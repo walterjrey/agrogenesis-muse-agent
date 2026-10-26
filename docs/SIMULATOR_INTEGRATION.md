@@ -1,6 +1,6 @@
 # Simulator integration: contract and required simulator changes
 
-The agent talks to the simulator only through a narrow server-to-server HTTP API. The typed, runtime-validated contracts live in `src/contracts/`; `src/simulator/client.ts` implements the client. **The simulator-side endpoints below do not exist yet** (see [SIMULATOR_AUDIT.md](SIMULATOR_AUDIT.md)); they are a proposal and must be implemented in the AgroGenesis repo, separately from this repository.
+The agent talks to the simulator only through a narrow server-to-server HTTP API. The typed, runtime-validated contracts live in `src/contracts/`; `src/simulator/client.ts` implements the client. **Phase 1 (read-only) endpoints now exist in the AgroGenesis repo** (`docs/AGENT_API.md` there): `games`, `overview`, `fields`, `actions`, verified live with `npm run integration:real` (4 GET requests, 0 mutating). Tokens are provisioned by an administrator on the server with `npm run agent:token`, not from the UI. Execute and time-advance endpoints are still a proposal (see `docs/SIMULATION_AUTHORITY.md` there); the section below describes the original proposal.
 
 ## Endpoints (`/api/agent/v1`)
 
