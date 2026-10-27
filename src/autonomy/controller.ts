@@ -10,8 +10,10 @@ import { SimulatorError, type SimulatorClient } from "../simulator/client.js";
 import { InconsistentObservationError, summarizeSnapshot, isAuthFailure } from "./observation.js";
 import { AUTONOMOUS_SYSTEM_PROMPT, DEFAULT_OBJECTIVE, cycleBrief } from "./prompt.js";
 import { SessionLockLostError, type SessionLock, type SessionStore } from "./store.js";
+import { buildProgress } from "./progress.js";
+import { superviseOperation, type WaitResult } from "./supervisor.js";
 import { createAutonomousTools, SnapshotProvider, type PlanSink } from "./tools.js";
-import { DEFAULT_SESSION_LIMITS, TERMINAL_ACTION_STATUSES, type SessionLimits, type SessionState } from "./types.js";
+import { DEFAULT_SESSION_LIMITS, TERMINAL_ACTION_STATUSES, type SessionLimits, type SessionState, type WaitRecord } from "./types.js";
 
 export interface NewSessionOptions {
   sessionId?: string;
@@ -20,6 +22,8 @@ export interface NewSessionOptions {
   mutationsEnabled: boolean;
   objective?: string;
   limits?: Partial<SessionLimits>;
+  /** Let the controller wait (server time only) for operations the model already started. Default true. */
+  autoWait?: boolean;
 }
 
 export function newSessionState(options: NewSessionOptions): SessionState {
@@ -33,18 +37,20 @@ export function newSessionState(options: NewSessionOptions): SessionState {
     status: "paused",
     stopReason: "not_started",
     stopDetail: null,
-    config: { modelId: options.modelId, mutationsEnabled: options.mutationsEnabled, objective: options.objective ?? DEFAULT_OBJECTIVE, limits: { ...DEFAULT_SESSION_LIMITS, ...options.limits } },
+    config: { modelId: options.modelId, mutationsEnabled: options.mutationsEnabled, objective: options.objective ?? DEFAULT_OBJECTIVE, limits: { ...DEFAULT_SESSION_LIMITS, ...options.limits }, autoWait: options.autoWait ?? true },
     cycle: 0,
     plan: null,
     decisions: [],
     actions: [],
     operations: [],
+    waits: [],
+    progress: null,
     pendingMutation: null,
     lastRevision: null,
     lastSimTimeS: null,
     modelEventCursor: 0,
     progressCursor: 0,
-    budgets: { costUsd: 0, modelCalls: 0, toolCalls: 0, acceptedMutations: 0, mutationAttempts: 0, rejectedActions: 0, advancedSimSeconds: 0, wallClockMs: 0, consecutiveErrors: 0, consecutiveNoProgress: 0, consecutiveRejections: 0 },
+    budgets: { costUsd: 0, modelCalls: 0, toolCalls: 0, acceptedMutations: 0, mutationAttempts: 0, rejectedActions: 0, advancedSimSeconds: 0, wallClockMs: 0, consecutiveErrors: 0, consecutiveNoProgress: 0,     consecutiveRejections: 0, advanceRequests: 0, consecutiveAdvances: 0, conflicts: 0 },
     usage: { inputTokens: 0, outputTokens: 0, cachedTokens: 0 },
     metrics: { baseline: null, latest: null, controllerReads: 0, snapshotRefreshes: 0, snapshotCacheHits: 0, mixedRevisionDetections: 0 },
   };
@@ -145,8 +151,9 @@ export class AutonomousController {
         const actionId = settlement.summary.actionId;
         if (typeof actionId === "string") {
           const status = settlement.summary.actionStatus;
-          s.actions.push({ actionId, type: String(settlement.summary.type ?? ""), status: typeof status === "string" ? (status as SessionState["actions"][number]["status"]) : "scheduled", submittedAtRevision: intent.expectedRevision, idempotencyKey: intent.idempotencyKey, lastCheckedAt: null });
+          s.actions.push({ actionId, type: String(settlement.summary.type ?? ""), status: typeof status === "string" ? (status as SessionState["actions"][number]["status"]) : "scheduled", submittedAtRevision: intent.expectedRevision,           idempotencyKey: intent.idempotencyKey, lastCheckedAt: null, target: typeof intent.request.params === "object" && intent.request.params !== null && typeof (intent.request.params as Record<string, unknown>).fieldId === "string" ? String((intent.request.params as Record<string, unknown>).fieldId) : typeof intent.request.targetId === "string" ? intent.request.targetId : null, startedAtS: null, estimatedCompletionS: null, finishedAtS: null, progress: null, consumedCredits: null, outcome: null, failure: null });
         }
+                  b.consecutiveAdvances = 0;
       } else if (settlement.status === "rejected") {
         b.rejectedActions += 1;
         b.mutationAttempts += 1;
@@ -154,8 +161,11 @@ export class AutonomousController {
       }
     } else if (settlement.status === "applied") {
       b.advancedSimSeconds += Number(settlement.summary.grantedSeconds ?? 0);
+      b.advanceRequests += 1;
+      b.consecutiveAdvances += 1;
       if (typeof settlement.summary.simTimeAfterS === "number") s.lastSimTimeS = settlement.summary.simTimeAfterS;
     }
+    if (settlement.status === "not_applied" && settlement.summary.code === "stale_revision") b.conflicts += 1;
     s.pendingMutation = null;
     this.provider.invalidate();
     this.save();
@@ -200,21 +210,33 @@ export class AutonomousController {
     return false;
   }
 
-  private budgetStop(): { reason: string; detail: string } | null {
+  /** forWait: waiting for an already-authorized operation spends no model/tool/cycle budget, so only the time, spending and conflict limits apply. */
+  private budgetStop(forWait = false): { reason: string; detail: string } | null {
     const { budgets: b, config, cycle } = this.state;
     const l = config.limits;
     const wall = this.wallBase + (Date.now() - this.startedAt);
-    if (b.costUsd >= l.maxCostUsd) return { reason: "cost_budget_exhausted", detail: `$${b.costUsd.toFixed(4)} of $${l.maxCostUsd}` };
-    if (b.modelCalls >= l.maxModelCalls) return { reason: "model_call_budget_exhausted", detail: `${b.modelCalls}/${l.maxModelCalls}` };
-    if (b.toolCalls >= l.maxToolCalls) return { reason: "tool_call_budget_exhausted", detail: `${b.toolCalls}/${l.maxToolCalls}` };
+    if (!forWait && b.costUsd >= l.maxCostUsd) return { reason: "cost_budget_exhausted", detail: `$${b.costUsd.toFixed(4)} of $${l.maxCostUsd}` };
+    if (!forWait && b.modelCalls >= l.maxModelCalls) return { reason: "model_call_budget_exhausted", detail: `${b.modelCalls}/${l.maxModelCalls}` };
+    if (!forWait && b.toolCalls >= l.maxToolCalls) return { reason: "tool_call_budget_exhausted", detail: `${b.toolCalls}/${l.maxToolCalls}` };
     if (wall >= l.maxWallClockMs) return { reason: "wall_clock_exhausted", detail: `${Math.round(wall / 1000)}s of ${Math.round(l.maxWallClockMs / 1000)}s` };
-    if (cycle >= l.maxCycles) return { reason: "cycle_budget_exhausted", detail: `${cycle}/${l.maxCycles}` };
+    if (!forWait && cycle >= l.maxCycles) return { reason: "cycle_budget_exhausted", detail: `${cycle}/${l.maxCycles}` };
+    if (b.conflicts >= l.maxConflicts) return { reason: "database_conflict_limit", detail: `${b.conflicts}/${l.maxConflicts} stale-revision conflicts` };
     if (this.mutationsEnabled) {
       if (b.advancedSimSeconds >= l.maxSimSeconds) return { reason: "sim_time_limit_reached", detail: `${b.advancedSimSeconds}/${l.maxSimSeconds} s` };
+      if (b.advanceRequests >= l.maxAdvanceRequests) return { reason: "advance_request_budget_exhausted", detail: `${b.advanceRequests}/${l.maxAdvanceRequests}` };
+      if (b.consecutiveAdvances >= l.maxConsecutiveAdvances) return { reason: "consecutive_advance_limit", detail: `${b.consecutiveAdvances}/${l.maxConsecutiveAdvances} advances without a new action` };
+      const spent = this.farmSpend();
+      if (spent !== null && spent >= l.maxFarmSpendCredits) return { reason: "farm_spend_limit_reached", detail: `${spent} of ${l.maxFarmSpendCredits} credits` };
       const inFlight = this.state.actions.some((a) => !TERMINAL_ACTION_STATUSES.has(a.status));
       if (b.acceptedMutations >= l.maxMutations && !inFlight) return { reason: "mutation_budget_exhausted", detail: `${b.acceptedMutations}/${l.maxMutations}` };
     }
     return null;
+  }
+
+  /** Realized farm costs since the first observation of this session; null when finance is not authorized/observed. */
+  private farmSpend(): number | null {
+    const { latest, baseline } = this.state.metrics;
+    return latest?.realizedCosts != null && baseline?.realizedCosts != null ? latest.realizedCosts - baseline.realizedCosts : null;
   }
 
   private async refreshActions(): Promise<void> {
@@ -222,7 +244,15 @@ export class AutonomousController {
       try {
         const { action: view } = await this.options.client.getAction(this.state.gameId, action.actionId);
         action.status = view.status;
+        action.target = view.target?.id ?? action.target;
         action.lastCheckedAt = new Date().toISOString();
+        action.startedAtS = view.startedAtS ?? null;
+        action.estimatedCompletionS = view.estimatedCompletionS ?? null;
+        action.finishedAtS = view.finishedAtS ?? null;
+        action.progress = view.progress ?? null;
+        action.consumedCredits = view.consumed?.credits ?? null;
+        action.outcome = view.outcome?.summary ?? null;
+        action.failure = view.failure ? `${view.failure.code}: ${view.failure.detail}`.slice(0, 200) : null;
       } catch {
         /* keep the last known status */
       }
@@ -242,6 +272,57 @@ export class AutonomousController {
       /* no evidence available: not counted as progress */
     }
     return { progress: reasons.length > 0, reasons };
+  }
+
+  private recordWait(wait: WaitResult, trigger: WaitRecord["trigger"]): void {
+    this.state.waits.push({ cycle: this.state.cycle, actionId: wait.actionId, trigger, outcome: wait.outcome, actionStatus: wait.actionStatus, advanceRequests: wait.advanceRequests, advancedSeconds: wait.advancedSeconds, simTimeStartS: wait.simTimeStartS, simTimeEndS: wait.simTimeEndS, events: wait.events, detail: wait.detail });
+    this.save();
+  }
+
+  /**
+   * Mechanical waiting for ONE already-authorized operation (server time only). It never chooses a farm action.
+   * Returns true when the awaited operation reached a terminal state.
+   */
+  private async autoWait(): Promise<boolean> {
+    const s = this.state;
+    if (!this.mutationsEnabled || !s.config.autoWait) return false;
+    const target = s.actions.find((a) => !TERMINAL_ACTION_STATUSES.has(a.status));
+    if (!target || this.budgetStop(true)) return false;
+    const l = s.config.limits;
+    const b = s.budgets;
+    const wait = await superviseOperation(
+      {
+        client: this.options.client,
+        gameId: s.gameId,
+        journal: this.journal,
+        newMutationId: this.options.newMutationId ?? (() => randomUUID()),
+        retryDelayMs: this.options.retryDelayMs ?? 400,
+        maxMutationRetries: 2,
+        budget: {
+          requestsLeft: Math.max(0, Math.min(l.maxAdvanceRequests - b.advanceRequests, l.maxConsecutiveAdvances - b.consecutiveAdvances)),
+          simSecondsLeft: Math.max(0, l.maxSimSeconds - b.advancedSimSeconds),
+          maxChunkSeconds: l.maxWaitChunkSeconds,
+          maxCallSeconds: l.maxAdvanceSecondsPerCall,
+          conflictsLeft: Math.max(0, l.maxConflicts - b.conflicts),
+        },
+        getCursor: () => s.modelEventCursor,
+        setCursor: (cursor) => {
+          s.modelEventCursor = Math.max(s.modelEventCursor, cursor);
+        },
+        onAdvanced: () => undefined,
+        shouldStop: () => (this.wallBase + (Date.now() - this.startedAt) >= l.maxWallClockMs ? "wall clock budget" : this.farmSpendExceeded() ? "farm spending limit" : null),
+        record: (event, data) => this.log(`${event} ${JSON.stringify(data).slice(0, 160)}`),
+      },
+      { actionId: target.actionId },
+    );
+    this.recordWait(wait, "controller");
+    this.log(`auto-wait ${wait.actionId}: ${wait.outcome} (${wait.advanceRequests} advance request(s), ${wait.advancedSeconds}s)`);
+    return wait.outcome === "completed" || wait.outcome === "failed" || wait.outcome === "cancelled";
+  }
+
+  private farmSpendExceeded(): boolean {
+    const spent = this.farmSpend();
+    return spent !== null && spent >= this.state.config.limits.maxFarmSpendCredits;
   }
 
   /** Best-effort final read so the report has the true end state; failures leave the previous (real) values. */
@@ -315,7 +396,12 @@ export class AutonomousController {
         const remainingMutations = this.mutationsEnabled ? Math.max(0, l.maxMutations - b.acceptedMutations) : 0;
         const remainingSim = Math.max(0, l.maxSimSeconds - b.advancedSimSeconds);
         const deadlineMs = this.startedAt + (l.maxWallClockMs - this.wallBase);
-        const tools = createAutonomousTools(this.provider, sink);
+        const tools = createAutonomousTools(this.provider, sink, this.mutationsEnabled ? {
+          maxChunkSeconds: l.maxWaitChunkSeconds,
+          conflictsLeft: () => Math.max(0, l.maxConflicts - s.budgets.conflicts),
+          onConflict: () => undefined,
+          finished: (wait) => this.recordWait(wait, "model_tool"),
+        } : undefined);
 
         result = await runAgent({
           provider: this.options.provider,
@@ -324,13 +410,12 @@ export class AutonomousController {
           mode: this.mutationsEnabled ? "controlled_mutation" : "observe_only",
           tools,
           systemPrompt: AUTONOMOUS_SYSTEM_PROMPT,
-          brief: cycleBrief({ state: s, snapshot, events }),
+          brief: cycleBrief({ state: s, snapshot, events, progress: buildProgress(s) }),
           runId: `${s.sessionId}-c${s.cycle}`,
           traceDirectory: this.options.traceDirectory === undefined ? join(this.options.store.sessionDir(s.sessionId), "runs") : this.options.traceDirectory,
           initialState: { observedRevision: snapshot.revision, eventCursor: eventsResponse.nextCursor },
           journal: this.journal,
           deadlineMs,
-          beforeFinal: () => (sink.latest ? null : "You have not called update_plan this cycle. Call update_plan now with your decision summary and rolling plan, then give your one-line final answer."),
           retryDelayMs: this.options.retryDelayMs ?? 400,
           ...(this.options.newMutationId ? { newMutationId: this.options.newMutationId } : {}),
           limits: {
@@ -343,6 +428,8 @@ export class AutonomousController {
             maxAdvanceSecondsPerCall: Math.min(l.maxAdvanceSecondsPerCall, remainingSim),
             maxTotalAdvanceSeconds: remainingSim,
             maxMutations: remainingMutations,
+            maxAdvanceRequests: Math.max(0, Math.min(l.maxAdvanceRequests - b.advanceRequests, l.maxConsecutiveAdvances - b.consecutiveAdvances)),
+            maxWaitChunkSeconds: l.maxWaitChunkSeconds,
             maxMutationAttempts: remainingMutations + Math.max(0, l.maxConsecutiveRejections - b.consecutiveRejections),
           },
         });
@@ -367,7 +454,13 @@ export class AutonomousController {
       s.usage.cachedTokens += result.totals.cachedTokens;
       if (sink.latest) s.plan = sink.latest;
 
-      const { progress, reasons } = await this.evaluateProgress(before.accepted);
+      let waitedProgress = false;
+      if (!s.pendingMutation) waitedProgress = await this.autoWait();
+      await this.refreshActions();
+      s.progress = buildProgress(s);
+      const { progress: eventProgress, reasons } = await this.evaluateProgress(before.accepted);
+      const progress = eventProgress || waitedProgress;
+      if (waitedProgress && !eventProgress) reasons.push("supervised_operation_finished");
       const toolCounts: Record<string, number> = {};
       for (const entry of result.trace.entries) if (entry.event === "tool.execute") toolCounts[String(entry.name)] = (toolCounts[String(entry.name)] ?? 0) + 1;
       const summaryText = sink.latest?.summary ?? (result.finalSummary ? `(model final text, no plan recorded) ${result.finalSummary}`.slice(0, 600) : `(no decision summary produced; run stopped: ${result.stopReason})`);

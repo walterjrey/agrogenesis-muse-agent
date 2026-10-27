@@ -23,6 +23,16 @@ export const SessionLimits = z.strictObject({
   maxAdvanceSecondsPerCall: z.number().positive(),
   maxOutputTokens: z.number().int().positive(),
   maxCostPerRequestUsd: z.number().positive(),
+  /** HTTP advance requests (agent-requested or supervised) in total. */
+  maxAdvanceRequests: z.number().int().positive().default(60),
+  /** Advance requests in a row without an accepted farm action in between. */
+  maxConsecutiveAdvances: z.number().int().positive().default(12),
+  /** HTTP 409 stale-revision conflicts tolerated in total. */
+  maxConflicts: z.number().int().positive().default(5),
+  /** Credits the farm may spend (growth of realizedCosts since the session baseline); checked between cycles and after each supervised wait. */
+  maxFarmSpendCredits: z.number().nonnegative().default(1_000),
+  /** Largest single advance a supervised wait requests (simulated seconds; one simulated day is 60 s). */
+  maxWaitChunkSeconds: z.number().positive().default(600),
 });
 export type SessionLimits = z.infer<typeof SessionLimits>;
 
@@ -42,6 +52,11 @@ export const DEFAULT_SESSION_LIMITS: Readonly<SessionLimits> = {
   maxAdvanceSecondsPerCall: 3_600,
   maxOutputTokens: 2_048,
   maxCostPerRequestUsd: 0.1,
+  maxAdvanceRequests: 60,
+  maxConsecutiveAdvances: 12,
+  maxConflicts: 5,
+  maxFarmSpendCredits: 1_000,
+  maxWaitChunkSeconds: 600,
 };
 
 export const Plan = z.strictObject({
@@ -64,8 +79,46 @@ export const TrackedAction = z.strictObject({
   submittedAtRevision: z.number().int(),
   idempotencyKey: z.string(),
   lastCheckedAt: z.string().nullable(),
+  /** Facts reported by the simulator for this action (never inferred). */
+  target: z.string().nullable().default(null),
+  startedAtS: z.number().nullable().default(null),
+  estimatedCompletionS: z.number().nullable().default(null),
+  finishedAtS: z.number().nullable().default(null),
+  progress: z.number().nullable().default(null),
+  consumedCredits: z.number().nullable().default(null),
+  outcome: z.string().nullable().default(null),
+  failure: z.string().nullable().default(null),
 });
 export type TrackedAction = z.infer<typeof TrackedAction>;
+
+/** One supervised wait on an already-authorized operation; every value comes from simulator responses. */
+export const WaitRecord = z.strictObject({
+  cycle: z.number().int(),
+  actionId: z.string(),
+  trigger: z.enum(["model_tool", "controller"]),
+  outcome: z.string(),
+  actionStatus: z.string().nullable(),
+  advanceRequests: z.number().int(),
+  advancedSeconds: z.number(),
+  simTimeStartS: z.number().nullable(),
+  simTimeEndS: z.number().nullable(),
+  events: z.array(z.string()),
+  detail: z.string().nullable(),
+});
+export type WaitRecord = z.infer<typeof WaitRecord>;
+
+/** Operational bookkeeping derived from simulator data. It contains no plan and no model reasoning. */
+export const ProgressRecord = z.strictObject({
+  objective: z.string(),
+  simTimeS: z.number().nullable(),
+  fields: z.array(z.strictObject({ fieldId: z.string(), knownCrop: z.string().nullable(), knownGrowthStage: z.string().nullable(), activeOperation: z.string().nullable(), lastActionType: z.string().nullable() })),
+  pendingOperations: z.array(z.strictObject({ actionId: z.string(), type: z.string(), target: z.string().nullable(), status: z.string(), progress: z.number().nullable(), estimatedCompletionS: z.number().nullable() })),
+  completedOperations: z.array(z.strictObject({ actionId: z.string(), type: z.string(), target: z.string().nullable(), status: z.string(), finishedAtS: z.number().nullable(), outcome: z.string().nullable(), failure: z.string().nullable() })),
+  blockers: z.array(z.string()),
+  nextRequiredDecision: z.string(),
+  expenses: z.strictObject({ realizedCostsDelta: z.number().nullable(), creditsDelta: z.number().nullable(), actionConsumedCredits: z.number() }),
+});
+export type ProgressRecord = z.infer<typeof ProgressRecord>;
 
 export const PendingMutation = z.strictObject({
   tool: z.enum(["execute_action", "advance_time"]),
@@ -141,6 +194,8 @@ export const SessionState = z.strictObject({
     mutationsEnabled: z.boolean(),
     objective: z.string(),
     limits: SessionLimits,
+    /** After a model turn, wait mechanically (no model calls) for operations still in flight. */
+    autoWait: z.boolean().default(true),
   }),
   cycle: z.number().int(),
   plan: Plan.nullable(),
@@ -148,6 +203,8 @@ export const SessionState = z.strictObject({
   actions: z.array(TrackedAction),
   operations: z.array(CompletedOperation),
   pendingMutation: PendingMutation.nullable(),
+  waits: z.array(WaitRecord).default([]),
+  progress: ProgressRecord.nullable().default(null),
   lastRevision: z.number().int().nullable(),
   lastSimTimeS: z.number().nullable(),
   /** Event cursor the model's tools use. */
@@ -166,6 +223,9 @@ export const SessionState = z.strictObject({
     consecutiveErrors: z.number().int(),
     consecutiveNoProgress: z.number().int(),
     consecutiveRejections: z.number().int(),
+    advanceRequests: z.number().int().default(0),
+    consecutiveAdvances: z.number().int().default(0),
+    conflicts: z.number().int().default(0),
   }),
   usage: z.strictObject({ inputTokens: z.number().int(), outputTokens: z.number().int(), cachedTokens: z.number().int() }),
   metrics: z.strictObject({

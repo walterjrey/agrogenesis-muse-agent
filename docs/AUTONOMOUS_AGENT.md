@@ -1,4 +1,4 @@
-# Phase 3B — Bounded Autonomous Farm Agent
+# Phase 3B/3C — Bounded Autonomous Farm Agent
 
 Phase 3B turns the single-run tool-calling runtime (Phase 3A, `docs/MUSE_TOOL_CALLING.md`)
 into a **bounded, resumable** controller that manages a Muse-mode game over several decision cycles.
@@ -131,7 +131,7 @@ Resume across processes worked without replaying completed actions and with cumu
   prompt and a one-time reminder). Decision summaries are therefore the model's final text and are
   marked `(model final text, no plan recorded)`; the rolling plan field is mostly empty.
 - Live runs reached only inspections and one soil preparation; no planting, harvest, livestock, revenue
-  or economic improvement was observed. Simulated time was ≈ 20 s, far below one day; the sim-time
+  or economic improvement was observed. Simulated time was ≈ 20 s (1/3 of a simulated day; 1 day = 60 s); the sim-time
   limit was never reached.
 - Runs ended by the model-call budget, mostly spent on repeated observation tools.
 - Per-call context (~9k tokens) remains the dominant cost.
@@ -143,3 +143,39 @@ Resume across processes worked without replaying completed actions and with cumu
 Slim the brief (send deltas instead of the full snapshot), enforce plan output (e.g. a forced final
 tool call), run a longer session covering plant → grow → harvest, live-test 409 and timeout recovery,
 then a Manual vs Muse comparison with identical seeds.
+
+
+---
+
+# Phase 3C — Long-horizon supervision
+
+Diagnosis, measurements and live results: [AGRICULTURAL_PROGRESS.md](AGRICULTURAL_PROGRESS.md).
+
+## What changed
+
+- **Operation supervisor** (`src/autonomy/supervisor.ts`): for an action Muse already authorized, it
+  polls the action status and advances server time (`/clock/advance`, `stopOn:["action_completion"]`,
+  fresh idempotency key, `expectedRevision`) until the action completes, fails, a material event
+  occurs, or a limit is hit. It accounts the **granted** seconds returned by the server, not the
+  requested ones. It never chooses farm actions. Exposed to the model as `wait_for_operation` and run
+  automatically by the controller (`autoWait`; disable with `--no-auto-wait`) for in-flight actions.
+- **409**: refresh the revision and retry up to `maxConflicts`. **Uncertain outcome**: the journal
+  entry stays pending; resume replays the same key and payload.
+- **Factual progress record** (`src/autonomy/progress.ts`): derived from tracked actions, metrics and
+  budgets; independent of `update_plan`; no plan is invented.
+- **Context compression**: superseded tool results become stubs (`src/agent/history.ts`);
+  `observe_snapshot` returns `unchanged` if revision/time were already delivered; the catalog is a
+  digest (eligible types only, targets grouped, reasons behind `describe_action`).
+- **New limits/flags**: `--max-sim-days` (1 day = 60 s), `--max-advance-requests`,
+  `--max-consecutive-advances`, `--max-conflicts`, `--max-farm-spend`, `--no-auto-wait`. New stop
+  reasons: `advance_request_budget_exhausted`, `consecutive_advance_limit`,
+  `database_conflict_limit`, `farm_spend_limit_reached`.
+- Report bug fixed: simulated days used 86,400 s/day; now 60 s/day.
+
+## Mocked vs live (3C)
+
+- **Mocked** (23 new tests, `tests/autonomy/timedSim.ts`; 94 total): time units, granted time,
+  completion, estimate already passed, long operations, failure/weather interrupts, limits, 409, lost
+  responses with same-key replay, resume, compaction, determinism.
+- **Live**: sessions `p3c-1` and `p3c-2`. HTTP 409, timeouts and mid-mutation crashes were **not**
+  observed live.

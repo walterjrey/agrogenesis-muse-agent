@@ -1,3 +1,4 @@
+import { compactHistory, type ToolCallMeta } from "./history.js";
 import { randomUUID } from "node:crypto";
 import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
 import { ModelApiError, type ModelProvider, type ModelResponse, type ModelToolCall } from "../model/meta.js";
@@ -97,6 +98,7 @@ export async function runAgent(options: RunOptions): Promise<RunResult & { trace
   let error: string | null = null;
   let toolsEnabled = true;
   let nudgedBeforeFinal = false;
+  const callMeta = new Map<string, ToolCallMeta>();
 
   for (let step = 1; ; step += 1) {
     if (policy.modelCalls >= limits.maxModelCalls) { stopReason = "model_call_limit"; break; }
@@ -110,7 +112,7 @@ export async function runAgent(options: RunOptions): Promise<RunResult & { trace
     let response: ModelResponse;
     try {
       trace.record("model.request", { step, messageCount: messages.length, toolsOffered: toolsEnabled ? tools.length : 0 });
-      response = await options.provider.complete({ messages, ...(toolsEnabled ? { tools } : {}), maxOutputTokens: limits.maxOutputTokens });
+      response = await options.provider.complete({ messages: compactHistory(messages, callMeta), ...(toolsEnabled ? { tools } : {}), maxOutputTokens: limits.maxOutputTokens });
     } catch (caught) {
       stopReason = caught instanceof SpendLimitError ? "cost_limit" : "model_error";
       error = caught instanceof Error ? caught.message : String(caught);
@@ -135,6 +137,7 @@ export async function runAgent(options: RunOptions): Promise<RunResult & { trace
       toolCalls: response.toolCalls.map((c) => ({ id: c.id, name: c.name })),
     });
     messages.push(response.assistantMessage);
+    for (const call of response.toolCalls) callMeta.set(call.id, { name: call.name, arguments: call.arguments });
 
     if (response.toolCalls.length === 0 && toolsEnabled && !nudgedBeforeFinal && policy.modelCalls < limits.maxModelCalls - 1) {
       const nudge = options.beforeFinal?.() ?? null;

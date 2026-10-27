@@ -117,6 +117,71 @@ export function compactCatalog(catalog: AvailableActions): CompactCatalog {
   };
 }
 
+export interface DigestActionType {
+  type: string;
+  category: AvailableAction["category"];
+  asynchronous: boolean;
+  params: string[];
+  /** Eligible targets grouped by identical simulator estimate. */
+  options: Array<{ targets: Array<string | null>; estimate: string }>;
+  /** Target ids that are not eligible right now; the reasons come from describe_action. */
+  notEligible?: Array<string | null>;
+}
+
+export interface DigestCatalog {
+  revision: number;
+  simTimeS: number;
+  eligibleActionTypes: number;
+  eligibleOptions: number;
+  actions: DigestActionType[];
+  /** Action types the simulator lists but that have no eligible target at this revision. */
+  typesWithoutEligibleTarget: string[];
+  note: string;
+}
+
+/**
+ * The recurring, smallest view: only action types with at least one eligible target, targets grouped by identical
+ * estimate, no prose. Everything shown is the simulator's own eligibility and estimate; ineligibility reasons,
+ * summaries and full schemas stay behind describe_action. Nothing is invented.
+ */
+export function digestCatalog(catalog: AvailableActions): DigestCatalog {
+  const groups = new Map<string, AvailableAction[]>();
+  for (const action of catalog.actions) groups.set(action.type, [...(groups.get(action.type) ?? []), action]);
+  const actions: DigestActionType[] = [];
+  const without: string[] = [];
+  for (const entries of groups.values()) {
+    const head = entries[0]!;
+    const eligible = entries.filter((e) => e.eligibility.eligible);
+    if (eligible.length === 0) {
+      without.push(head.type);
+      continue;
+    }
+    const byEstimate = new Map<string, Array<string | null>>();
+    for (const e of eligible) {
+      const key = estimateText(e.estimate);
+      byEstimate.set(key, [...(byEstimate.get(key) ?? []), e.target?.id ?? null]);
+    }
+    const notEligible = entries.filter((e) => !e.eligibility.eligible).map((e) => e.target?.id ?? null);
+    actions.push({
+      type: head.type,
+      category: head.category,
+      asynchronous: head.asynchronous,
+      params: parameterHints(head.parametersSchema),
+      options: [...byEstimate.entries()].map(([estimate, targets]) => ({ targets, estimate })),
+      ...(notEligible.length ? { notEligible } : {}),
+    });
+  }
+  return {
+    revision: catalog.revision,
+    simTimeS: catalog.simTimeS,
+    eligibleActionTypes: actions.length,
+    eligibleOptions: actions.reduce((sum, a) => sum + a.options.reduce((n, o) => n + o.targets.length, 0), 0),
+    actions,
+    typesWithoutEligibleTarget: without,
+    note: "Digest of eligible actions only (* = required param). describe_action(type) gives the full schema, preconditions and why a target is not eligible. Only the simulator validates actions.",
+  };
+}
+
 export interface ActionDescription {
   revision: number;
   type: string;

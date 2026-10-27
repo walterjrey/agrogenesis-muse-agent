@@ -1,8 +1,9 @@
 import { z } from "zod";
 import type { SimulatorClient } from "../simulator/client.js";
 import { createToolRegistry, defineTool, failureFromError, fail, succeed, type RegisteredTool } from "../agent/tools.js";
-import { compactCatalog, describeAction } from "./catalog.js";
+import { compactCatalog, describeAction, digestCatalog } from "./catalog.js";
 import { collectSnapshot, InconsistentObservationError, type Snapshot } from "./observation.js";
+import { superviseOperation, type WaitResult } from "./supervisor.js";
 import type { Plan } from "./types.js";
 
 /**
@@ -15,6 +16,8 @@ export class SnapshotProvider {
   refreshes = 0;
   cacheHits = 0;
   mixedRevisionDetections = 0;
+  /** Revision and simulated time of the snapshot most recently shown to the model, so an identical one is not re-sent. */
+  delivered: { revision: number; simTimeS: number } | null = null;
 
   constructor(private readonly client: SimulatorClient, private readonly gameId: string, private readonly options: { retryDelayMs?: number } = {}) {}
 
@@ -48,6 +51,13 @@ export class SnapshotProvider {
   }
 }
 
+export interface WaitHooks {
+  maxChunkSeconds: number;
+  conflictsLeft(): number;
+  onConflict(): void;
+  finished(result: WaitResult): void;
+}
+
 export interface PlanSink {
   latest: Plan | null;
   updates: number;
@@ -70,7 +80,7 @@ const PlanArgs = z.strictObject({
   stopReason: z.string().max(300).optional().describe("Required when nextStep is stop."),
 });
 
-export function createAutonomousTools(provider: SnapshotProvider, sink: PlanSink): RegisteredTool[] {
+export function createAutonomousTools(provider: SnapshotProvider, sink: PlanSink, wait?: WaitHooks): RegisteredTool[] {
   const base = createToolRegistry();
   const reuse = (name: string): RegisteredTool => {
     const tool = base.find((t) => t.name === name);
@@ -81,14 +91,18 @@ export function createAutonomousTools(provider: SnapshotProvider, sink: PlanSink
   return [
     defineTool({
       name: "observe_snapshot",
-      description: "Get a CONSISTENT snapshot: farm overview, per-field observations and a compact action catalog, all from the same game revision and simulated time. Each measurement keeps its own age/freshness/confidence; missing or stale quantities are unknown. Prefer this over separate reads; the call is cheap when the game has not changed.",
+      description: "Get a CONSISTENT snapshot: farm overview, per-field observations and a digest of eligible actions, all from the same game revision and simulated time. Each measurement keeps its own age/freshness/confidence; missing or stale quantities are unknown. Prefer this over separate reads; an unchanged game returns a short 'unchanged' marker instead of repeating the data.",
       mutating: false,
       args: z.strictObject({}),
       async run(context) {
         try {
           const snapshot = await provider.get();
           context.state.observedRevision = snapshot.revision;
-          return succeed({ revision: snapshot.revision, simTimeS: snapshot.simTimeS, overview: snapshot.overview, fields: snapshot.fields, actions: compactCatalog(snapshot.actions) });
+          if (provider.delivered && provider.delivered.revision === snapshot.revision && provider.delivered.simTimeS === snapshot.simTimeS) {
+            return succeed({ unchanged: true, revision: snapshot.revision, simTimeS: snapshot.simTimeS, note: "The game has not changed since the snapshot you already have (same revision and simulated time); it is not repeated." });
+          }
+          provider.delivered = { revision: snapshot.revision, simTimeS: snapshot.simTimeS };
+          return succeed({ revision: snapshot.revision, simTimeS: snapshot.simTimeS, overview: snapshot.overview, fields: snapshot.fields, actions: digestCatalog(snapshot.actions) });
         } catch (error) {
           return inconsistent(error);
         }
@@ -132,7 +146,7 @@ export function createAutonomousTools(provider: SnapshotProvider, sink: PlanSink
     }),
     defineTool({
       name: "update_plan",
-      description: "Record your rolling plan and an explicit decision summary for this cycle. It does not change the farm. Revise it whenever new evidence changes your mind; it is not a fixed script. Call it once near the end of each cycle, then give a one-line final answer.",
+      description: "OPTIONAL: record your own rolling plan and decision summary so it carries into later cycles. It does not change the farm. The runtime separately keeps a factual operational record, so only record a plan when it adds something. Revise it whenever new evidence changes your mind.",
       mutating: false,
       args: PlanArgs,
       async run(_context, args) {
@@ -154,7 +168,62 @@ export function createAutonomousTools(provider: SnapshotProvider, sink: PlanSink
     }),
     reuse("execute_action"),
     reuse("advance_time"),
-    reuse("get_action_status"),
+    ...(wait
+      ? [
+          defineTool({
+            name: "wait_for_operation",
+            description:
+              "Wait (the server advances simulated time) until ONE operation you already started finishes, fails or needs your attention. The runtime sizes each advance from the simulator's own estimate, accounts only the time the server actually granted, stops on completion, failure, weather alerts or when another operation finishes, and returns a concise factual result. It never starts a farm action. Use this instead of repeated advance_time and get_action_status calls. Call it alone.",
+            mutating: true,
+            args: z.strictObject({
+              actionId: z.string().min(1).max(100).describe("actionId returned by execute_action."),
+              maxSeconds: z.number().positive().max(86_400).optional().describe("Optional cap on simulated seconds to wait (one simulated day is 60 s)."),
+              rationale: z.string().min(1).max(500).optional(),
+            }),
+            async run(context, args) {
+              if (context.state.mutationLocked) return fail("mutation_locked", "A previous state-changing request has an unconfirmed outcome; no further time advancement is allowed in this run.");
+              const limits = context.policy.limits;
+              const result = await superviseOperation(
+                {
+                  client: context.client,
+                  gameId: context.gameId,
+                  ...(context.journal ? { journal: context.journal } : {}),
+                  newMutationId: context.newMutationId,
+                  retryDelayMs: context.retryDelayMs,
+                  maxMutationRetries: context.maxMutationRetries,
+                  budget: {
+                    requestsLeft: Math.max(0, limits.maxAdvanceRequests - context.policy.advanceRequests),
+                    simSecondsLeft: Math.max(0, limits.maxTotalAdvanceSeconds - context.policy.advancedSimSeconds),
+                    maxChunkSeconds: Math.min(wait.maxChunkSeconds, limits.maxAdvanceSecondsPerCall),
+                    maxCallSeconds: limits.maxAdvanceSecondsPerCall,
+                    conflictsLeft: wait.conflictsLeft(),
+                  },
+                  getCursor: () => context.state.eventCursor,
+                  setCursor: (cursor) => {
+                    context.state.eventCursor = cursor;
+                  },
+                  onAdvanced: (granted) => {
+                    context.policy.advancedSimSeconds += granted;
+                    context.policy.advanceRequests += 1;
+                  },
+                  onConflict: wait.onConflict,
+                  record: (event, data) => context.trace.record(event, data),
+                },
+                { actionId: args.actionId, ...(args.maxSeconds !== undefined ? { maxSeconds: args.maxSeconds } : {}) },
+              );
+              context.state.observedRevision = null;
+              provider.invalidate();
+              wait.finished(result);
+              context.trace.record("supervisor.result", { ...result });
+              if (result.outcome === "outcome_unknown") {
+                context.state.mutationLocked = true;
+                return fail("outcome_unknown", "A time advance may or may not have been applied. Further state-changing calls are blocked for this run; the controller will reconcile it with the original idempotency key.");
+              }
+              return succeed({ ...result, note: "Time advanced on the server. Earlier observations are stale; observe again before acting." });
+            },
+          }),
+        ]
+      : []),    reuse("get_action_status"),
     reuse("get_recent_events"),
   ];
 }

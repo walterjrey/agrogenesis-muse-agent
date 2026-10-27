@@ -118,14 +118,14 @@ export function failureFromError(error: unknown): ToolFailure {
 const RETRIABLE = (error: unknown): boolean =>
   error instanceof SimulatorError && (error.kind === "timeout" || error.kind === "network" || (error.kind === "http" && (error.status ?? 0) >= 500));
 
-class OutcomeUnknownError extends Error {}
+export class OutcomeUnknownError extends Error {}
 
 /**
  * Sends a mutation and, when the outcome is unknown (timeout, dropped connection, 5xx), repeats the SAME request
  * with the SAME idempotency key. The simulator replays the stored result when the first attempt committed, and
  * executes at most once otherwise. A new key is never generated for a retry.
  */
-async function sendIdempotent<T>(context: ToolContext, send: () => Promise<T>): Promise<T> {
+export async function sendIdempotent<T>(context: { trace: { record(event: string, data?: Record<string, unknown>): unknown }; retryDelayMs: number; maxMutationRetries: number }, send: () => Promise<T>): Promise<T> {
   let lastError: unknown;
   for (let attempt = 0; attempt <= context.maxMutationRetries; attempt += 1) {
     try {
@@ -141,7 +141,7 @@ async function sendIdempotent<T>(context: ToolContext, send: () => Promise<T>): 
 }
 
 /** Only a definitive 4xx answer proves the simulator did not commit the request. Everything else is an unknown outcome. */
-const isDefinitiveRefusal = (error: unknown): boolean =>
+export const isDefinitiveRefusal = (error: unknown): boolean =>
   error instanceof SimulatorError && error.kind === "http" && (error.status ?? 0) >= 400 && (error.status ?? 0) < 500;
 
 async function mutationFailure(context: ToolContext, error: unknown, intent?: MutationIntent): Promise<ToolOutcome> {
@@ -313,6 +313,7 @@ export function createToolRegistry(): RegisteredTool[] {
             summary: { grantedSeconds: response.grantedSeconds, stoppedBecause: response.stoppedBecause, simTimeAfterS: response.clockAfter.simTimeS, eventCount: response.events.length },
           });
           context.policy.advancedSimSeconds += response.grantedSeconds;
+          context.policy.advanceRequests += 1;
           context.state.eventCursor = Math.max(context.state.eventCursor, response.nextCursor);
           context.state.observedRevision = null;
           context.trace.record("mutation.result", { tool: "advance_time", grantedSeconds: response.grantedSeconds, stoppedBecause: response.stoppedBecause, simTimeBeforeS: response.clockBefore.simTimeS, simTimeAfterS: response.clockAfter.simTimeS, eventCount: response.events.length });

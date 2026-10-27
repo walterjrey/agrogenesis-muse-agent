@@ -1,5 +1,7 @@
 import type { SessionState } from "./types.js";
 
+/** The simulator\u0027s DAY_SECONDS: one simulated day is 60 simulated seconds. */
+const SECONDS_PER_SIM_DAY = 60;
 const delta = (a: number | null | undefined, b: number | null | undefined): number | null => (typeof a === "number" && typeof b === "number" ? Math.round((b - a) * 100) / 100 : null);
 
 /**
@@ -35,7 +37,9 @@ export function buildReport(state: SessionState) {
       inFlight: state.actions.filter((a) => a.status === "scheduled" || a.status === "running").length,
     },
     pendingMutation: state.pendingMutation ? { tool: state.pendingMutation.tool, idempotencyKey: state.pendingMutation.idempotencyKey } : null,
-    time: { advancedSimSeconds: state.budgets.advancedSimSeconds, simulatedDaysElapsed: Math.round((state.budgets.advancedSimSeconds / 86_400) * 1000) / 1000, lastSimTimeS: state.lastSimTimeS },
+    time: { advancedSimSeconds: state.budgets.advancedSimSeconds, simulatedDaysElapsed: Math.round((state.budgets.advancedSimSeconds / SECONDS_PER_SIM_DAY) * 1000) / 1000, advanceRequests: state.budgets.advanceRequests, lastSimTimeS: state.lastSimTimeS },
+    waits: { count: state.waits.length, byOutcome: state.waits.reduce<Record<string, number>>((acc, w) => ({ ...acc, [w.outcome]: (acc[w.outcome] ?? 0) + 1 }), {}), byTrigger: { model_tool: state.waits.filter((w) => w.trigger === "model_tool").length, controller: state.waits.filter((w) => w.trigger === "controller").length } },
+    progress: state.progress,
     farm: {
       revision: { first: baseline?.revision ?? null, last: latest?.revision ?? null },
       credits: { first: baseline?.credits ?? null, last: latest?.credits ?? null, delta: delta(baseline?.credits, latest?.credits) },

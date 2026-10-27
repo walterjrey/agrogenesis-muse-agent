@@ -9,7 +9,7 @@ import { DEFAULT_SESSION_LIMITS, type SessionLimits } from "../src/autonomy/type
 import { SimulatorClient } from "../src/simulator/client.js";
 
 /**
- *   npm run agent:autonomous -- --game-id <id> [--enable-mutations --max-cost-usd 1 --max-mutations 3 --max-sim-seconds 86400 --max-model-calls 20]
+ *   npm run agent:autonomous -- --game-id <id> [--enable-mutations --max-cost-usd 1 --max-mutations 3 --max-sim-days 1 --max-model-calls 20]
  *   npm run agent:resume     -- --session-id <id> [--enable-mutations]
  *   npm run agent:status     -- [--session-id <id>] [--decisions]
  *
@@ -33,6 +33,12 @@ const { values, positionals } = parseArgs({
     "max-tool-calls": { type: "string" },
     "max-mutations": { type: "string" },
     "max-sim-seconds": { type: "string" },
+    "max-sim-days": { type: "string" },
+    "max-advance-requests": { type: "string" },
+    "max-consecutive-advances": { type: "string" },
+    "max-conflicts": { type: "string" },
+    "max-farm-spend": { type: "string" },
+    "no-auto-wait": { type: "boolean", default: false },
     "max-wall-minutes": { type: "string" },
     "max-cycles": { type: "string" },
     "max-consecutive-errors": { type: "string" },
@@ -93,15 +99,21 @@ try {
       ...(num("max-tool-calls", values["max-tool-calls"]) !== undefined && { maxToolCalls: num("max-tool-calls", values["max-tool-calls"])! }),
       ...(num("max-mutations", values["max-mutations"]) !== undefined && { maxMutations: num("max-mutations", values["max-mutations"])! }),
       ...(num("max-sim-seconds", values["max-sim-seconds"]) !== undefined && { maxSimSeconds: num("max-sim-seconds", values["max-sim-seconds"])! }),
+      ...(num("max-sim-days", values["max-sim-days"]) !== undefined && { maxSimSeconds: num("max-sim-days", values["max-sim-days"])! * 60 }),
+      ...(num("max-advance-requests", values["max-advance-requests"]) !== undefined && { maxAdvanceRequests: num("max-advance-requests", values["max-advance-requests"])! }),
+      ...(num("max-consecutive-advances", values["max-consecutive-advances"]) !== undefined && { maxConsecutiveAdvances: num("max-consecutive-advances", values["max-consecutive-advances"])! }),
+      ...(num("max-conflicts", values["max-conflicts"]) !== undefined && { maxConflicts: num("max-conflicts", values["max-conflicts"])! }),
+      ...(num("max-farm-spend", values["max-farm-spend"]) !== undefined && { maxFarmSpendCredits: num("max-farm-spend", values["max-farm-spend"])! }),
       ...(num("max-wall-minutes", values["max-wall-minutes"]) !== undefined && { maxWallClockMs: num("max-wall-minutes", values["max-wall-minutes"])! * 60_000 }),
       ...(num("max-cycles", values["max-cycles"]) !== undefined && { maxCycles: num("max-cycles", values["max-cycles"])! }),
       ...(num("max-consecutive-errors", values["max-consecutive-errors"]) !== undefined && { maxConsecutiveErrors: num("max-consecutive-errors", values["max-consecutive-errors"])! }),
       ...(num("max-consecutive-no-progress", values["max-consecutive-no-progress"]) !== undefined && { maxConsecutiveNoProgress: num("max-consecutive-no-progress", values["max-consecutive-no-progress"])! }),
     };
     if (mutations) {
-      for (const flag of ["max-cost-usd", "max-mutations", "max-sim-seconds", "max-model-calls"] as const) {
+      for (const flag of ["max-cost-usd", "max-mutations", "max-model-calls"] as const) {
         if (values[flag] === undefined) fail(`--enable-mutations requires explicit budgets: missing --${flag}.`, 2);
       }
+      if (values["max-sim-seconds"] === undefined && values["max-sim-days"] === undefined) fail("--enable-mutations requires an explicit simulated-time budget: --max-sim-days or --max-sim-seconds.", 2);
       if ((overrides.maxMutations ?? 0) < 1) fail("--max-mutations must be at least 1 when mutations are enabled.", 2);
     }
 
@@ -116,7 +128,7 @@ try {
     limits = { ...DEFAULT_SESSION_LIMITS, ...overrides };
     const provider = metaProviderFromEnv(logger, { maxCostPerRequestUsd: limits.maxCostPerRequestUsd, maxSessionCostUsd: limits.maxCostUsd, maxOutputTokens: limits.maxOutputTokens });
     modelId = provider.modelId;
-    const state = newSessionState({ ...(values["session-id"] ? { sessionId: values["session-id"] } : {}), gameId, modelId, mutationsEnabled: mutations, ...(values.objective ? { objective: values.objective } : {}), limits });
+    const state = newSessionState({ ...(values["session-id"] ? { sessionId: values["session-id"] } : {}), gameId, modelId, mutationsEnabled: mutations, autoWait: values["no-auto-wait"] !== true, ...(values.objective ? { objective: values.objective } : {}), limits });
     if (store.exists(state.sessionId)) fail(`Session ${state.sessionId} already exists; use agent:resume.`, 2);
     const lock = store.acquire(state.sessionId);
     lock.save(state);

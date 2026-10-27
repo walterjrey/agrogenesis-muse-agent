@@ -13,6 +13,10 @@ export interface RunLimits {
   maxMutations: number;
   /** Submitted actions, accepted or rejected; bounds retries after rejections. */
   maxMutationAttempts: number;
+  /** HTTP advance requests (model-requested or supervised) in one run. */
+  maxAdvanceRequests: number;
+  /** Largest single advance a supervised wait requests. */
+  maxWaitChunkSeconds: number;
 }
 
 export const DEFAULT_LIMITS: Readonly<RunLimits> = {
@@ -26,6 +30,8 @@ export const DEFAULT_LIMITS: Readonly<RunLimits> = {
   maxTotalAdvanceSeconds: 3600,
   maxMutations: 1,
   maxMutationAttempts: 3,
+  maxAdvanceRequests: 30,
+  maxWaitChunkSeconds: 600,
 };
 
 export interface ToolTraits {
@@ -45,6 +51,7 @@ export class RunPolicy {
   acceptedMutations = 0;
   mutationAttempts = 0;
   advancedSimSeconds = 0;
+  advanceRequests = 0;
 
   constructor(readonly mode: ExecutionMode, readonly limits: RunLimits = DEFAULT_LIMITS) {}
 
@@ -62,6 +69,14 @@ export class RunPolicy {
       if (this.acceptedMutations >= this.limits.maxMutations || this.mutationAttempts >= this.limits.maxMutationAttempts) {
         return { allowed: false, code: "mutation_limit_reached", message: `This run may execute at most ${this.limits.maxMutations} action(s) (${this.limits.maxMutationAttempts} submission attempts). The limit is reached.` };
       }
+    }
+    if (tool.name === "advance_time" || tool.name === "wait_for_operation") {
+      if (this.advanceRequests >= this.limits.maxAdvanceRequests) {
+        return { allowed: false, code: "advance_request_limit", message: `This run may send at most ${this.limits.maxAdvanceRequests} time-advance requests. The limit is reached.` };
+      }
+    }
+    if (tool.name === "wait_for_operation" && this.advancedSimSeconds >= this.limits.maxTotalAdvanceSeconds) {
+      return { allowed: false, code: "advance_limit_exceeded", message: `No simulated time remains in this run's advancement budget.` };
     }
     if (tool.name === "advance_time") {
       const requested = typeof args.requestedSeconds === "number" ? args.requestedSeconds : 0;

@@ -38,7 +38,7 @@ function setup(limits: Partial<SessionLimits> = {}, mutationsEnabled = true) {
   const dir = mkdtempSync(join(tmpdir(), "autonomy-"));
   dirs.push(dir);
   const store = new SessionStore(dir, 5_000);
-  const state = newSessionState({ sessionId: "t1", gameId: GAME_ID, modelId: "muse-spark-1.3", mutationsEnabled, limits });
+  const state = newSessionState({ sessionId: "t1", gameId: GAME_ID, modelId: "muse-spark-1.3", mutationsEnabled, limits, autoWait: false });
   const lock = store.acquire("t1");
   lock.save(state);
   lock.release();
@@ -80,14 +80,12 @@ describe("MOCKED autonomy: multi-cycle control and persistence", () => {
     expect({ ...store.load("t1"), updatedAt: "" }).toEqual({ ...final, updatedAt: "" });
   });
 
-  it("asks once for the missing plan when the model answers without update_plan, and records only what the model then states", async () => {
+  it("does not force update_plan: a cycle without a plan keeps the model's own text, labeled, and invents no plan", async () => {
     sim = await fakeSimulator();
     const { store } = setup();
-    const model = scriptedModel([TEXT, PLAN("stop", "Plan given after the reminder."), TEXT]);
-    const final = await controller(store, sim, model).run();
-    expect(String(model.requests[1]!.messages.at(-1)!.content)).toContain("update_plan");
-    expect(final.decisions[0]!.summary).toBe("Plan given after the reminder.");
-    expect(final.plan).toMatchObject({ nextStep: "stop" });
+    const final = await controller(store, sim, scriptedModel([TEXT])).run();
+    expect(final.plan).toBeNull();
+    expect(final.decisions[0]!.summary).toContain("no plan recorded");
   });
 
   it("never persists credentials", async () => {
