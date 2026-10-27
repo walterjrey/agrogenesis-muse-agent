@@ -23,7 +23,7 @@ The agent talks to the simulator only through a narrow server-to-server HTTP API
    - overview / fields: map `ObservationState` via `queryAgentObservations`. Do not serialize `environment`, `ecosystem` or the snapshot.
    - actions: `ManagementSystem.catalog()` + `preview()`; derive `parametersSchema` from `PARAM_SCHEMAS` (`z.toJSONSchema`).
    - execute: `ManagementSystem.submit({ origin: "ai", actorId: <token id>, ... })`. This is the single authoritative validator; the agent does not duplicate it. Enforce the existing hybrid-mode `approvalRequired` policy. Idempotency key stored per game; `expectedRevision` checked against the game revision.
-4. **Clock**: `advance` runs the real `Simulation.advance` for at most `min(requested, per-call cap, remaining daily budget)`, stops early on the requested events, then persists a new snapshot revision. The agent can never set time directly.
+4. **Clock**: `advance` runs the real `Simulation.advance` for at most `min(requested, per-call cap, remaining daily budget)`, stops early on the requested events, then persists a new snapshot revision. The agent can never set time directly. Like `execute`, `advance` requires both `idempotencyKey` and `expectedRevision` (confirmed against the implemented `AdvanceRequestSchema`); `AdvanceRequest` in this repo's contracts was initially missing `expectedRevision` and has been corrected to match.
 5. **Enable `muse_ai`/`hybrid` creation** only after the above (`AI_AGENT_CONNECTED`), keeping manual mode behaviour untouched.
 6. Rate limits and audit logging on agent routes; `Cache-Control: no-store`.
 

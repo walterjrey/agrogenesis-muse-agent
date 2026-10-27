@@ -39,6 +39,8 @@ export const AdvanceRequest = z.strictObject({
   stopOn: z.array(z.enum(["action_completion", "new_observation", "any_event"])).default(["any_event"]),
   cursor: z.number().int().nonnegative().default(0),
   idempotencyKey: z.string().uuid(),
+  /** Always required: reject if the game changed since the agent observed it. */
+  expectedRevision: z.number().int().positive(),
 });
 export type AdvanceRequest = z.input<typeof AdvanceRequest>;
 
