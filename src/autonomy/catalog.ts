@@ -196,7 +196,8 @@ export interface ActionDescription {
   requiredEquipment: string[];
   /** Distinct parameter schemas with the targets they apply to (usually one). */
   parameterSchemas: Array<{ appliesToTargets: Array<string | null>; schema: JsonSchema }>;
-  targets: Array<{ target: string | null; label: string | null; eligible: boolean; issues: Array<{ code: string; detail: string }>; estimate: AvailableAction["estimate"] }>;
+  /** Per target: label only when it differs from the id; estimate omitted only for ineligible targets with an all-zero estimate (zero resources are left out). */
+  targets: Array<{ target: string | null; label?: string; eligible: boolean; issues?: Array<{ code: string; detail: string }>; estimate?: { resources: Record<string, number>; durationS: number } }>;
 }
 
 export function describeAction(catalog: AvailableActions, type: string): ActionDescription | null {
@@ -225,6 +226,17 @@ export function describeAction(catalog: AvailableActions, type: string): ActionD
     constraints: head.constraints,
     requiredEquipment: head.requiredEquipment,
     parameterSchemas: [...schemas.values()],
-    targets: entries.map((e) => ({ target: e.target?.id ?? null, label: e.target?.label ?? null, eligible: e.eligibility.eligible, issues: e.eligibility.issues.map((i) => ({ code: i.code, detail: i.detail })), estimate: e.estimate })),
+    targets: entries.map((e) => {
+      const resources = Object.fromEntries(Object.entries(e.estimate.resources).filter(([, v]) => typeof v === "number" && v !== 0)) as Record<string, number>;
+      const hasEstimate = Object.keys(resources).length > 0 || e.estimate.durationS !== 0;
+      const label = e.target?.label;
+      return {
+        target: e.target?.id ?? null,
+        ...(label && label !== e.target?.id ? { label } : {}),
+        eligible: e.eligibility.eligible,
+        ...(e.eligibility.issues.length > 0 ? { issues: e.eligibility.issues.map((i) => ({ code: i.code, detail: i.detail })) } : {}),
+        ...(hasEstimate || e.eligibility.eligible ? { estimate: { resources, durationS: e.estimate.durationS } } : {}),
+      };
+    }),
   };
 }

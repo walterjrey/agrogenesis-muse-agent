@@ -179,3 +179,7 @@ Diagnosis, measurements and live results: [AGRICULTURAL_PROGRESS.md](AGRICULTURA
   responses with same-key replay, resume, compaction, determinism.
 - **Live**: sessions `p3c-1` and `p3c-2`. HTTP 409, timeouts and mid-mutation crashes were **not**
   observed live.
+
+# Phase 4A — Crop lifecycle
+
+Adds `wait_for_checkpoint` (Muse-chosen horizon up to 30 simulated days, checkpoints of 0.5–10 days, returns early on non-routine events, never starts farm actions), per-field planting/harvest bookkeeping in the progress record, a `lifecycle` report section, scenario manifest flags and compact field observations. A real 200-simulated-day run (144 Muse calls, $1.274) harvested 7 times and sold once. Details, evidence and limitations (including that the average prompt size did not decrease) are in [CROP_LIFECYCLE.md](CROP_LIFECYCLE.md).

@@ -298,7 +298,7 @@ describe("MOCKED progress record", () => {
     expect(p.completedOperations).toEqual([expect.objectContaining({ actionId: "act-1", type: "prepareSoil", target: "field-1", status: "completed", finishedAtS: 11 })]);
     expect(p.expenses.actionConsumedCredits).toBe(9.12);
     expect(p.expenses.creditsDelta).toBe(-34.12);
-    expect(JSON.stringify(p)).not.toMatch(/plan/i);
+    expect(JSON.stringify(p)).not.toMatch(/\bplan(s|ning)?\b/i);
   });
 });
 

@@ -2,8 +2,9 @@ import { z } from "zod";
 import type { SimulatorClient } from "../simulator/client.js";
 import { createToolRegistry, defineTool, failureFromError, fail, succeed, type RegisteredTool } from "../agent/tools.js";
 import { compactCatalog, describeAction, digestCatalog } from "./catalog.js";
+import { compactFields } from "./compactObservation.js";
 import { collectSnapshot, InconsistentObservationError, type Snapshot } from "./observation.js";
-import { superviseOperation, type WaitResult } from "./supervisor.js";
+import { superviseInterval, superviseOperation, type IntervalResult, type WaitResult } from "./supervisor.js";
 import type { Plan } from "./types.js";
 
 /**
@@ -56,6 +57,7 @@ export interface WaitHooks {
   conflictsLeft(): number;
   onConflict(): void;
   finished(result: WaitResult): void;
+  finishedInterval(result: IntervalResult): void;
 }
 
 export interface PlanSink {
@@ -102,7 +104,7 @@ export function createAutonomousTools(provider: SnapshotProvider, sink: PlanSink
             return succeed({ unchanged: true, revision: snapshot.revision, simTimeS: snapshot.simTimeS, note: "The game has not changed since the snapshot you already have (same revision and simulated time); it is not repeated." });
           }
           provider.delivered = { revision: snapshot.revision, simTimeS: snapshot.simTimeS };
-          return succeed({ revision: snapshot.revision, simTimeS: snapshot.simTimeS, overview: snapshot.overview, fields: snapshot.fields, actions: digestCatalog(snapshot.actions) });
+          return succeed({ revision: snapshot.revision, simTimeS: snapshot.simTimeS, overview: snapshot.overview, fields: compactFields(snapshot.fields), actions: digestCatalog(snapshot.actions) });
         } catch (error) {
           return inconsistent(error);
         }
@@ -223,7 +225,64 @@ export function createAutonomousTools(provider: SnapshotProvider, sink: PlanSink
             },
           }),
         ]
-      : []),    reuse("get_action_status"),
+      : []),
+    ...(wait
+      ? [
+          defineTool({
+            name: "wait_for_checkpoint",
+            description:
+              "Let simulated time pass in bounded review checkpoints (default 5 simulated days each) up to a horizon YOU choose (max 30 days), for example while a planted crop grows. It never starts a farm action and never uses the server maximum. After every checkpoint the runtime looks at the simulator events and returns to you early on any weather alert, equipment change, operation finishing or failing, or mode change; otherwise it stops at your horizon. Observe again afterwards: nothing is inferred about crop state. Call it alone.",
+            mutating: true,
+            args: z.strictObject({
+              maxDays: z.number().positive().max(30).describe("Horizon in simulated days (one day = 60 s)."),
+              checkpointDays: z.number().min(0.5).max(10).optional().describe("Review checkpoint size in simulated days (default 5)."),
+              rationale: z.string().min(1).max(500).optional(),
+            }),
+            async run(context, args) {
+              if (context.state.mutationLocked) return fail("mutation_locked", "A previous state-changing request has an unconfirmed outcome; no further time advancement is allowed in this run.");
+              const limits = context.policy.limits;
+              const result = await superviseInterval(
+                {
+                  client: context.client,
+                  gameId: context.gameId,
+                  ...(context.journal ? { journal: context.journal } : {}),
+                  newMutationId: context.newMutationId,
+                  retryDelayMs: context.retryDelayMs,
+                  maxMutationRetries: context.maxMutationRetries,
+                  budget: {
+                    requestsLeft: Math.max(0, limits.maxAdvanceRequests - context.policy.advanceRequests),
+                    simSecondsLeft: Math.max(0, limits.maxTotalAdvanceSeconds - context.policy.advancedSimSeconds),
+                    maxChunkSeconds: Math.min(wait.maxChunkSeconds, limits.maxAdvanceSecondsPerCall),
+                    maxCallSeconds: limits.maxAdvanceSecondsPerCall,
+                    conflictsLeft: wait.conflictsLeft(),
+                  },
+                  getCursor: () => context.state.eventCursor,
+                  setCursor: (cursor) => {
+                    context.state.eventCursor = cursor;
+                  },
+                  onAdvanced: (granted) => {
+                    context.policy.advancedSimSeconds += granted;
+                    context.policy.advanceRequests += 1;
+                  },
+                  onConflict: wait.onConflict,
+                  record: (event, data) => context.trace.record(event, data),
+                },
+                { maxSeconds: args.maxDays * 60, checkpointSeconds: (args.checkpointDays ?? 5) * 60 },
+              );
+              context.state.observedRevision = null;
+              provider.invalidate();
+              wait.finishedInterval(result);
+              context.trace.record("supervisor.interval_result", { ...result });
+              if (result.outcome === "outcome_unknown") {
+                context.state.mutationLocked = true;
+                return fail("outcome_unknown", "A time advance may or may not have been applied. Further state-changing calls are blocked for this run; the controller will reconcile it with the original idempotency key.");
+              }
+              return succeed({ ...result, note: "Time advanced on the server. Earlier observations are stale; observe again before acting." });
+            },
+          }),
+        ]
+      : []),
+    reuse("get_action_status"),
     reuse("get_recent_events"),
   ];
 }

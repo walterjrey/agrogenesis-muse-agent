@@ -1,5 +1,6 @@
 import type { Snapshot } from "./observation.js";
 import { digestCatalog } from "./catalog.js";
+import { compactFields } from "./compactObservation.js";
 import type { ProgressRecord, SessionState } from "./types.js";
 import type { GameEvent } from "../contracts/time.js";
 
@@ -14,8 +15,9 @@ Information:
 - The action catalog is a digest of eligible actions only. Use describe_action for the exact parameter schema before execute_action. Only the simulator validates actions and may reject them.
 
 Acting:
-- execute_action and advance_time change the farm; call each alone. You cannot set revisions or idempotency keys. Costs are real simulated resources: avoid duplicate, repeated or speculative actions, and prefer doing nothing over an unjustified action.
-- Time: one simulated day is 60 simulated seconds and the server advances in 0.1 s ticks. An operation you started takes simulated time to finish. To wait for it call wait_for_operation (one call, the runtime sizes the advances, stops when it finishes, fails or something important happens, and reports facts); do not poll with repeated advance_time/get_action_status. Use advance_time only for a deliberate, justified jump (e.g. letting crops grow); the server grants at most what it allows and reports the granted time. Never advance just to loop.
+- execute_action, advance_time, wait_for_operation and wait_for_checkpoint change the farm; call each alone. You cannot set revisions or idempotency keys. Costs are real simulated resources: avoid duplicate, repeated or speculative actions, and prefer doing nothing over an unjustified action.
+- Time: one simulated day is 60 simulated seconds and the server advances in 0.1 s ticks. An operation you started takes simulated time to finish. To wait for it call wait_for_operation (one call, the runtime sizes the advances, stops when it finishes, fails or something important happens, and reports facts); do not poll with repeated advance_time/get_action_status. Crops need on the order of 100 simulated days (about 6,000 s) to mature. To let a crop grow, call wait_for_checkpoint with a horizon you choose (max 30 days): it advances in review checkpoints and returns early on weather alerts, equipment changes or operations finishing/failing; it never starts farm actions. Use advance_time only for a short, justified jump; the server grants at most what it allows and reports the granted time. Never advance just to loop.
+- Crop identity and growth stage are NOT observable. The operational record keeps what you planted and when (plantedCrop, simDaysSincePlanting) from your own completed actions; harvestField becoming eligible is the simulator's own maturity signal. Inspect fields, irrigate or treat only when the observations justify it, and judge readiness from the catalog, not from the calendar.
 - On stale_revision or conflict, observe again and reconsider. On outcome_unknown, stop acting this cycle and report.
 - Budgets are hard limits; when little remains, prefer a safe state and a clear report.
 
@@ -53,7 +55,7 @@ export function cycleBrief({ state, snapshot, events, progress }: CycleBriefInpu
     recentDecisions: recent,
     operationalRecord: progress,
     eventsSinceLastCycle: events.map((e) => ({ id: e.eventId, simTimeS: e.simTimeS, kind: e.kind, actionId: e.actionId, summary: e.summary })),
-    snapshot: { revision: snapshot.revision, simTimeS: snapshot.simTimeS, overview: snapshot.overview, fields: snapshot.fields, actions: digestCatalog(snapshot.actions) },
+    snapshot: { revision: snapshot.revision, simTimeS: snapshot.simTimeS, overview: snapshot.overview, fields: compactFields(snapshot.fields), actions: digestCatalog(snapshot.actions) },
   };
   return `Decision cycle ${state.cycle}. Work toward the objective with the evidence below, then give a short decision summary.\n${JSON.stringify(brief)}`;
 }

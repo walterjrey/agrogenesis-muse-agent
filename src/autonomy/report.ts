@@ -16,6 +16,24 @@ export function buildReport(state: SessionState) {
     for (const [name, count] of Object.entries(d.tools)) acc[name] = (acc[name] ?? 0) + count;
     return acc;
   }, {});
+  const sum = (xs: Array<number | null>): number => Math.round(xs.reduce<number>((a, b) => a + (b ?? 0), 0) * 100) / 100;
+  const byType = (type: string) => state.actions.filter((a) => a.type === type);
+  const done = (type: string) => byType(type).filter((a) => a.status === "completed");
+  const costsByType = state.actions.reduce<Record<string, number>>((acc, a) => (a.consumedCredits === null ? acc : { ...acc, [a.type]: Math.round(((acc[a.type] ?? 0) + a.consumedCredits) * 100) / 100 }), {});
+  const lifecycle = {
+    plantings: done("plantField").map((a) => ({ fieldId: a.target, crop: a.params.crop ?? null, atSimTimeS: a.finishedAtS })),
+    inspections: state.actions.filter((a) => a.type.startsWith("inspect") || a.type.startsWith("survey") || a.type === "sampleSoil").length,
+    irrigations: { count: done("irrigateField").length, waterM3Consumed: sum(done("irrigateField").map((a) => a.consumedWaterM3)) },
+    treatments: done("applyTreatment").length,
+    harvests: done("harvestField").map((a) => ({ fieldId: a.target, atSimTimeS: a.finishedAtS, outcome: a.outcome })),
+    sales: done("sellHarvest").map((a) => ({ product: a.params.product ?? null, kg: a.params.kg ?? null, atSimTimeS: a.finishedAtS, outcome: a.outcome })),
+    harvestedGrainPeakKg: state.metrics.grainPeakKg,
+    actionCreditsByType: costsByType,
+    seedConsumedKg: sum(state.actions.map((a) => a.consumedSeedKg)),
+    fuelConsumedL: sum(state.actions.map((a) => a.consumedFuelL)),
+    netCreditsResult: delta(baseline?.credits, latest?.credits),
+    cropCycleCompleted: done("harvestField").length > 0 && done("sellHarvest").length > 0,
+  };
   const submitted = state.budgets.acceptedMutations + state.budgets.rejectedActions;
   return {
     sessionId: state.sessionId,
@@ -40,6 +58,8 @@ export function buildReport(state: SessionState) {
     time: { advancedSimSeconds: state.budgets.advancedSimSeconds, simulatedDaysElapsed: Math.round((state.budgets.advancedSimSeconds / SECONDS_PER_SIM_DAY) * 1000) / 1000, advanceRequests: state.budgets.advanceRequests, lastSimTimeS: state.lastSimTimeS },
     waits: { count: state.waits.length, byOutcome: state.waits.reduce<Record<string, number>>((acc, w) => ({ ...acc, [w.outcome]: (acc[w.outcome] ?? 0) + 1 }), {}), byTrigger: { model_tool: state.waits.filter((w) => w.trigger === "model_tool").length, controller: state.waits.filter((w) => w.trigger === "controller").length } },
     progress: state.progress,
+    scenario: state.config.scenario,
+    lifecycle,
     farm: {
       revision: { first: baseline?.revision ?? null, last: latest?.revision ?? null },
       credits: { first: baseline?.credits ?? null, last: latest?.credits ?? null, delta: delta(baseline?.credits, latest?.credits) },

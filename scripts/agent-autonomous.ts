@@ -27,6 +27,10 @@ const { values, positionals } = parseArgs({
     "enable-mutations": { type: "boolean", default: false },
     objective: { type: "string" },
     "slice-cycles": { type: "string" },
+  "scenario-name": { type: "string" },
+  "scenario-seed": { type: "string" },
+  "start-snapshot-sha256": { type: "string" },
+  "world-config-sha256": { type: "string" },
     decisions: { type: "boolean", default: false },
     "max-cost-usd": { type: "string" },
     "max-model-calls": { type: "string" },
@@ -128,7 +132,7 @@ try {
     limits = { ...DEFAULT_SESSION_LIMITS, ...overrides };
     const provider = metaProviderFromEnv(logger, { maxCostPerRequestUsd: limits.maxCostPerRequestUsd, maxSessionCostUsd: limits.maxCostUsd, maxOutputTokens: limits.maxOutputTokens });
     modelId = provider.modelId;
-    const state = newSessionState({ ...(values["session-id"] ? { sessionId: values["session-id"] } : {}), gameId, modelId, mutationsEnabled: mutations, autoWait: values["no-auto-wait"] !== true, ...(values.objective ? { objective: values.objective } : {}), limits });
+    const state = newSessionState({ ...(values["session-id"] ? { sessionId: values["session-id"] } : {}), gameId, modelId, mutationsEnabled: mutations, autoWait: values["no-auto-wait"] !== true, ...(values.objective ? { objective: values.objective } : {}), limits, scenario: { name: values["scenario-name"] ?? null, seed: values["scenario-seed"] ? Number(values["scenario-seed"]) : null, startSnapshotSha256: values["start-snapshot-sha256"] ?? null, worldConfigSha256: values["world-config-sha256"] ?? null } });
     if (store.exists(state.sessionId)) fail(`Session ${state.sessionId} already exists; use agent:resume.`, 2);
     const lock = store.acquire(state.sessionId);
     lock.save(state);

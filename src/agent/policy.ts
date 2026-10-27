@@ -70,12 +70,12 @@ export class RunPolicy {
         return { allowed: false, code: "mutation_limit_reached", message: `This run may execute at most ${this.limits.maxMutations} action(s) (${this.limits.maxMutationAttempts} submission attempts). The limit is reached.` };
       }
     }
-    if (tool.name === "advance_time" || tool.name === "wait_for_operation") {
+    if (tool.name === "advance_time" || tool.name === "wait_for_operation" || tool.name === "wait_for_checkpoint") {
       if (this.advanceRequests >= this.limits.maxAdvanceRequests) {
         return { allowed: false, code: "advance_request_limit", message: `This run may send at most ${this.limits.maxAdvanceRequests} time-advance requests. The limit is reached.` };
       }
     }
-    if (tool.name === "wait_for_operation" && this.advancedSimSeconds >= this.limits.maxTotalAdvanceSeconds) {
+    if ((tool.name === "wait_for_operation" || tool.name === "wait_for_checkpoint") && this.advancedSimSeconds >= this.limits.maxTotalAdvanceSeconds) {
       return { allowed: false, code: "advance_limit_exceeded", message: `No simulated time remains in this run's advancement budget.` };
     }
     if (tool.name === "advance_time") {

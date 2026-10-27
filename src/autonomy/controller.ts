@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { runAgent } from "../agent/runtime.js";
 import type { MutationIntent, MutationJournal, MutationSettlement } from "../agent/tools.js";
@@ -11,9 +11,9 @@ import { InconsistentObservationError, summarizeSnapshot, isAuthFailure } from "
 import { AUTONOMOUS_SYSTEM_PROMPT, DEFAULT_OBJECTIVE, cycleBrief } from "./prompt.js";
 import { SessionLockLostError, type SessionLock, type SessionStore } from "./store.js";
 import { buildProgress } from "./progress.js";
-import { superviseOperation, type WaitResult } from "./supervisor.js";
+import { superviseOperation, type IntervalResult, type WaitResult } from "./supervisor.js";
 import { createAutonomousTools, SnapshotProvider, type PlanSink } from "./tools.js";
-import { DEFAULT_SESSION_LIMITS, TERMINAL_ACTION_STATUSES, type SessionLimits, type SessionState, type WaitRecord } from "./types.js";
+import { DEFAULT_SESSION_LIMITS, TERMINAL_ACTION_STATUSES, type ObservationSummary, type ScenarioManifest, type SessionLimits, type SessionState, type WaitRecord } from "./types.js";
 
 export interface NewSessionOptions {
   sessionId?: string;
@@ -24,6 +24,19 @@ export interface NewSessionOptions {
   limits?: Partial<SessionLimits>;
   /** Let the controller wait (server time only) for operations the model already started. Default true. */
   autoWait?: boolean;
+  /** Starting-condition identity supplied by the operator (seed, scenario name, DB snapshot hash). */
+  scenario?: Partial<ScenarioManifest>;
+}
+
+const EMPTY_SCENARIO: ScenarioManifest = { name: null, seed: null, startSnapshotSha256: null, worldConfigSha256: null, startObservationSha256: null, startRevision: null, startSimTimeS: null, notes: [] };
+
+/** Primitive request parameters only (crop, volumeM3, kg, ...). */
+function primitiveParams(request: Record<string, unknown>): Record<string, string | number | boolean> {
+  const out: Record<string, string | number | boolean> = {};
+  const params = request.params;
+  if (typeof params !== "object" || params === null) return out;
+  for (const [key, value] of Object.entries(params as Record<string, unknown>)) if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") out[key] = value;
+  return out;
 }
 
 export function newSessionState(options: NewSessionOptions): SessionState {
@@ -37,7 +50,7 @@ export function newSessionState(options: NewSessionOptions): SessionState {
     status: "paused",
     stopReason: "not_started",
     stopDetail: null,
-    config: { modelId: options.modelId, mutationsEnabled: options.mutationsEnabled, objective: options.objective ?? DEFAULT_OBJECTIVE, limits: { ...DEFAULT_SESSION_LIMITS, ...options.limits }, autoWait: options.autoWait ?? true },
+    config: { modelId: options.modelId, mutationsEnabled: options.mutationsEnabled, objective: options.objective ?? DEFAULT_OBJECTIVE, limits: { ...DEFAULT_SESSION_LIMITS, ...options.limits }, autoWait: options.autoWait ?? true, scenario: { ...EMPTY_SCENARIO, ...options.scenario } },
     cycle: 0,
     plan: null,
     decisions: [],
@@ -52,7 +65,7 @@ export function newSessionState(options: NewSessionOptions): SessionState {
     progressCursor: 0,
     budgets: { costUsd: 0, modelCalls: 0, toolCalls: 0, acceptedMutations: 0, mutationAttempts: 0, rejectedActions: 0, advancedSimSeconds: 0, wallClockMs: 0, consecutiveErrors: 0, consecutiveNoProgress: 0,     consecutiveRejections: 0, advanceRequests: 0, consecutiveAdvances: 0, conflicts: 0 },
     usage: { inputTokens: 0, outputTokens: 0, cachedTokens: 0 },
-    metrics: { baseline: null, latest: null, controllerReads: 0, snapshotRefreshes: 0, snapshotCacheHits: 0, mixedRevisionDetections: 0 },
+    metrics: { baseline: null, latest: null, controllerReads: 0, snapshotRefreshes: 0, snapshotCacheHits: 0, mixedRevisionDetections: 0, grainPeakKg: {} },
   };
 }
 
@@ -151,7 +164,7 @@ export class AutonomousController {
         const actionId = settlement.summary.actionId;
         if (typeof actionId === "string") {
           const status = settlement.summary.actionStatus;
-          s.actions.push({ actionId, type: String(settlement.summary.type ?? ""), status: typeof status === "string" ? (status as SessionState["actions"][number]["status"]) : "scheduled", submittedAtRevision: intent.expectedRevision,           idempotencyKey: intent.idempotencyKey, lastCheckedAt: null, target: typeof intent.request.params === "object" && intent.request.params !== null && typeof (intent.request.params as Record<string, unknown>).fieldId === "string" ? String((intent.request.params as Record<string, unknown>).fieldId) : typeof intent.request.targetId === "string" ? intent.request.targetId : null, startedAtS: null, estimatedCompletionS: null, finishedAtS: null, progress: null, consumedCredits: null, outcome: null, failure: null });
+          s.actions.push({ actionId, type: String(settlement.summary.type ?? ""), status: typeof status === "string" ? (status as SessionState["actions"][number]["status"]) : "scheduled", submittedAtRevision: intent.expectedRevision,           idempotencyKey: intent.idempotencyKey, lastCheckedAt: null, target: typeof intent.request.params === "object" && intent.request.params !== null && typeof (intent.request.params as Record<string, unknown>).fieldId === "string" ? String((intent.request.params as Record<string, unknown>).fieldId) : typeof intent.request.targetId === "string" ? intent.request.targetId : null, startedAtS: null, estimatedCompletionS: null, finishedAtS: null, progress: null, consumedCredits: null, outcome: null, failure: null, params: primitiveParams(intent.request), consumedWaterM3: null, consumedSeedKg: null, consumedFuelL: null });
         }
                   b.consecutiveAdvances = 0;
       } else if (settlement.status === "rejected") {
@@ -251,6 +264,9 @@ export class AutonomousController {
         action.finishedAtS = view.finishedAtS ?? null;
         action.progress = view.progress ?? null;
         action.consumedCredits = view.consumed?.credits ?? null;
+        action.consumedWaterM3 = view.consumed?.waterM3 ?? null;
+        action.consumedSeedKg = view.consumed?.seedKg ?? null;
+        action.consumedFuelL = view.consumed?.fuelL ?? null;
         action.outcome = view.outcome?.summary ?? null;
         action.failure = view.failure ? `${view.failure.code}: ${view.failure.detail}`.slice(0, 200) : null;
       } catch {
@@ -272,6 +288,10 @@ export class AutonomousController {
       /* no evidence available: not counted as progress */
     }
     return { progress: reasons.length > 0, reasons };
+  }
+
+  private recordInterval(r: IntervalResult): void {
+    this.state.waits.push({ cycle: this.state.cycle, actionId: "checkpoint-interval", trigger: "model_tool", outcome: r.outcome, actionStatus: null, advanceRequests: r.advanceRequests, advancedSeconds: r.advancedSeconds, simTimeStartS: r.simTimeStartS, simTimeEndS: r.simTimeEndS, events: r.events, detail: r.detail });
   }
 
   private recordWait(wait: WaitResult, trigger: WaitRecord["trigger"]): void {
@@ -325,6 +345,12 @@ export class AutonomousController {
     return spent !== null && spent >= this.state.config.limits.maxFarmSpendCredits;
   }
 
+  private noteSummary(summary: ObservationSummary): void {
+    const metrics = this.state.metrics;
+    metrics.latest = summary;
+    for (const r of summary.resources) if (r.kind === "grain") metrics.grainPeakKg[r.id] = Math.max(metrics.grainPeakKg[r.id] ?? 0, r.quantity);
+  }
+
   /** Best-effort final read so the report has the true end state; failures leave the previous (real) values. */
   private async finalize(): Promise<void> {
     try {
@@ -332,7 +358,7 @@ export class AutonomousController {
       const snapshot = await this.provider.get();
       this.state.lastRevision = snapshot.revision;
       this.state.lastSimTimeS = snapshot.simTimeS;
-      this.state.metrics.latest = summarizeSnapshot(snapshot);
+      this.noteSummary(summarizeSnapshot(snapshot));
     } catch {
       /* keep last known */
     }
@@ -383,7 +409,12 @@ export class AutonomousController {
         s.lastSimTimeS = snapshot.simTimeS;
         const summary = summarizeSnapshot(snapshot);
         s.metrics.baseline ??= summary;
-        s.metrics.latest = summary;
+        this.noteSummary(summary);
+        if (s.config.scenario.startObservationSha256 === null && s.metrics.baseline === summary) {
+          s.config.scenario.startObservationSha256 = createHash("sha256").update(JSON.stringify({ overview: snapshot.overview, fields: snapshot.fields, actions: snapshot.actions })).digest("hex");
+          s.config.scenario.startRevision = snapshot.revision;
+          s.config.scenario.startSimTimeS = snapshot.simTimeS;
+        }
         const eventsResponse = await this.options.client.getEvents(s.gameId, s.modelEventCursor);
         const events: GameEvent[] = eventsResponse.events;
 
@@ -401,6 +432,7 @@ export class AutonomousController {
           conflictsLeft: () => Math.max(0, l.maxConflicts - s.budgets.conflicts),
           onConflict: () => undefined,
           finished: (wait) => this.recordWait(wait, "model_tool"),
+          finishedInterval: (r) => this.recordInterval(r),
         } : undefined);
 
         result = await runAgent({

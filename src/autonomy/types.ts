@@ -88,6 +88,11 @@ export const TrackedAction = z.strictObject({
   consumedCredits: z.number().nullable().default(null),
   outcome: z.string().nullable().default(null),
   failure: z.string().nullable().default(null),
+  /** Primitive parameters the model requested (e.g. crop, volumeM3, kg); never authoritative simulation values. */
+  params: z.record(z.string(), z.union([z.string(), z.number(), z.boolean()])).default({}),
+  consumedWaterM3: z.number().nullable().default(null),
+  consumedSeedKg: z.number().nullable().default(null),
+  consumedFuelL: z.number().nullable().default(null),
 });
 export type TrackedAction = z.infer<typeof TrackedAction>;
 
@@ -111,7 +116,21 @@ export type WaitRecord = z.infer<typeof WaitRecord>;
 export const ProgressRecord = z.strictObject({
   objective: z.string(),
   simTimeS: z.number().nullable(),
-  fields: z.array(z.strictObject({ fieldId: z.string(), knownCrop: z.string().nullable(), knownGrowthStage: z.string().nullable(), activeOperation: z.string().nullable(), lastActionType: z.string().nullable() })),
+  fields: z.array(
+    z.strictObject({
+      fieldId: z.string(),
+      knownCrop: z.string().nullable(),
+      knownGrowthStage: z.string().nullable(),
+      activeOperation: z.string().nullable(),
+      lastActionType: z.string().nullable(),
+      /** From this session's own completed plantField action (never from a sensor). */
+      plantedCrop: z.string().nullable().default(null),
+      plantedAtSimTimeS: z.number().nullable().default(null),
+      simDaysSincePlanting: z.number().nullable().default(null),
+      lastHarvestAtSimTimeS: z.number().nullable().default(null),
+      lastInspectionAtSimTimeS: z.number().nullable().default(null),
+    }),
+  ),
   pendingOperations: z.array(z.strictObject({ actionId: z.string(), type: z.string(), target: z.string().nullable(), status: z.string(), progress: z.number().nullable(), estimatedCompletionS: z.number().nullable() })),
   completedOperations: z.array(z.strictObject({ actionId: z.string(), type: z.string(), target: z.string().nullable(), status: z.string(), finishedAtS: z.number().nullable(), outcome: z.string().nullable(), failure: z.string().nullable() })),
   blockers: z.array(z.string()),
@@ -177,6 +196,19 @@ export const ObservationSummary = z.strictObject({
 });
 export type ObservationSummary = z.infer<typeof ObservationSummary>;
 
+/** Starting-condition identity. The DB hashes are supplied by the operator; the observation hash is computed by the agent from its first authorized observation. */
+export const ScenarioManifest = z.strictObject({
+  name: z.string().nullable(),
+  seed: z.number().nullable(),
+  startSnapshotSha256: z.string().nullable(),
+  worldConfigSha256: z.string().nullable(),
+  startObservationSha256: z.string().nullable(),
+  startRevision: z.number().int().nullable(),
+  startSimTimeS: z.number().nullable(),
+  notes: z.array(z.string()),
+});
+export type ScenarioManifest = z.infer<typeof ScenarioManifest>;
+
 export const SessionStatus = z.enum(["running", "paused", "stopped", "completed", "failed"]);
 export type SessionStatus = z.infer<typeof SessionStatus>;
 
@@ -196,6 +228,8 @@ export const SessionState = z.strictObject({
     limits: SessionLimits,
     /** After a model turn, wait mechanically (no model calls) for operations still in flight. */
     autoWait: z.boolean().default(true),
+    /** Identity of the starting conditions, so a run can be reproduced and audited. */
+    scenario: ScenarioManifest.default({ name: null, seed: null, startSnapshotSha256: null, worldConfigSha256: null, startObservationSha256: null, startRevision: null, startSimTimeS: null, notes: [] }),
   }),
   cycle: z.number().int(),
   plan: Plan.nullable(),
@@ -235,6 +269,8 @@ export const SessionState = z.strictObject({
     snapshotRefreshes: z.number().int(),
     snapshotCacheHits: z.number().int(),
     mixedRevisionDetections: z.number().int(),
+    /** Largest stock of each grain product seen in any authorized observation (kg). */
+    grainPeakKg: z.record(z.string(), z.number()).default({}),
   }),
 });
 export type SessionState = z.infer<typeof SessionState>;

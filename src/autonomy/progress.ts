@@ -1,7 +1,9 @@
 import type { ObservationSummary } from "./types.js";
 import { TERMINAL_ACTION_STATUSES, type ProgressRecord, type SessionState } from "./types.js";
 
-const MAX_COMPLETED = 8;
+const MAX_COMPLETED = 6;
+/** The simulator's DAY_SECONDS. */
+const SECONDS_PER_SIM_DAY = 60;
 const round2 = (n: number): number => Math.round(n * 100) / 100;
 
 /**
@@ -20,7 +22,23 @@ export function buildProgress(state: SessionState): ProgressRecord {
     const forField = actions.filter((a) => a.target === f.fieldId);
     const active = forField.find((a) => !TERMINAL_ACTION_STATUSES.has(a.status));
     const last = forField[forField.length - 1];
-    return { fieldId: f.fieldId, knownCrop: f.knownCrop, knownGrowthStage: f.knownGrowthStage, activeOperation: active ? `${active.type} (${active.actionId})` : null, lastActionType: last?.type ?? null };
+    const completed = (type: string) => forField.filter((a) => a.type === type && a.status === "completed" && a.finishedAtS !== null).at(-1);
+    const planting = completed("plantField");
+    const harvest = completed("harvestField");
+    const harvestedAfterPlanting = planting && harvest && harvest.finishedAtS! >= planting.finishedAtS!;
+    const now = state.lastSimTimeS;
+    return {
+      fieldId: f.fieldId,
+      knownCrop: f.knownCrop,
+      knownGrowthStage: f.knownGrowthStage,
+      activeOperation: active ? `${active.type} (${active.actionId})` : null,
+      lastActionType: last?.type ?? null,
+      plantedCrop: planting && !harvestedAfterPlanting ? (typeof planting.params.crop === "string" ? planting.params.crop : null) : null,
+      plantedAtSimTimeS: planting && !harvestedAfterPlanting ? planting.finishedAtS : null,
+      simDaysSincePlanting: planting && !harvestedAfterPlanting && now !== null ? round2((now - planting.finishedAtS!) / SECONDS_PER_SIM_DAY) : null,
+      lastHarvestAtSimTimeS: harvest?.finishedAtS ?? null,
+      lastInspectionAtSimTimeS: completed("inspectField")?.finishedAtS ?? null,
+    };
   });
 
   const blockers: string[] = [];
