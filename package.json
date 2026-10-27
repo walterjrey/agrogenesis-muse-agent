@@ -16,7 +16,12 @@
     "agent:test-action": "tsx scripts/agent-run.ts test-action",
     "agent:autonomous": "tsx scripts/agent-autonomous.ts start",
     "agent:resume": "tsx scripts/agent-autonomous.ts resume",
-    "agent:status": "tsx scripts/agent-autonomous.ts status"
+    "agent:status": "tsx scripts/agent-autonomous.ts status",
+    "baseline:start": "tsx scripts/agent-baseline.ts start",
+    "baseline:resume": "tsx scripts/agent-baseline.ts resume",
+    "baseline:status": "tsx scripts/agent-baseline.ts status",
+    "benchmark:verify-pair": "tsx scripts/benchmark.ts verify-pair",
+    "benchmark:outcome": "tsx scripts/benchmark.ts outcome"
   },
   "dependencies": {
     "openai": "^6.0.0",
