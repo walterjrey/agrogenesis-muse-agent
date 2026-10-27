@@ -11,7 +11,9 @@
     "test": "vitest run",
     "build": "tsc -p tsconfig.build.json",
     "model:ping": "tsx scripts/model-ping.ts",
-    "integration:real": "tsx scripts/simulator-integration.ts"
+    "integration:real": "tsx scripts/simulator-integration.ts",
+    "agent:observe": "tsx scripts/agent-run.ts observe",
+    "agent:test-action": "tsx scripts/agent-run.ts test-action"
   },
   "dependencies": {
     "openai": "^6.0.0",

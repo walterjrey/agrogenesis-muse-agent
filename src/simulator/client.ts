@@ -23,6 +23,9 @@ export interface SimulatorClientOptions {
   fetchImpl?: typeof fetch;
 }
 
+/** A submission the simulator validated and refused answers 422 with a normal, committed response body. */
+const SUBMISSION_STATUSES = [422] as const;
+
 export class SimulatorError extends Error {
   constructor(
     message: string,
@@ -69,7 +72,7 @@ export class SimulatorClient {
   /** Mutating. Defaults to a dry run so nothing is committed unless the caller opts in explicitly. */
   executeAction(gameId: string, input: Omit<ExecuteActionRequest, "idempotencyKey" | "dryRun"> & { dryRun?: boolean; idempotencyKey?: string }) {
     const body = { ...input, dryRun: input.dryRun ?? true, idempotencyKey: input.idempotencyKey ?? randomUUID() };
-    return this.request("POST", this.game(gameId, "actions"), ExecuteActionResponse, body);
+    return this.request("POST", this.game(gameId, "actions"), ExecuteActionResponse, body, SUBMISSION_STATUSES);
   }
 
   getAction(gameId: string, actionId: string) {
@@ -90,7 +93,7 @@ export class SimulatorClient {
     return `/api/agent/v1/games/${encodeURIComponent(gameId)}/${suffix}`;
   }
 
-  private async request<S extends z.ZodType>(method: "GET" | "POST", path: string, schema: S, body?: unknown): Promise<z.infer<S>> {
+  private async request<S extends z.ZodType>(method: "GET" | "POST", path: string, schema: S, body?: unknown, okStatuses: readonly number[] = []): Promise<z.infer<S>> {
     const started = Date.now();
     const url = `${this.baseUrl}${path}`;
     let response: Response;
@@ -121,7 +124,7 @@ export class SimulatorClient {
     }
     this.logger.log("info", "simulator.request", { method, path, status: response.status, ms: Date.now() - started });
 
-    if (!response.ok) {
+    if (!response.ok && !okStatuses.includes(response.status)) {
       const parsed = ApiErrorBody.safeParse(json);
       throw new SimulatorError(parsed.success ? parsed.data.error : `Simulator returned HTTP ${response.status}.`, "http", response.status, parsed.success ? parsed.data : undefined);
     }

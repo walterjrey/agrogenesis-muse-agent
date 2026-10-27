@@ -22,6 +22,8 @@ export interface ModelResponse {
   model: string;
   content: string | null;
   toolCalls: ModelToolCall[];
+  /** The assistant message exactly as returned; Chat Completions requires it to be replayed before tool results. */
+  assistantMessage: ChatCompletionMessageParam;
   finishReason: string;
   usage: TokenUsage | null;
   estimatedCostUsd: number | null;
@@ -110,6 +112,7 @@ export class MetaModelProvider implements ModelProvider {
         model: this.modelId,
         content: choice.message.content,
         toolCalls,
+        assistantMessage: replayableAssistantMessage(choice.message),
         finishReason: choice.finish_reason,
         usage,
         estimatedCostUsd: cost,
@@ -133,6 +136,14 @@ export class MetaModelProvider implements ModelProvider {
       throw mapped;
     }
   }
+}
+
+/** Keeps only the fields Chat Completions accepts back (role, content, function tool calls). */
+function replayableAssistantMessage(message: { content: string | null; tool_calls?: Array<{ id: string; type: string; function?: { name: string; arguments: string } }> }): ChatCompletionMessageParam {
+  const toolCalls = (message.tool_calls ?? []).flatMap((tc) =>
+    tc.type === "function" && tc.function ? [{ id: tc.id, type: "function" as const, function: { name: tc.function.name, arguments: tc.function.arguments } }] : [],
+  );
+  return { role: "assistant", content: message.content, ...(toolCalls.length ? { tool_calls: toolCalls } : {}) };
 }
 
 function mapError(error: unknown): ModelApiError {

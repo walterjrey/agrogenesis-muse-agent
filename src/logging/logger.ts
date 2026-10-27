@@ -3,10 +3,10 @@ import { dirname } from "node:path";
 
 export type LogLevel = "debug" | "info" | "warn" | "error";
 const ORDER: Record<LogLevel, number> = { debug: 10, info: 20, warn: 30, error: 40 };
-const SENSITIVE_KEY = /key|token|secret|password|authorization|cookie|database_url/i;
+const SENSITIVE_KEY = /(?<!idempotency)key|token(?!s)|secret|password|authorization|cookie|database_url/i;
 
 export function redact(value: unknown, depth = 0): unknown {
-  if (depth > 6) return "[truncated]";
+  if (depth > 12) return "[truncated]";
   if (typeof value === "string") return value.replace(/Bearer\s+[\w.~+/=-]+/gi, "Bearer [redacted]");
   if (Array.isArray(value)) return value.map((v) => redact(v, depth + 1));
   if (value && typeof value === "object") {

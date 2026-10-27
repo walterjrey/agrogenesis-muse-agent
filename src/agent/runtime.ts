@@ -1,0 +1,210 @@
+import { randomUUID } from "node:crypto";
+import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
+import { ModelApiError, type ModelProvider, type ModelResponse, type ModelToolCall } from "../model/meta.js";
+import { SpendLimitError } from "../model/spendGuard.js";
+import type { SimulatorClient } from "../simulator/client.js";
+import { DEFAULT_LIMITS, RunPolicy, type ExecutionMode, type RunLimits } from "./policy.js";
+import { SYSTEM_PROMPT, userBrief } from "./prompt.js";
+import { createToolRegistry, newMutationId, toolSpecs, type RegisteredTool, type ToolContext, type ToolOutcome, type ToolState } from "./tools.js";
+import { RunTrace } from "./trace.js";
+
+export type StopReason = "final_answer" | "model_call_limit" | "cost_limit" | "model_error" | "empty_response";
+
+export interface RunTotals {
+  modelCalls: number;
+  toolCalls: number;
+  inputTokens: number;
+  outputTokens: number;
+  cachedTokens: number;
+  estimatedCostUsd: number;
+  acceptedMutations: number;
+  mutationAttempts: number;
+  advancedSimSeconds: number;
+}
+
+export interface RunResult {
+  runId: string;
+  status: "completed" | "limited" | "failed";
+  stopReason: StopReason;
+  mode: ExecutionMode;
+  modelId: string;
+  gameId: string;
+  finalSummary: string | null;
+  totals: RunTotals;
+  error: string | null;
+  traceFile: string | null;
+}
+
+export interface RunOptions {
+  provider: ModelProvider;
+  client: SimulatorClient;
+  gameId: string;
+  mode: ExecutionMode;
+  limits?: Partial<RunLimits>;
+  /** Directory for the JSONL audit trail; null keeps the trace in memory only. */
+  traceDirectory?: string | null;
+  runId?: string;
+  brief?: string;
+  newMutationId?: () => string;
+  retryDelayMs?: number;
+  maxMutationRetries?: number;
+  tools?: RegisteredTool[];
+}
+
+const MAX_TOOL_RESULT_CHARS = 60_000;
+const FINAL_NUDGE = "No further tool calls are available. Using only what you have observed, give your final summary now.";
+
+export async function runAgent(options: RunOptions): Promise<RunResult & { trace: RunTrace }> {
+  const limits: RunLimits = { ...DEFAULT_LIMITS, ...options.limits };
+  const policy = new RunPolicy(options.mode, limits);
+  const runId = options.runId ?? randomUUID();
+  const trace = new RunTrace(runId, options.traceDirectory === undefined ? "logs/runs" : options.traceDirectory);
+  const registry = options.tools ?? createToolRegistry();
+  const state: ToolState = { observedRevision: null, eventCursor: 0, mutationLocked: false };
+  const context: ToolContext = {
+    client: options.client,
+    gameId: options.gameId,
+    policy,
+    trace,
+    state,
+    newMutationId: options.newMutationId ?? newMutationId,
+    retryDelayMs: options.retryDelayMs ?? 400,
+    maxMutationRetries: options.maxMutationRetries ?? 2,
+  };
+  const exposed = registry.filter((tool) => policy.isExposed(tool));
+  const tools = toolSpecs(registry, (tool) => policy.isExposed(tool));
+  const totals = { inputTokens: 0, outputTokens: 0, cachedTokens: 0, estimatedCostUsd: 0 };
+
+  trace.record("run.start", { runId, gameId: options.gameId, modelId: options.provider.modelId, mode: options.mode, limits, exposedTools: exposed.map((t) => t.name) });
+
+  const messages: ChatCompletionMessageParam[] = [
+    { role: "system", content: SYSTEM_PROMPT },
+    { role: "user", content: options.brief ?? userBrief(options.mode) },
+  ];
+
+  let stopReason: StopReason = "model_call_limit";
+  let finalSummary: string | null = null;
+  let error: string | null = null;
+  let toolsEnabled = true;
+
+  for (let step = 1; ; step += 1) {
+    if (policy.modelCalls >= limits.maxModelCalls) { stopReason = "model_call_limit"; break; }
+    if (totals.estimatedCostUsd >= limits.maxCostUsd) { stopReason = "cost_limit"; break; }
+    if (toolsEnabled && policy.modelCalls === limits.maxModelCalls - 1 && policy.modelCalls > 0) {
+      toolsEnabled = false;
+      messages.push({ role: "user", content: FINAL_NUDGE });
+    }
+
+    let response: ModelResponse;
+    try {
+      trace.record("model.request", { step, messageCount: messages.length, toolsOffered: toolsEnabled ? tools.length : 0 });
+      response = await options.provider.complete({ messages, ...(toolsEnabled ? { tools } : {}), maxOutputTokens: limits.maxOutputTokens });
+    } catch (caught) {
+      stopReason = caught instanceof SpendLimitError ? "cost_limit" : "model_error";
+      error = caught instanceof Error ? caught.message : String(caught);
+      trace.record("model.error", { step, kind: caught instanceof ModelApiError ? caught.kind : caught instanceof SpendLimitError ? caught.limit : "unknown", message: error });
+      break;
+    }
+
+    policy.modelCalls += 1;
+    totals.inputTokens += response.usage?.promptTokens ?? 0;
+    totals.outputTokens += response.usage?.completionTokens ?? 0;
+    totals.cachedTokens += response.usage?.cachedPromptTokens ?? 0;
+    totals.estimatedCostUsd += response.estimatedCostUsd ?? 0;
+    trace.record("model.response", {
+      step,
+      model: response.model,
+      finishReason: response.finishReason,
+      requestId: response.requestId,
+      usage: response.usage,
+      estimatedCostUsd: response.estimatedCostUsd,
+      latencyMs: response.latencyMs,
+      assistantText: response.content,
+      toolCalls: response.toolCalls.map((c) => ({ id: c.id, name: c.name })),
+    });
+    messages.push(response.assistantMessage);
+
+    if (response.toolCalls.length === 0 || !toolsEnabled) {
+      finalSummary = response.content?.trim() || null;
+      stopReason = finalSummary ? "final_answer" : "empty_response";
+      break;
+    }
+
+    for (const [index, call] of response.toolCalls.entries()) {
+      const outcome = await resolveToolCall(call, index, response.toolCalls.length, step);
+      messages.push({ role: "tool", tool_call_id: call.id, content: serialize(outcome) });
+    }
+    if (policy.toolCalls >= limits.maxTotalToolCalls && toolsEnabled) {
+      toolsEnabled = false;
+      messages.push({ role: "user", content: FINAL_NUDGE });
+    }
+  }
+
+  const finished = stopReason === "final_answer";
+  const result: RunResult = {
+    runId,
+    status: finished ? "completed" : stopReason === "model_error" ? "failed" : "limited",
+    stopReason,
+    mode: options.mode,
+    modelId: options.provider.modelId,
+    gameId: options.gameId,
+    finalSummary,
+    totals: {
+      modelCalls: policy.modelCalls,
+      toolCalls: policy.toolCalls,
+      ...totals,
+      acceptedMutations: policy.acceptedMutations,
+      mutationAttempts: policy.mutationAttempts,
+      advancedSimSeconds: policy.advancedSimSeconds,
+    },
+    error,
+    traceFile: trace.file,
+  };
+  trace.record("run.end", { ...result });
+  return { ...result, trace };
+
+  async function resolveToolCall(call: ModelToolCall, index: number, callsInStep: number, step: number): Promise<ToolOutcome> {
+    const tool = registry.find((t) => t.name === call.name);
+    const finish = (outcome: ToolOutcome, args?: unknown): ToolOutcome => {
+      trace.record("tool.result", { step, toolCallId: call.id, name: call.name, ...(outcome.ok ? { ok: true, result: outcome.data } : { ok: false, error: outcome.error }), args: args ?? null });
+      return outcome;
+    };
+    const deny = (code: string, message: string, extra: Record<string, unknown> = {}): ToolOutcome => finish({ ok: false, error: { code, message, ...extra } });
+
+    trace.record("tool.request", { step, toolCallId: call.id, name: call.name, rawArguments: call.arguments.slice(0, 2000) });
+    if (!tool) return deny("unknown_tool", `No tool named "${call.name}". Available: ${exposed.map((t) => t.name).join(", ")}.`);
+    const exposure = policy.authorize(tool, {});
+    if (!policy.isExposed(tool) && !exposure.allowed) return deny(exposure.code, exposure.message);
+    if (index >= limits.maxToolCallsPerStep) return deny("per_step_limit", `At most ${limits.maxToolCallsPerStep} tool calls are executed per step; this call was not executed.`);
+    if (policy.toolCalls >= limits.maxTotalToolCalls) return deny("tool_call_limit", "The total tool-call limit for this run is reached; this call was not executed.");
+    policy.toolCalls += 1;
+
+    let raw: unknown;
+    try {
+      raw = call.arguments.trim() === "" ? {} : JSON.parse(call.arguments);
+    } catch {
+      return deny("invalid_arguments", "Arguments must be a valid JSON object.");
+    }
+    const parsed = tool.parse(raw);
+    if (!parsed.ok) return deny("invalid_arguments", "Arguments did not match the tool schema.", { issues: parsed.issues });
+    if (tool.mutating && callsInStep > 1) {
+      return deny("mutation_must_be_alone", `${tool.name} changes the farm and must be called alone, after you have seen the results of any other calls. It was not executed; call it again by itself.`);
+    }
+    const decision = policy.authorize(tool, parsed.args);
+    if (!decision.allowed) return deny(decision.code, decision.message);
+
+    trace.record("tool.execute", { step, toolCallId: call.id, name: call.name, args: parsed.args });
+    try {
+      return finish(await tool.run(context, parsed.args), parsed.args);
+    } catch (caught) {
+      trace.record("tool.exception", { step, toolCallId: call.id, name: call.name, message: caught instanceof Error ? caught.message : String(caught) });
+      return finish({ ok: false, error: { code: "internal_error", message: "The tool failed unexpectedly." } }, parsed.args);
+    }
+  }
+}
+
+function serialize(outcome: ToolOutcome): string {
+  const text = JSON.stringify(outcome.ok ? { ok: true, data: outcome.data } : { ok: false, error: outcome.error });
+  if (text.length <= MAX_TOOL_RESULT_CHARS) return text;
+  return JSON.stringify({ ok: false, error: { code: "result_too_large", message: `The result exceeded ${MAX_TOOL_RESULT_CHARS} characters and was withheld. Narrow the request (for example with a category filter).` } });
+}

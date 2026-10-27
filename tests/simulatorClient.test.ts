@@ -65,4 +65,14 @@ describe("simulator client + read-only integration (MOCKED simulator, not a real
     expect(sent.dryRun).toBe(true);
     expect(sent.idempotencyKey).toMatch(/^[0-9a-f-]{36}$/);
   });
+
+  it("parses an HTTP 422 rejection as a normal committed response, but still throws on other 4xx", async () => {
+    const rejected = { ...executeAccepted, accepted: false, action: null, errors: [{ code: "invalid_params", detail: "volumeM3 must be positive" }] };
+    server = await startMockServer(() => ({ status: 422, body: rejected }));
+    const result = await client(server.url).executeAction(GAME_ID, { type: "irrigateField", params: { fieldId: "field-1", volumeM3: 50 }, dryRun: false });
+    expect(result.accepted).toBe(false);
+    await server.close();
+    server = await startMockServer(() => ({ status: 400, body: { error: "bad" } }));
+    await expect(client(server.url).executeAction(GAME_ID, { type: "irrigateField", params: { fieldId: "field-1", volumeM3: 50 } })).rejects.toMatchObject({ kind: "http", status: 400 });
+  });
 });
