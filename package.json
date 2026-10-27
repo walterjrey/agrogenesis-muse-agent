@@ -13,7 +13,10 @@
     "model:ping": "tsx scripts/model-ping.ts",
     "integration:real": "tsx scripts/simulator-integration.ts",
     "agent:observe": "tsx scripts/agent-run.ts observe",
-    "agent:test-action": "tsx scripts/agent-run.ts test-action"
+    "agent:test-action": "tsx scripts/agent-run.ts test-action",
+    "agent:autonomous": "tsx scripts/agent-autonomous.ts start",
+    "agent:resume": "tsx scripts/agent-autonomous.ts resume",
+    "agent:status": "tsx scripts/agent-autonomous.ts status"
   },
   "dependencies": {
     "openai": "^6.0.0",

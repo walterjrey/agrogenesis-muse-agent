@@ -13,7 +13,30 @@ export interface ToolState {
   mutationLocked: boolean;
 }
 
+/** A state-changing request, recorded durably BEFORE it is sent so that a crash can be reconciled with the same key. */
+export interface MutationIntent {
+  tool: "execute_action" | "advance_time";
+  idempotencyKey: string;
+  expectedRevision: number;
+  /** The exact request body that is (re)sent, including the idempotency key. */
+  request: Record<string, unknown>;
+  rationale: string | null;
+}
+
+export interface MutationSettlement {
+  /** `not_applied` is used only when the simulator definitively refused the request (4xx before any commit). */
+  status: "applied" | "rejected" | "not_applied";
+  revisionAfter: number | null;
+  summary: Record<string, unknown>;
+}
+
+export interface MutationJournal {
+  begin(intent: MutationIntent): Promise<void>;
+  settle(intent: MutationIntent, settlement: MutationSettlement): Promise<void>;
+}
+
 export interface ToolContext {
+  journal?: MutationJournal;
   client: SimulatorClient;
   gameId: string;
   policy: RunPolicy;
@@ -45,10 +68,10 @@ export interface RegisteredTool {
   run(context: ToolContext, args: Record<string, unknown>): Promise<ToolOutcome>;
 }
 
-const succeed = (data: unknown): ToolOutcome => ({ ok: true, data });
-const fail = (code: string, message: string, extra: Record<string, unknown> = {}): ToolOutcome => ({ ok: false, error: { code, message, ...extra } });
+export const succeed = (data: unknown): ToolOutcome => ({ ok: true, data });
+export const fail = (code: string, message: string, extra: Record<string, unknown> = {}): ToolOutcome => ({ ok: false, error: { code, message, ...extra } });
 
-function defineTool<S extends z.ZodObject>(definition: {
+export function defineTool<S extends z.ZodObject>(definition: {
   name: string;
   description: string;
   mutating: boolean;
@@ -117,13 +140,18 @@ async function sendIdempotent<T>(context: ToolContext, send: () => Promise<T>): 
   throw Object.assign(new OutcomeUnknownError("Mutation outcome could not be confirmed."), { cause: lastError });
 }
 
-async function mutationFailure(context: ToolContext, error: unknown): Promise<ToolOutcome> {
-  if (error instanceof OutcomeUnknownError) {
+/** Only a definitive 4xx answer proves the simulator did not commit the request. Everything else is an unknown outcome. */
+const isDefinitiveRefusal = (error: unknown): boolean =>
+  error instanceof SimulatorError && error.kind === "http" && (error.status ?? 0) >= 400 && (error.status ?? 0) < 500;
+
+async function mutationFailure(context: ToolContext, error: unknown, intent?: MutationIntent): Promise<ToolOutcome> {
+  if (!isDefinitiveRefusal(error)) {
     context.state.mutationLocked = true;
-    context.trace.record("mutation.outcome_unknown", {});
+    context.trace.record("mutation.outcome_unknown", { reason: error instanceof OutcomeUnknownError ? "retries_exhausted" : "unconfirmed_response" });
     return fail("outcome_unknown", "The request may or may not have been applied. Repeating it with the same idempotency key did not produce a confirmed result. Further state-changing calls are blocked for this run; use read-only tools to inspect the current state and report it.");
   }
   const failure = failureFromError(error);
+  if (intent) await context.journal?.settle(intent, { status: "not_applied", revisionAfter: null, summary: { code: failure.code, httpStatus: failure.httpStatus ?? null } });
   if (failure.code === "stale_revision") {
     context.state.observedRevision = null;
     let latest: unknown = null;
@@ -142,7 +170,7 @@ async function mutationFailure(context: ToolContext, error: unknown): Promise<To
 }
 
 const NoArgs = z.strictObject({});
-const Rationale = z.string().min(1).max(500).optional().describe("One or two sentences explaining, from the observations, why you are doing this. Recorded in the audit log.");
+export const Rationale = z.string().min(1).max(500).optional().describe("One or two sentences explaining, from the observations, why you are doing this. Recorded in the audit log.");
 
 export function createToolRegistry(): RegisteredTool[] {
   return [
@@ -212,11 +240,17 @@ export function createToolRegistry(): RegisteredTool[] {
 
         context.policy.mutationAttempts += 1;
         const idempotencyKey = context.newMutationId();
+        const request = { type: args.type, params: args.params, expectedRevision, dryRun: false, idempotencyKey };
+        const intent: MutationIntent = { tool: "execute_action", idempotencyKey, expectedRevision, request, rationale: args.rationale ?? null };
         context.trace.record("mutation.submit", { tool: "execute_action", type: args.type, params: args.params, expectedRevision, idempotencyKey, rationale: args.rationale ?? null });
         try {
-          const response = await sendIdempotent(context, () =>
-            context.client.executeAction(context.gameId, { type: args.type, params: args.params, expectedRevision, dryRun: false, idempotencyKey }),
-          );
+          await context.journal?.begin(intent);
+          const response = await sendIdempotent(context, () => context.client.executeAction(context.gameId, request));
+          await context.journal?.settle(intent, {
+            status: response.accepted ? "applied" : "rejected",
+            revisionAfter: response.revision,
+            summary: { type: args.type, accepted: response.accepted, actionId: response.action?.actionId ?? null, actionStatus: response.action?.status ?? null, errors: response.errors },
+          });
           context.trace.record("mutation.result", { tool: "execute_action", accepted: response.accepted, revision: response.revision, actionId: response.action?.actionId ?? null, status: response.action?.status ?? null, errors: response.errors });
           if (response.accepted) {
             context.policy.acceptedMutations += 1;
@@ -235,7 +269,7 @@ export function createToolRegistry(): RegisteredTool[] {
               : "Rejected by the simulator; nothing was reserved or consumed. You may reconsider.",
           });
         } catch (error) {
-          return mutationFailure(context, error);
+          return mutationFailure(context, error, intent);
         }
       },
     }),
@@ -267,18 +301,24 @@ export function createToolRegistry(): RegisteredTool[] {
         if (expectedRevision === null) return fail("observation_required", "Observe the farm first (observe_farm, observe_fields or list_available_actions) before advancing time.");
 
         const idempotencyKey = context.newMutationId();
+        const request = { requestedSeconds: args.requestedSeconds, stopOn: args.stopOn, cursor: context.state.eventCursor, expectedRevision, idempotencyKey };
+        const intent: MutationIntent = { tool: "advance_time", idempotencyKey, expectedRevision, request, rationale: args.rationale ?? null };
         context.trace.record("mutation.submit", { tool: "advance_time", requestedSeconds: args.requestedSeconds, stopOn: args.stopOn, expectedRevision, idempotencyKey, rationale: args.rationale ?? null });
         try {
-          const response = await sendIdempotent(context, () =>
-            context.client.advance(context.gameId, { requestedSeconds: args.requestedSeconds, stopOn: args.stopOn, cursor: context.state.eventCursor, expectedRevision, idempotencyKey }),
-          );
+          await context.journal?.begin(intent);
+          const response = await sendIdempotent(context, () => context.client.advance(context.gameId, request));
+          await context.journal?.settle(intent, {
+            status: "applied",
+            revisionAfter: null,
+            summary: { grantedSeconds: response.grantedSeconds, stoppedBecause: response.stoppedBecause, simTimeAfterS: response.clockAfter.simTimeS, eventCount: response.events.length },
+          });
           context.policy.advancedSimSeconds += response.grantedSeconds;
           context.state.eventCursor = Math.max(context.state.eventCursor, response.nextCursor);
           context.state.observedRevision = null;
           context.trace.record("mutation.result", { tool: "advance_time", grantedSeconds: response.grantedSeconds, stoppedBecause: response.stoppedBecause, simTimeBeforeS: response.clockBefore.simTimeS, simTimeAfterS: response.clockAfter.simTimeS, eventCount: response.events.length });
           return succeed({ ...response, note: "Time advanced. Earlier observations are now stale; observe again before acting." });
         } catch (error) {
-          return mutationFailure(context, error);
+          return mutationFailure(context, error, intent);
         }
       },
     }),

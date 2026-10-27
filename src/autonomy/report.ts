@@ -1,0 +1,53 @@
+import type { SessionState } from "./types.js";
+
+const delta = (a: number | null | undefined, b: number | null | undefined): number | null => (typeof a === "number" && typeof b === "number" ? Math.round((b - a) * 100) / 100 : null);
+
+/**
+ * Measured session report. Every value is either read from the simulator/model responses or null when it was not
+ * observable; nothing is estimated or filled in. The shape is intentionally flat and stable so that a later
+ * Manual-vs-Muse comparison can use the same fields.
+ */
+export function buildReport(state: SessionState) {
+  const { baseline, latest } = state.metrics;
+  const water = (o: typeof baseline) => o?.resources.find((r) => r.kind === "water")?.quantity ?? null;
+  const toolCalls = state.decisions.reduce<Record<string, number>>((acc, d) => {
+    for (const [name, count] of Object.entries(d.tools)) acc[name] = (acc[name] ?? 0) + count;
+    return acc;
+  }, {});
+  const submitted = state.budgets.acceptedMutations + state.budgets.rejectedActions;
+  return {
+    sessionId: state.sessionId,
+    gameId: state.gameId,
+    model: state.config.modelId,
+    status: state.status,
+    stopReason: state.stopReason,
+    stopDetail: state.stopDetail,
+    mutationsEnabled: state.config.mutationsEnabled,
+    cycles: state.cycle,
+    decisions: state.decisions.length,
+    toolCalls: { total: state.budgets.toolCalls, byTool: toolCalls },
+    actions: {
+      submitted,
+      accepted: state.budgets.acceptedMutations,
+      rejected: state.budgets.rejectedActions,
+      completed: state.actions.filter((a) => a.status === "completed").length,
+      failed: state.actions.filter((a) => a.status === "failed").length,
+      inFlight: state.actions.filter((a) => a.status === "scheduled" || a.status === "running").length,
+    },
+    pendingMutation: state.pendingMutation ? { tool: state.pendingMutation.tool, idempotencyKey: state.pendingMutation.idempotencyKey } : null,
+    time: { advancedSimSeconds: state.budgets.advancedSimSeconds, simulatedDaysElapsed: Math.round((state.budgets.advancedSimSeconds / 86_400) * 1000) / 1000, lastSimTimeS: state.lastSimTimeS },
+    farm: {
+      revision: { first: baseline?.revision ?? null, last: latest?.revision ?? null },
+      credits: { first: baseline?.credits ?? null, last: latest?.credits ?? null, delta: delta(baseline?.credits, latest?.credits) },
+      realizedRevenueDelta: delta(baseline?.realizedRevenue, latest?.realizedRevenue),
+      realizedCostsDelta: delta(baseline?.realizedCosts, latest?.realizedCosts),
+      waterStockDelta: delta(water(baseline), water(latest)),
+      resourcesLast: latest?.resources ?? null,
+      fieldsLast: latest?.fields ?? null,
+    },
+    model_usage: { ...state.usage, modelCalls: state.budgets.modelCalls, estimatedCostUsd: Math.round(state.budgets.costUsd * 1e6) / 1e6 },
+    budgets: { used: state.budgets, limits: state.config.limits },
+    observation: { controllerReads: state.metrics.controllerReads, snapshotRefreshes: state.metrics.snapshotRefreshes, snapshotCacheHits: state.metrics.snapshotCacheHits, mixedRevisionDetections: state.metrics.mixedRevisionDetections },
+    notes: "Null means not observable. Farm-outcome deltas describe this session only and are not a comparison against Manual management.",
+  };
+}

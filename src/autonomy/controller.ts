@@ -1,0 +1,410 @@
+import { randomUUID } from "node:crypto";
+import { join } from "node:path";
+import { runAgent } from "../agent/runtime.js";
+import type { MutationIntent, MutationJournal, MutationSettlement } from "../agent/tools.js";
+import type { ExecuteActionRequest } from "../contracts/execute.js";
+import type { AdvanceRequest } from "../contracts/time.js";
+import type { GameEvent } from "../contracts/time.js";
+import type { ModelProvider } from "../model/meta.js";
+import { SimulatorError, type SimulatorClient } from "../simulator/client.js";
+import { InconsistentObservationError, summarizeSnapshot, isAuthFailure } from "./observation.js";
+import { AUTONOMOUS_SYSTEM_PROMPT, DEFAULT_OBJECTIVE, cycleBrief } from "./prompt.js";
+import { SessionLockLostError, type SessionLock, type SessionStore } from "./store.js";
+import { createAutonomousTools, SnapshotProvider, type PlanSink } from "./tools.js";
+import { DEFAULT_SESSION_LIMITS, TERMINAL_ACTION_STATUSES, type SessionLimits, type SessionState } from "./types.js";
+
+export interface NewSessionOptions {
+  sessionId?: string;
+  gameId: string;
+  modelId: string;
+  mutationsEnabled: boolean;
+  objective?: string;
+  limits?: Partial<SessionLimits>;
+}
+
+export function newSessionState(options: NewSessionOptions): SessionState {
+  const now = new Date().toISOString();
+  return {
+    version: 1,
+    sessionId: options.sessionId ?? `s-${now.replace(/[-:.TZ]/g, "").slice(0, 14)}-${randomUUID().slice(0, 6)}`,
+    gameId: options.gameId,
+    createdAt: now,
+    updatedAt: now,
+    status: "paused",
+    stopReason: "not_started",
+    stopDetail: null,
+    config: { modelId: options.modelId, mutationsEnabled: options.mutationsEnabled, objective: options.objective ?? DEFAULT_OBJECTIVE, limits: { ...DEFAULT_SESSION_LIMITS, ...options.limits } },
+    cycle: 0,
+    plan: null,
+    decisions: [],
+    actions: [],
+    operations: [],
+    pendingMutation: null,
+    lastRevision: null,
+    lastSimTimeS: null,
+    modelEventCursor: 0,
+    progressCursor: 0,
+    budgets: { costUsd: 0, modelCalls: 0, toolCalls: 0, acceptedMutations: 0, mutationAttempts: 0, rejectedActions: 0, advancedSimSeconds: 0, wallClockMs: 0, consecutiveErrors: 0, consecutiveNoProgress: 0, consecutiveRejections: 0 },
+    usage: { inputTokens: 0, outputTokens: 0, cachedTokens: 0 },
+    metrics: { baseline: null, latest: null, controllerReads: 0, snapshotRefreshes: 0, snapshotCacheHits: 0, mixedRevisionDetections: 0 },
+  };
+}
+
+export interface ControllerOptions {
+  store: SessionStore;
+  sessionId: string;
+  provider: ModelProvider;
+  client: SimulatorClient;
+  /** Mutations run only if the persisted session allows them AND the caller re-confirms them for this process. */
+  mutationsEnabled: boolean;
+  /** Pause with `slice_complete` after this many cycles in this process (resume continues the same budgets). */
+  sliceCycles?: number;
+  newMutationId?: () => string;
+  retryDelayMs?: number;
+  /** Where per-cycle JSONL traces are written; defaults to `<session dir>/runs`. */
+  traceDirectory?: string | null;
+  onEvent?: (message: string) => void;
+}
+
+const REASONS_RESUMABLE = new Set(["paused", "running"]);
+
+const settledExecute = (type: string, response: Awaited<ReturnType<SimulatorClient["executeAction"]>>): MutationSettlement => ({
+  status: response.accepted ? "applied" : "rejected",
+  revisionAfter: response.revision,
+  summary: { type, accepted: response.accepted, actionId: response.action?.actionId ?? null, actionStatus: response.action?.status ?? null, errors: response.errors },
+});
+
+const settledAdvance = (response: Awaited<ReturnType<SimulatorClient["advance"]>>): MutationSettlement => ({
+  status: "applied",
+  revisionAfter: null,
+  summary: { grantedSeconds: response.grantedSeconds, stoppedBecause: response.stoppedBecause, simTimeAfterS: response.clockAfter.simTimeS, eventCount: response.events.length },
+});
+
+const isDefinitiveRefusal = (error: unknown): boolean => error instanceof SimulatorError && error.kind === "http" && (error.status ?? 0) >= 400 && (error.status ?? 0) < 500 && !isAuthFailure(error);
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+export class AutonomousController {
+  private readonly lock: SessionLock;
+  private state: SessionState;
+  private readonly provider: SnapshotProvider;
+  private readonly startedAt = Date.now();
+  private wallBase: number;
+  private readonly mutationsEnabled: boolean;
+
+  constructor(private readonly options: ControllerOptions) {
+    this.lock = options.store.acquire(options.sessionId);
+    try {
+      this.state = options.store.load(options.sessionId);
+    } catch (error) {
+      this.lock.release();
+      throw error;
+    }
+    if (!REASONS_RESUMABLE.has(this.state.status)) {
+      this.lock.release();
+      throw new Error(`Session ${options.sessionId} is ${this.state.status} (${this.state.stopReason}) and cannot be resumed. Budgets are never raised automatically; start a new session.`);
+    }
+    this.mutationsEnabled = this.state.config.mutationsEnabled && options.mutationsEnabled;
+    this.provider = new SnapshotProvider(options.client, this.state.gameId, { retryDelayMs: options.retryDelayMs ?? 250 });
+    this.wallBase = this.state.budgets.wallClockMs;
+  }
+
+  private log(message: string): void {
+    this.options.onEvent?.(message);
+  }
+
+  private save(): void {
+    this.state.budgets.wallClockMs = this.wallBase + (Date.now() - this.startedAt);
+    this.state.metrics.controllerReads += this.provider.reads;
+    this.state.metrics.snapshotRefreshes += this.provider.refreshes;
+    this.state.metrics.snapshotCacheHits += this.provider.cacheHits;
+    this.state.metrics.mixedRevisionDetections += this.provider.mixedRevisionDetections;
+    this.provider.reads = this.provider.refreshes = this.provider.cacheHits = this.provider.mixedRevisionDetections = 0;
+    this.lock.save(this.state);
+  }
+
+  private end(status: SessionState["status"], reason: string, detail: string | null = null): SessionState {
+    this.state.status = status;
+    this.state.stopReason = reason;
+    this.state.stopDetail = detail;
+    this.log(`session ${status}: ${reason}${detail ? ` (${detail})` : ""}`);
+    this.save();
+    return this.state;
+  }
+
+  /** Records a settled mutation exactly once, updates counters and clears the pending record. */
+  private settle(intent: MutationIntent, settlement: MutationSettlement, via: "direct" | "reconciled"): void {
+    const s = this.state;
+    const b = s.budgets;
+    s.operations.push({ tool: intent.tool, idempotencyKey: intent.idempotencyKey, status: settlement.status, expectedRevision: intent.expectedRevision, revisionAfter: settlement.revisionAfter, summary: settlement.summary, cycle: s.cycle, settledAt: new Date().toISOString(), via });
+    if (settlement.revisionAfter !== null) s.lastRevision = settlement.revisionAfter;
+    if (intent.tool === "execute_action") {
+      if (settlement.status === "applied") {
+        b.acceptedMutations += 1;
+        b.mutationAttempts += 1;
+        b.consecutiveRejections = 0;
+        const actionId = settlement.summary.actionId;
+        if (typeof actionId === "string") {
+          const status = settlement.summary.actionStatus;
+          s.actions.push({ actionId, type: String(settlement.summary.type ?? ""), status: typeof status === "string" ? (status as SessionState["actions"][number]["status"]) : "scheduled", submittedAtRevision: intent.expectedRevision, idempotencyKey: intent.idempotencyKey, lastCheckedAt: null });
+        }
+      } else if (settlement.status === "rejected") {
+        b.rejectedActions += 1;
+        b.mutationAttempts += 1;
+        b.consecutiveRejections += 1;
+      }
+    } else if (settlement.status === "applied") {
+      b.advancedSimSeconds += Number(settlement.summary.grantedSeconds ?? 0);
+      if (typeof settlement.summary.simTimeAfterS === "number") s.lastSimTimeS = settlement.summary.simTimeAfterS;
+    }
+    s.pendingMutation = null;
+    this.provider.invalidate();
+    this.save();
+  }
+
+  private readonly journal: MutationJournal = {
+    begin: async (intent) => {
+      this.state.pendingMutation = { tool: intent.tool, idempotencyKey: intent.idempotencyKey, expectedRevision: intent.expectedRevision, request: intent.request, rationale: intent.rationale, recordedAt: new Date().toISOString(), cycle: this.state.cycle };
+      this.save();
+    },
+    settle: async (intent, settlement) => this.settle(intent, settlement, "direct"),
+  };
+
+  /**
+   * Resolves a mutation that was recorded but never confirmed by replaying the EXACT persisted request with the
+   * SAME idempotency key. The simulator returns the stored result if it had committed, executes at most once if not,
+   * and refuses with 4xx (e.g. stale revision) if it can no longer be applied.
+   */
+  private async reconcile(): Promise<boolean> {
+    const pending = this.state.pendingMutation;
+    if (!pending) return true;
+    const intent: MutationIntent = { tool: pending.tool, idempotencyKey: pending.idempotencyKey, expectedRevision: pending.expectedRevision, request: pending.request, rationale: pending.rationale };
+    this.log(`reconciling unconfirmed ${pending.tool} with its original idempotency key`);
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        if (pending.tool === "execute_action") {
+          const response = await this.options.client.executeAction(this.state.gameId, pending.request as unknown as ExecuteActionRequest);
+          this.settle(intent, settledExecute(String(pending.request.type ?? ""), response), "reconciled");
+        } else {
+          const response = await this.options.client.advance(this.state.gameId, pending.request as unknown as AdvanceRequest);
+          this.settle(intent, settledAdvance(response), "reconciled");
+        }
+        return true;
+      } catch (error) {
+        if (isDefinitiveRefusal(error)) {
+          this.settle(intent, { status: "not_applied", revisionAfter: null, summary: { reason: error instanceof SimulatorError ? error.message : "refused" } }, "reconciled");
+          return true;
+        }
+        await sleep((this.options.retryDelayMs ?? 250) * (attempt + 1));
+      }
+    }
+    return false;
+  }
+
+  private budgetStop(): { reason: string; detail: string } | null {
+    const { budgets: b, config, cycle } = this.state;
+    const l = config.limits;
+    const wall = this.wallBase + (Date.now() - this.startedAt);
+    if (b.costUsd >= l.maxCostUsd) return { reason: "cost_budget_exhausted", detail: `$${b.costUsd.toFixed(4)} of $${l.maxCostUsd}` };
+    if (b.modelCalls >= l.maxModelCalls) return { reason: "model_call_budget_exhausted", detail: `${b.modelCalls}/${l.maxModelCalls}` };
+    if (b.toolCalls >= l.maxToolCalls) return { reason: "tool_call_budget_exhausted", detail: `${b.toolCalls}/${l.maxToolCalls}` };
+    if (wall >= l.maxWallClockMs) return { reason: "wall_clock_exhausted", detail: `${Math.round(wall / 1000)}s of ${Math.round(l.maxWallClockMs / 1000)}s` };
+    if (cycle >= l.maxCycles) return { reason: "cycle_budget_exhausted", detail: `${cycle}/${l.maxCycles}` };
+    if (this.mutationsEnabled) {
+      if (b.advancedSimSeconds >= l.maxSimSeconds) return { reason: "sim_time_limit_reached", detail: `${b.advancedSimSeconds}/${l.maxSimSeconds} s` };
+      const inFlight = this.state.actions.some((a) => !TERMINAL_ACTION_STATUSES.has(a.status));
+      if (b.acceptedMutations >= l.maxMutations && !inFlight) return { reason: "mutation_budget_exhausted", detail: `${b.acceptedMutations}/${l.maxMutations}` };
+    }
+    return null;
+  }
+
+  private async refreshActions(): Promise<void> {
+    for (const action of this.state.actions.filter((a) => !TERMINAL_ACTION_STATUSES.has(a.status))) {
+      try {
+        const { action: view } = await this.options.client.getAction(this.state.gameId, action.actionId);
+        action.status = view.status;
+        action.lastCheckedAt = new Date().toISOString();
+      } catch {
+        /* keep the last known status */
+      }
+    }
+  }
+
+  /** Progress = an accepted mutation, or a simulator event proving something completed/failed/delivered information. */
+  private async evaluateProgress(acceptedBefore: number): Promise<{ progress: boolean; reasons: string[] }> {
+    const reasons: string[] = [];
+    if (this.state.budgets.acceptedMutations > acceptedBefore) reasons.push("action_accepted");
+    try {
+      const events = await this.options.client.getEvents(this.state.gameId, this.state.progressCursor);
+      this.state.progressCursor = Math.max(this.state.progressCursor, events.nextCursor);
+      const kinds = new Set(events.events.map((e) => e.kind));
+      for (const kind of ["action_completed", "action_failed", "observation_delivered"] as const) if (kinds.has(kind)) reasons.push(kind);
+    } catch {
+      /* no evidence available: not counted as progress */
+    }
+    return { progress: reasons.length > 0, reasons };
+  }
+
+  /** Best-effort final read so the report has the true end state; failures leave the previous (real) values. */
+  private async finalize(): Promise<void> {
+    try {
+      await this.refreshActions();
+      const snapshot = await this.provider.get();
+      this.state.lastRevision = snapshot.revision;
+      this.state.lastSimTimeS = snapshot.simTimeS;
+      this.state.metrics.latest = summarizeSnapshot(snapshot);
+    } catch {
+      /* keep last known */
+    }
+    this.save();
+  }
+
+  async run(): Promise<SessionState> {
+    try {
+      const final = await this.loop();
+      await this.finalize();
+      return final;
+    } catch (error) {
+      if (error instanceof SessionLockLostError) throw error;
+      try {
+        return this.end("paused", "controller_error", error instanceof Error ? error.message.slice(0, 300) : "unknown");
+      } catch {
+        throw error;
+      }
+    } finally {
+      this.lock.release();
+    }
+  }
+
+  private async loop(): Promise<SessionState> {
+    const s = this.state;
+    s.status = "running";
+    s.stopReason = null;
+    s.stopDetail = null;
+    this.save();
+    let cyclesThisRun = 0;
+
+    for (;;) {
+      if (!(await this.reconcile())) return this.end("paused", "unresolved_mutation", "The outcome of a state-changing request could not be confirmed; resume to retry the same idempotency key.");
+      await this.refreshActions();
+      const stop = this.budgetStop();
+      if (stop) return this.end("stopped", stop.reason, stop.detail);
+
+      s.cycle += 1;
+      cyclesThisRun += 1;
+      this.log(`cycle ${s.cycle}`);
+      const sink: PlanSink = { latest: null, updates: 0 };
+      let result: Awaited<ReturnType<typeof runAgent>>;
+      const before = { accepted: s.budgets.acceptedMutations, rejected: s.budgets.rejectedActions, advanced: s.budgets.advancedSimSeconds, cost: s.budgets.costUsd };
+
+      try {
+        const snapshot = await this.provider.get();
+        s.lastRevision = snapshot.revision;
+        s.lastSimTimeS = snapshot.simTimeS;
+        const summary = summarizeSnapshot(snapshot);
+        s.metrics.baseline ??= summary;
+        s.metrics.latest = summary;
+        const eventsResponse = await this.options.client.getEvents(s.gameId, s.modelEventCursor);
+        const events: GameEvent[] = eventsResponse.events;
+
+        const eligible = snapshot.actions.actions.some((a) => a.eligibility.eligible);
+        const inFlight = s.actions.some((a) => !TERMINAL_ACTION_STATUSES.has(a.status)) || snapshot.overview.status.activeActionCount > 0;
+        if (!eligible && !inFlight) return this.end("completed", "no_eligible_actions", "The simulator offers no eligible action and no operation is in flight.");
+
+        const l = s.config.limits;
+        const b = s.budgets;
+        const remainingMutations = this.mutationsEnabled ? Math.max(0, l.maxMutations - b.acceptedMutations) : 0;
+        const remainingSim = Math.max(0, l.maxSimSeconds - b.advancedSimSeconds);
+        const deadlineMs = this.startedAt + (l.maxWallClockMs - this.wallBase);
+        const tools = createAutonomousTools(this.provider, sink);
+
+        result = await runAgent({
+          provider: this.options.provider,
+          client: this.options.client,
+          gameId: s.gameId,
+          mode: this.mutationsEnabled ? "controlled_mutation" : "observe_only",
+          tools,
+          systemPrompt: AUTONOMOUS_SYSTEM_PROMPT,
+          brief: cycleBrief({ state: s, snapshot, events }),
+          runId: `${s.sessionId}-c${s.cycle}`,
+          traceDirectory: this.options.traceDirectory === undefined ? join(this.options.store.sessionDir(s.sessionId), "runs") : this.options.traceDirectory,
+          initialState: { observedRevision: snapshot.revision, eventCursor: eventsResponse.nextCursor },
+          journal: this.journal,
+          deadlineMs,
+          beforeFinal: () => (sink.latest ? null : "You have not called update_plan this cycle. Call update_plan now with your decision summary and rolling plan, then give your one-line final answer."),
+          retryDelayMs: this.options.retryDelayMs ?? 400,
+          ...(this.options.newMutationId ? { newMutationId: this.options.newMutationId } : {}),
+          limits: {
+            maxModelCalls: Math.max(1, Math.min(l.maxModelCallsPerCycle, l.maxModelCalls - b.modelCalls)),
+            maxTotalToolCalls: Math.max(1, Math.min(l.maxToolCallsPerCycle, l.maxToolCalls - b.toolCalls)),
+            maxToolCallsPerStep: 4,
+            maxOutputTokens: l.maxOutputTokens,
+            maxCostPerRequestUsd: l.maxCostPerRequestUsd,
+            maxCostUsd: Math.max(0, l.maxCostUsd - b.costUsd),
+            maxAdvanceSecondsPerCall: Math.min(l.maxAdvanceSecondsPerCall, remainingSim),
+            maxTotalAdvanceSeconds: remainingSim,
+            maxMutations: remainingMutations,
+            maxMutationAttempts: remainingMutations + Math.max(0, l.maxConsecutiveRejections - b.consecutiveRejections),
+          },
+        });
+        s.modelEventCursor = Math.max(eventsResponse.nextCursor, result.state.eventCursor);
+      } catch (error) {
+        if (error instanceof SessionLockLostError) throw error;
+        if (isAuthFailure(error)) return this.end("paused", "authentication_failure", "The simulator rejected the agent credentials (401/403).");
+        if (error instanceof InconsistentObservationError) return this.end("paused", "inconsistent_observation", error.message);
+        s.budgets.consecutiveErrors += 1;
+        this.log(`cycle error: ${error instanceof Error ? error.message : "unknown"}`);
+        if (s.budgets.consecutiveErrors >= s.config.limits.maxConsecutiveErrors) return this.end("paused", "consecutive_errors", error instanceof Error ? error.message.slice(0, 300) : null);
+        this.save();
+        continue;
+      }
+
+      const b = s.budgets;
+      b.costUsd += result.totals.estimatedCostUsd;
+      b.modelCalls += result.totals.modelCalls;
+      b.toolCalls += result.totals.toolCalls;
+      s.usage.inputTokens += result.totals.inputTokens;
+      s.usage.outputTokens += result.totals.outputTokens;
+      s.usage.cachedTokens += result.totals.cachedTokens;
+      if (sink.latest) s.plan = sink.latest;
+
+      const { progress, reasons } = await this.evaluateProgress(before.accepted);
+      const toolCounts: Record<string, number> = {};
+      for (const entry of result.trace.entries) if (entry.event === "tool.execute") toolCounts[String(entry.name)] = (toolCounts[String(entry.name)] ?? 0) + 1;
+      const summaryText = sink.latest?.summary ?? (result.finalSummary ? `(model final text, no plan recorded) ${result.finalSummary}`.slice(0, 600) : `(no decision summary produced; run stopped: ${result.stopReason})`);
+      s.decisions.push({
+        cycle: s.cycle,
+        at: new Date().toISOString(),
+        simTimeS: s.lastSimTimeS,
+        revision: s.lastRevision,
+        summary: summaryText,
+        plannedStep: sink.latest?.nextStep ?? null,
+        tools: toolCounts,
+        actionsSubmitted: b.acceptedMutations - before.accepted + (b.rejectedActions - before.rejected),
+        actionsAccepted: b.acceptedMutations - before.accepted,
+        advancedSeconds: b.advancedSimSeconds - before.advanced,
+        progress,
+        progressReasons: reasons,
+        costUsd: Math.round((b.costUsd - before.cost) * 1e6) / 1e6,
+        stopReason: result.stopReason,
+      });
+
+      const failedRun = result.stopReason === "model_error" || result.stopReason === "empty_response" || (result.stopReason === "cost_limit" && b.costUsd < s.config.limits.maxCostUsd);
+      const hadUnknown = s.pendingMutation !== null;
+      b.consecutiveErrors = failedRun || hadUnknown ? b.consecutiveErrors + 1 : 0;
+      b.consecutiveNoProgress = progress ? 0 : b.consecutiveNoProgress + 1;
+      this.save();
+
+      if (result.error && /HTTP (401|403)/.test(result.error)) return this.end("paused", "authentication_failure", "The model API rejected the credentials (401/403).");
+      if (s.pendingMutation) continue; // reconcile first; never act on top of an unknown outcome
+      if (result.stopReason === "wall_clock_limit") return this.end("stopped", "wall_clock_exhausted");
+      if (sink.latest?.nextStep === "stop") return this.end("completed", "model_declared_done", sink.latest.stopReason);
+      if (!this.mutationsEnabled) return this.end("completed", "observe_only_complete", "Mutations are disabled; one observation-and-planning cycle was run.");
+      if (b.consecutiveErrors >= s.config.limits.maxConsecutiveErrors) return this.end("paused", "consecutive_errors");
+      if (b.consecutiveRejections >= s.config.limits.maxConsecutiveRejections) return this.end("stopped", "repeated_rejections");
+      if (b.consecutiveNoProgress >= s.config.limits.maxConsecutiveNoProgress) return this.end("stopped", "no_progress", `${b.consecutiveNoProgress} consecutive cycles without progress`);
+      const budget = this.budgetStop();
+      if (budget) return this.end("stopped", budget.reason, budget.detail);
+      if (this.options.sliceCycles !== undefined && cyclesThisRun >= this.options.sliceCycles) return this.end("paused", "slice_complete", `${cyclesThisRun} cycle(s) run in this process; resume continues the same budgets.`);
+    }
+  }
+}

@@ -19,7 +19,9 @@ type Override = (req: MockRequest, sim: FakeSim["state"]) => { status: number; b
 const BASE = `/api/agent/v1/games/${GAME_ID}`;
 
 /** Minimal stateful stand-in for the simulator's agent API: revision checks and idempotent replay of POSTs. */
-export async function fakeSimulator(override?: Override, clientTimeoutMs = 2000): Promise<FakeSim> {
+/** `lostResponses`: the first N POSTs are committed but their responses arrive after the client timeout (simulates response loss). */
+export async function fakeSimulator(override?: Override, clientTimeoutMs = 2000, lostResponses = 0): Promise<FakeSim> {
+  let lost = lostResponses;
   const state = { revision: 4, accepted: 0, replays: 0 };
   const posts: FakeSim["posts"] = [];
   const stored = new Map<string, { status: number; body: unknown }>();
@@ -54,6 +56,7 @@ export async function fakeSimulator(override?: Override, clientTimeoutMs = 2000)
       response = { status: 200, body: { gameId: GAME_ID, clockBefore: clock, clockAfter: { ...clock, simTimeS: clock.simTimeS + granted }, requestedSeconds: body.requestedSeconds, grantedSeconds: granted, stoppedBecause: "requested_time_reached", events: [], nextCursor: 0 } };
     }
     stored.set(key, response);
+    if (lost > 0) { lost -= 1; return { ...response, delayMs: clientTimeoutMs + 300 }; }
     return response;
   });
 

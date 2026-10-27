@@ -5,10 +5,10 @@ import { SpendLimitError } from "../model/spendGuard.js";
 import type { SimulatorClient } from "../simulator/client.js";
 import { DEFAULT_LIMITS, RunPolicy, type ExecutionMode, type RunLimits } from "./policy.js";
 import { SYSTEM_PROMPT, userBrief } from "./prompt.js";
-import { createToolRegistry, newMutationId, toolSpecs, type RegisteredTool, type ToolContext, type ToolOutcome, type ToolState } from "./tools.js";
+import { createToolRegistry, newMutationId, toolSpecs, type MutationJournal, type RegisteredTool, type ToolContext, type ToolOutcome, type ToolState } from "./tools.js";
 import { RunTrace } from "./trace.js";
 
-export type StopReason = "final_answer" | "model_call_limit" | "cost_limit" | "model_error" | "empty_response";
+export type StopReason = "final_answer" | "model_call_limit" | "cost_limit" | "model_error" | "empty_response" | "wall_clock_limit";
 
 export interface RunTotals {
   modelCalls: number;
@@ -49,18 +49,27 @@ export interface RunOptions {
   retryDelayMs?: number;
   maxMutationRetries?: number;
   tools?: RegisteredTool[];
+  systemPrompt?: string;
+  /** Seeds the tool state, e.g. the revision of an observation the caller already collected and showed to the model. */
+  initialState?: Partial<ToolState>;
+  /** Durable record of state-changing requests (see MutationJournal). */
+  journal?: MutationJournal;
+  /** Epoch milliseconds after which no further model request is started. */
+  deadlineMs?: number;
+  /** Asked when the model is about to give its final answer; a non-null message is sent back once instead (e.g. to ask for a missing plan). */
+  beforeFinal?: () => string | null;
 }
 
 const MAX_TOOL_RESULT_CHARS = 60_000;
 const FINAL_NUDGE = "No further tool calls are available. Using only what you have observed, give your final summary now.";
 
-export async function runAgent(options: RunOptions): Promise<RunResult & { trace: RunTrace }> {
+export async function runAgent(options: RunOptions): Promise<RunResult & { trace: RunTrace; state: ToolState }> {
   const limits: RunLimits = { ...DEFAULT_LIMITS, ...options.limits };
   const policy = new RunPolicy(options.mode, limits);
   const runId = options.runId ?? randomUUID();
   const trace = new RunTrace(runId, options.traceDirectory === undefined ? "logs/runs" : options.traceDirectory);
   const registry = options.tools ?? createToolRegistry();
-  const state: ToolState = { observedRevision: null, eventCursor: 0, mutationLocked: false };
+  const state: ToolState = { observedRevision: null, eventCursor: 0, mutationLocked: false, ...options.initialState };
   const context: ToolContext = {
     client: options.client,
     gameId: options.gameId,
@@ -70,6 +79,7 @@ export async function runAgent(options: RunOptions): Promise<RunResult & { trace
     newMutationId: options.newMutationId ?? newMutationId,
     retryDelayMs: options.retryDelayMs ?? 400,
     maxMutationRetries: options.maxMutationRetries ?? 2,
+    ...(options.journal ? { journal: options.journal } : {}),
   };
   const exposed = registry.filter((tool) => policy.isExposed(tool));
   const tools = toolSpecs(registry, (tool) => policy.isExposed(tool));
@@ -78,7 +88,7 @@ export async function runAgent(options: RunOptions): Promise<RunResult & { trace
   trace.record("run.start", { runId, gameId: options.gameId, modelId: options.provider.modelId, mode: options.mode, limits, exposedTools: exposed.map((t) => t.name) });
 
   const messages: ChatCompletionMessageParam[] = [
-    { role: "system", content: SYSTEM_PROMPT },
+    { role: "system", content: options.systemPrompt ?? SYSTEM_PROMPT },
     { role: "user", content: options.brief ?? userBrief(options.mode) },
   ];
 
@@ -86,10 +96,12 @@ export async function runAgent(options: RunOptions): Promise<RunResult & { trace
   let finalSummary: string | null = null;
   let error: string | null = null;
   let toolsEnabled = true;
+  let nudgedBeforeFinal = false;
 
   for (let step = 1; ; step += 1) {
     if (policy.modelCalls >= limits.maxModelCalls) { stopReason = "model_call_limit"; break; }
     if (totals.estimatedCostUsd >= limits.maxCostUsd) { stopReason = "cost_limit"; break; }
+    if (options.deadlineMs !== undefined && Date.now() >= options.deadlineMs) { stopReason = "wall_clock_limit"; break; }
     if (toolsEnabled && policy.modelCalls === limits.maxModelCalls - 1 && policy.modelCalls > 0) {
       toolsEnabled = false;
       messages.push({ role: "user", content: FINAL_NUDGE });
@@ -124,6 +136,14 @@ export async function runAgent(options: RunOptions): Promise<RunResult & { trace
     });
     messages.push(response.assistantMessage);
 
+    if (response.toolCalls.length === 0 && toolsEnabled && !nudgedBeforeFinal && policy.modelCalls < limits.maxModelCalls - 1) {
+      const nudge = options.beforeFinal?.() ?? null;
+      if (nudge) {
+        nudgedBeforeFinal = true;
+        messages.push({ role: "user", content: nudge });
+        continue;
+      }
+    }
     if (response.toolCalls.length === 0 || !toolsEnabled) {
       finalSummary = response.content?.trim() || null;
       stopReason = finalSummary ? "final_answer" : "empty_response";
@@ -161,7 +181,7 @@ export async function runAgent(options: RunOptions): Promise<RunResult & { trace
     traceFile: trace.file,
   };
   trace.record("run.end", { ...result });
-  return { ...result, trace };
+  return { ...result, trace, state };
 
   async function resolveToolCall(call: ModelToolCall, index: number, callsInStep: number, step: number): Promise<ToolOutcome> {
     const tool = registry.find((t) => t.name === call.name);

@@ -1,0 +1,182 @@
+import { z } from "zod";
+
+/**
+ * Session-wide budgets. They are cumulative across cycles and across resumes and are never raised automatically:
+ * a session that exhausts one stops, and resuming it does not reset the counters.
+ */
+export const SessionLimits = z.strictObject({
+  maxCostUsd: z.number().positive(),
+  maxModelCalls: z.number().int().positive(),
+  maxToolCalls: z.number().int().positive(),
+  /** Accepted state-changing farm actions. */
+  maxMutations: z.number().int().nonnegative(),
+  /** Simulated seconds the agent may advance in total. */
+  maxSimSeconds: z.number().nonnegative(),
+  /** Active wall-clock milliseconds, accumulated over all controller runs. */
+  maxWallClockMs: z.number().positive(),
+  maxCycles: z.number().int().positive(),
+  maxConsecutiveErrors: z.number().int().positive(),
+  maxConsecutiveNoProgress: z.number().int().positive(),
+  maxConsecutiveRejections: z.number().int().positive(),
+  maxModelCallsPerCycle: z.number().int().positive(),
+  maxToolCallsPerCycle: z.number().int().positive(),
+  maxAdvanceSecondsPerCall: z.number().positive(),
+  maxOutputTokens: z.number().int().positive(),
+  maxCostPerRequestUsd: z.number().positive(),
+});
+export type SessionLimits = z.infer<typeof SessionLimits>;
+
+export const DEFAULT_SESSION_LIMITS: Readonly<SessionLimits> = {
+  maxCostUsd: 1,
+  maxModelCalls: 20,
+  maxToolCalls: 60,
+  maxMutations: 3,
+  maxSimSeconds: 86_400,
+  maxWallClockMs: 15 * 60_000,
+  maxCycles: 8,
+  maxConsecutiveErrors: 3,
+  maxConsecutiveNoProgress: 3,
+  maxConsecutiveRejections: 3,
+  maxModelCallsPerCycle: 6,
+  maxToolCallsPerCycle: 12,
+  maxAdvanceSecondsPerCall: 3_600,
+  maxOutputTokens: 2_048,
+  maxCostPerRequestUsd: 0.1,
+};
+
+export const Plan = z.strictObject({
+  summary: z.string(),
+  objective: z.string().nullable(),
+  priorities: z.array(z.string()),
+  constraints: z.array(z.string()),
+  missingObservations: z.array(z.string()),
+  pendingOperations: z.array(z.string()),
+  nextReviewSimSeconds: z.number().nonnegative().nullable(),
+  nextStep: z.enum(["continue", "wait_for_actions", "stop"]),
+  stopReason: z.string().nullable(),
+});
+export type Plan = z.infer<typeof Plan>;
+
+export const TrackedAction = z.strictObject({
+  actionId: z.string(),
+  type: z.string(),
+  status: z.enum(["scheduled", "running", "completed", "failed", "cancelled", "rejected"]),
+  submittedAtRevision: z.number().int(),
+  idempotencyKey: z.string(),
+  lastCheckedAt: z.string().nullable(),
+});
+export type TrackedAction = z.infer<typeof TrackedAction>;
+
+export const PendingMutation = z.strictObject({
+  tool: z.enum(["execute_action", "advance_time"]),
+  idempotencyKey: z.string(),
+  expectedRevision: z.number().int(),
+  /** The exact request body (it contains the idempotency key, never a credential). */
+  request: z.record(z.string(), z.unknown()),
+  rationale: z.string().nullable(),
+  recordedAt: z.string(),
+  cycle: z.number().int(),
+});
+export type PendingMutation = z.infer<typeof PendingMutation>;
+
+export const CompletedOperation = z.strictObject({
+  tool: z.enum(["execute_action", "advance_time"]),
+  idempotencyKey: z.string(),
+  status: z.enum(["applied", "rejected", "not_applied"]),
+  expectedRevision: z.number().int(),
+  revisionAfter: z.number().int().nullable(),
+  summary: z.record(z.string(), z.unknown()),
+  cycle: z.number().int(),
+  settledAt: z.string(),
+  /** "reconciled" when settled by replaying the same key after an unknown outcome. */
+  via: z.enum(["direct", "reconciled"]),
+});
+export type CompletedOperation = z.infer<typeof CompletedOperation>;
+
+export const DecisionSummary = z.strictObject({
+  cycle: z.number().int(),
+  at: z.string(),
+  simTimeS: z.number().nullable(),
+  revision: z.number().int().nullable(),
+  /** The model's own explicit summary (update_plan.summary, or its final text). Never hidden reasoning. */
+  summary: z.string(),
+  plannedStep: z.string().nullable(),
+  tools: z.record(z.string(), z.number()),
+  actionsSubmitted: z.number().int(),
+  actionsAccepted: z.number().int(),
+  advancedSeconds: z.number(),
+  progress: z.boolean(),
+  progressReasons: z.array(z.string()),
+  costUsd: z.number(),
+  stopReason: z.string(),
+});
+export type DecisionSummary = z.infer<typeof DecisionSummary>;
+
+export const ObservationSummary = z.strictObject({
+  revision: z.number().int(),
+  simTimeS: z.number(),
+  credits: z.number().nullable(),
+  realizedRevenue: z.number().nullable(),
+  realizedCosts: z.number().nullable(),
+  resources: z.array(z.strictObject({ id: z.string(), kind: z.string(), quantity: z.number(), unit: z.string() })),
+  activeActions: z.number().int(),
+  fields: z.array(z.strictObject({ fieldId: z.string(), knownCrop: z.string().nullable(), knownGrowthStage: z.string().nullable(), missingCount: z.number().int() })),
+});
+export type ObservationSummary = z.infer<typeof ObservationSummary>;
+
+export const SessionStatus = z.enum(["running", "paused", "stopped", "completed", "failed"]);
+export type SessionStatus = z.infer<typeof SessionStatus>;
+
+export const SessionState = z.strictObject({
+  version: z.literal(1),
+  sessionId: z.string(),
+  gameId: z.string(),
+  createdAt: z.string(),
+  updatedAt: z.string(),
+  status: SessionStatus,
+  stopReason: z.string().nullable(),
+  stopDetail: z.string().nullable(),
+  config: z.strictObject({
+    modelId: z.string(),
+    mutationsEnabled: z.boolean(),
+    objective: z.string(),
+    limits: SessionLimits,
+  }),
+  cycle: z.number().int(),
+  plan: Plan.nullable(),
+  decisions: z.array(DecisionSummary),
+  actions: z.array(TrackedAction),
+  operations: z.array(CompletedOperation),
+  pendingMutation: PendingMutation.nullable(),
+  lastRevision: z.number().int().nullable(),
+  lastSimTimeS: z.number().nullable(),
+  /** Event cursor the model's tools use. */
+  modelEventCursor: z.number().int(),
+  /** Event cursor of the controller's own progress reads. */
+  progressCursor: z.number().int(),
+  budgets: z.strictObject({
+    costUsd: z.number(),
+    modelCalls: z.number().int(),
+    toolCalls: z.number().int(),
+    acceptedMutations: z.number().int(),
+    mutationAttempts: z.number().int(),
+    rejectedActions: z.number().int(),
+    advancedSimSeconds: z.number(),
+    wallClockMs: z.number(),
+    consecutiveErrors: z.number().int(),
+    consecutiveNoProgress: z.number().int(),
+    consecutiveRejections: z.number().int(),
+  }),
+  usage: z.strictObject({ inputTokens: z.number().int(), outputTokens: z.number().int(), cachedTokens: z.number().int() }),
+  metrics: z.strictObject({
+    baseline: ObservationSummary.nullable(),
+    latest: ObservationSummary.nullable(),
+    controllerReads: z.number().int(),
+    snapshotRefreshes: z.number().int(),
+    snapshotCacheHits: z.number().int(),
+    mixedRevisionDetections: z.number().int(),
+  }),
+});
+export type SessionState = z.infer<typeof SessionState>;
+
+export const TERMINAL_ACTION_STATUSES: ReadonlySet<string> = new Set(["completed", "failed", "cancelled", "rejected"]);
