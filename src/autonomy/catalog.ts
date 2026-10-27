@@ -240,3 +240,29 @@ export function describeAction(catalog: AvailableActions, type: string): ActionD
     }),
   };
 }
+
+export interface TerseCatalog {
+  revision: number;
+  simTimeS: number;
+  /** Action type -> eligible target ids (null target = the farm itself). Parameters, estimates and reasons: describe_action. */
+  eligible: Record<string, Array<string | null>>;
+  notEligible: string[];
+  note: string;
+}
+
+/** Smallest recurring view: which action types have an eligible target, and which targets. Costs and parameters stay behind describe_action. */
+export function terseCatalog(catalog: AvailableActions): TerseCatalog {
+  const eligible: Record<string, Array<string | null>> = {};
+  const types = new Set<string>();
+  for (const a of catalog.actions) {
+    types.add(a.type);
+    if (a.eligibility.eligible) (eligible[a.type] ??= []).push(a.target?.id ?? null);
+  }
+  return {
+    revision: catalog.revision,
+    simTimeS: catalog.simTimeS,
+    eligible,
+    notEligible: [...types].filter((t) => !eligible[t]),
+    note: "Eligible action types and targets only. Call describe_action(type) for parameters, estimated cost/duration and eligibility details before execute_action. Only the simulator validates actions.",
+  };
+}

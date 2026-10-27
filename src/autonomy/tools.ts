@@ -1,7 +1,7 @@
 import { z } from "zod";
 import type { SimulatorClient } from "../simulator/client.js";
 import { createToolRegistry, defineTool, failureFromError, fail, succeed, type RegisteredTool } from "../agent/tools.js";
-import { compactCatalog, describeAction, digestCatalog } from "./catalog.js";
+import { compactCatalog, describeAction, terseCatalog } from "./catalog.js";
 import { compactFields } from "./compactObservation.js";
 import { collectSnapshot, InconsistentObservationError, type Snapshot } from "./observation.js";
 import { superviseInterval, superviseOperation, type IntervalResult, type WaitResult } from "./supervisor.js";
@@ -104,7 +104,7 @@ export function createAutonomousTools(provider: SnapshotProvider, sink: PlanSink
             return succeed({ unchanged: true, revision: snapshot.revision, simTimeS: snapshot.simTimeS, note: "The game has not changed since the snapshot you already have (same revision and simulated time); it is not repeated." });
           }
           provider.delivered = { revision: snapshot.revision, simTimeS: snapshot.simTimeS };
-          return succeed({ revision: snapshot.revision, simTimeS: snapshot.simTimeS, overview: snapshot.overview, fields: compactFields(snapshot.fields), actions: digestCatalog(snapshot.actions) });
+          return succeed({ revision: snapshot.revision, simTimeS: snapshot.simTimeS, overview: snapshot.overview, fields: compactFields(snapshot.fields), actions: terseCatalog(snapshot.actions) });
         } catch (error) {
           return inconsistent(error);
         }

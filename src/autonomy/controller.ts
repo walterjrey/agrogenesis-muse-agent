@@ -8,6 +8,7 @@ import type { GameEvent } from "../contracts/time.js";
 import type { ModelProvider } from "../model/meta.js";
 import { SimulatorError, type SimulatorClient } from "../simulator/client.js";
 import { InconsistentObservationError, summarizeSnapshot, isAuthFailure } from "./observation.js";
+import { buildEconomics, ledgerEntry } from "./economics.js";
 import { AUTONOMOUS_SYSTEM_PROMPT, DEFAULT_OBJECTIVE, cycleBrief } from "./prompt.js";
 import { SessionLockLostError, type SessionLock, type SessionStore } from "./store.js";
 import { buildProgress } from "./progress.js";
@@ -65,7 +66,7 @@ export function newSessionState(options: NewSessionOptions): SessionState {
     progressCursor: 0,
     budgets: { costUsd: 0, modelCalls: 0, toolCalls: 0, acceptedMutations: 0, mutationAttempts: 0, rejectedActions: 0, advancedSimSeconds: 0, wallClockMs: 0, consecutiveErrors: 0, consecutiveNoProgress: 0,     consecutiveRejections: 0, advanceRequests: 0, consecutiveAdvances: 0, conflicts: 0 },
     usage: { inputTokens: 0, outputTokens: 0, cachedTokens: 0 },
-    metrics: { baseline: null, latest: null, controllerReads: 0, snapshotRefreshes: 0, snapshotCacheHits: 0, mixedRevisionDetections: 0, grainPeakKg: {} },
+    metrics: { baseline: null, latest: null, controllerReads: 0, snapshotRefreshes: 0, snapshotCacheHits: 0, mixedRevisionDetections: 0, grainPeakKg: {}, ledger: [] },
   };
 }
 
@@ -90,7 +91,7 @@ const REASONS_RESUMABLE = new Set(["paused", "running"]);
 const settledExecute = (type: string, response: Awaited<ReturnType<SimulatorClient["executeAction"]>>): MutationSettlement => ({
   status: response.accepted ? "applied" : "rejected",
   revisionAfter: response.revision,
-  summary: { type, accepted: response.accepted, actionId: response.action?.actionId ?? null, actionStatus: response.action?.status ?? null, errors: response.errors },
+  summary: { type, accepted: response.accepted, actionId: response.action?.actionId ?? null, actionStatus: response.action?.status ?? null, finishedAtS: response.action?.finishedAtS ?? null, outcomeSummary: response.action?.outcome?.summary ?? null, measurements: response.action?.outcome?.measurements ?? {}, consumed: response.action?.consumed ?? null, errors: response.errors },
 });
 
 const settledAdvance = (response: Awaited<ReturnType<SimulatorClient["advance"]>>): MutationSettlement => ({
@@ -164,7 +165,19 @@ export class AutonomousController {
         const actionId = settlement.summary.actionId;
         if (typeof actionId === "string") {
           const status = settlement.summary.actionStatus;
-          s.actions.push({ actionId, type: String(settlement.summary.type ?? ""), status: typeof status === "string" ? (status as SessionState["actions"][number]["status"]) : "scheduled", submittedAtRevision: intent.expectedRevision,           idempotencyKey: intent.idempotencyKey, lastCheckedAt: null, target: typeof intent.request.params === "object" && intent.request.params !== null && typeof (intent.request.params as Record<string, unknown>).fieldId === "string" ? String((intent.request.params as Record<string, unknown>).fieldId) : typeof intent.request.targetId === "string" ? intent.request.targetId : null, startedAtS: null, estimatedCompletionS: null, finishedAtS: null, progress: null, consumedCredits: null, outcome: null, failure: null, params: primitiveParams(intent.request), consumedWaterM3: null, consumedSeedKg: null, consumedFuelL: null });
+          s.actions.push({ actionId, type: String(settlement.summary.type ?? ""), status: typeof status === "string" ? (status as SessionState["actions"][number]["status"]) : "scheduled", submittedAtRevision: intent.expectedRevision,           idempotencyKey: intent.idempotencyKey, lastCheckedAt: null, target: typeof intent.request.params === "object" && intent.request.params !== null && typeof (intent.request.params as Record<string, unknown>).fieldId === "string" ? String((intent.request.params as Record<string, unknown>).fieldId) : typeof intent.request.targetId === "string" ? intent.request.targetId : null, startedAtS: null, estimatedCompletionS: null, finishedAtS: null, progress: null, consumedCredits: null, outcome: null, failure: null, params: primitiveParams(intent.request), consumedWaterM3: null, consumedSeedKg: null, consumedFuelL: null, measurements: {} });
+          const tracked = s.actions[s.actions.length - 1]!;
+          const sum = settlement.summary as Record<string, unknown>;
+          if (typeof sum.finishedAtS === "number") tracked.finishedAtS = sum.finishedAtS;
+          if (typeof sum.outcomeSummary === "string") tracked.outcome = sum.outcomeSummary;
+          if (sum.measurements && typeof sum.measurements === "object") tracked.measurements = Object.fromEntries(Object.entries(sum.measurements).filter(([, v]) => typeof v === "number")) as Record<string, number>;
+          const consumed = sum.consumed as { credits?: number; waterM3?: number; seedKg?: number; fuelL?: number } | null | undefined;
+          if (consumed) {
+            tracked.consumedCredits = consumed.credits ?? null;
+            tracked.consumedWaterM3 = consumed.waterM3 ?? null;
+            tracked.consumedSeedKg = consumed.seedKg ?? null;
+            tracked.consumedFuelL = consumed.fuelL ?? null;
+          }
         }
                   b.consecutiveAdvances = 0;
       } else if (settlement.status === "rejected") {
@@ -268,6 +281,7 @@ export class AutonomousController {
         action.consumedSeedKg = view.consumed?.seedKg ?? null;
         action.consumedFuelL = view.consumed?.fuelL ?? null;
         action.outcome = view.outcome?.summary ?? null;
+        action.measurements = view.outcome?.measurements ?? {};
         action.failure = view.failure ? `${view.failure.code}: ${view.failure.detail}`.slice(0, 200) : null;
       } catch {
         /* keep the last known status */
@@ -347,7 +361,13 @@ export class AutonomousController {
 
   private noteSummary(summary: ObservationSummary): void {
     const metrics = this.state.metrics;
+    const previous = metrics.latest;
     metrics.latest = summary;
+    const entry = previous ? ledgerEntry(previous, summary, this.state.actions) : null;
+    if (entry) {
+      metrics.ledger.push(entry);
+      if (metrics.ledger.length > 60) metrics.ledger.splice(0, metrics.ledger.length - 60);
+    }
     for (const r of summary.resources) if (r.kind === "grain") metrics.grainPeakKg[r.id] = Math.max(metrics.grainPeakKg[r.id] ?? 0, r.quantity);
   }
 
@@ -435,6 +455,8 @@ export class AutonomousController {
           finishedInterval: (r) => this.recordInterval(r),
         } : undefined);
 
+        // The brief carries this exact snapshot, so observe_snapshot must not resend it until something changes.
+        this.provider.delivered = { revision: snapshot.revision, simTimeS: snapshot.simTimeS };
         result = await runAgent({
           provider: this.options.provider,
           client: this.options.client,
@@ -442,7 +464,7 @@ export class AutonomousController {
           mode: this.mutationsEnabled ? "controlled_mutation" : "observe_only",
           tools,
           systemPrompt: AUTONOMOUS_SYSTEM_PROMPT,
-          brief: cycleBrief({ state: s, snapshot, events, progress: buildProgress(s) }),
+          brief: cycleBrief({ state: s, snapshot, events, progress: buildProgress(s), economics: buildEconomics(s) }),
           runId: `${s.sessionId}-c${s.cycle}`,
           traceDirectory: this.options.traceDirectory === undefined ? join(this.options.store.sessionDir(s.sessionId), "runs") : this.options.traceDirectory,
           initialState: { observedRevision: snapshot.revision, eventCursor: eventsResponse.nextCursor },

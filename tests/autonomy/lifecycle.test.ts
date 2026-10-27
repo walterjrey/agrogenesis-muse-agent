@@ -155,7 +155,7 @@ function stateWith(actions: TrackedAction[], simTimeS: number): SessionState {
   const s = newSessionState({ sessionId: "life-1", gameId: GAME_ID, modelId: "test", mutationsEnabled: true });
   s.actions = actions;
   s.lastSimTimeS = simTimeS;
-  s.metrics.latest = { revision: 1, simTimeS, credits: 2500, realizedRevenue: 0, realizedCosts: 0, resources: [], activeActions: 0, fields: [{ fieldId: "field-4", knownCrop: null, knownGrowthStage: null, missingCount: 0 }] };
+  s.metrics.latest = { revision: 1, simTimeS, credits: 2500, realizedRevenue: 0, realizedCosts: 0, marketPricesPerKg: null, priceConfigVersion: null, resources: [], activeActions: 0, fields: [{ fieldId: "field-4", knownCrop: null, knownGrowthStage: null, missingCount: 0 }] };
   return s;
 }
 

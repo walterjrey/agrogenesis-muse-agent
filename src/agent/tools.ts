@@ -249,7 +249,7 @@ export function createToolRegistry(): RegisteredTool[] {
           await context.journal?.settle(intent, {
             status: response.accepted ? "applied" : "rejected",
             revisionAfter: response.revision,
-            summary: { type: args.type, accepted: response.accepted, actionId: response.action?.actionId ?? null, actionStatus: response.action?.status ?? null, errors: response.errors },
+            summary: { type: args.type, accepted: response.accepted, actionId: response.action?.actionId ?? null, actionStatus: response.action?.status ?? null, finishedAtS: response.action?.finishedAtS ?? null, outcomeSummary: response.action?.outcome?.summary ?? null, measurements: response.action?.outcome?.measurements ?? {}, consumed: response.action?.consumed ?? null, errors: response.errors },
           });
           context.trace.record("mutation.result", { tool: "execute_action", accepted: response.accepted, revision: response.revision, actionId: response.action?.actionId ?? null, status: response.action?.status ?? null, errors: response.errors });
           if (response.accepted) {

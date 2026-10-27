@@ -93,6 +93,8 @@ export const TrackedAction = z.strictObject({
   consumedWaterM3: z.number().nullable().default(null),
   consumedSeedKg: z.number().nullable().default(null),
   consumedFuelL: z.number().nullable().default(null),
+  /** Measurements reported by the simulator when the action finished (e.g. kg sold, revenue); never inferred. */
+  measurements: z.record(z.string(), z.number()).default({}),
 });
 export type TrackedAction = z.infer<typeof TrackedAction>;
 
@@ -190,11 +192,30 @@ export const ObservationSummary = z.strictObject({
   credits: z.number().nullable(),
   realizedRevenue: z.number().nullable(),
   realizedCosts: z.number().nullable(),
+  /** Configured per-kg market quotes published by the simulator; null when the simulator does not publish them. */
+  marketPricesPerKg: z.record(z.string(), z.number()).nullable().default(null),
+  priceConfigVersion: z.number().int().nullable().default(null),
   resources: z.array(z.strictObject({ id: z.string(), kind: z.string(), quantity: z.number(), unit: z.string() })),
   activeActions: z.number().int(),
   fields: z.array(z.strictObject({ fieldId: z.string(), knownCrop: z.string().nullable(), knownGrowthStage: z.string().nullable(), missingCount: z.number().int() })),
 });
 export type ObservationSummary = z.infer<typeof ObservationSummary>;
+
+/**
+ * Observed economic change between two consecutive authorized observations in which this session's own harvest/sale
+ * actions finished. Deltas are pooled over the listed actions (stock is not tracked per harvest).
+ */
+export const LedgerEntry = z.strictObject({
+  fromSimTimeS: z.number(),
+  toSimTimeS: z.number(),
+  harvestActionIds: z.array(z.string()),
+  sellActionIds: z.array(z.string()),
+  grainDeltaKg: z.record(z.string(), z.number()),
+  creditsDelta: z.number().nullable(),
+  revenueDelta: z.number().nullable(),
+  costsDelta: z.number().nullable(),
+});
+export type LedgerEntry = z.infer<typeof LedgerEntry>;
 
 /** Starting-condition identity. The DB hashes are supplied by the operator; the observation hash is computed by the agent from its first authorized observation. */
 export const ScenarioManifest = z.strictObject({
@@ -271,6 +292,7 @@ export const SessionState = z.strictObject({
     mixedRevisionDetections: z.number().int(),
     /** Largest stock of each grain product seen in any authorized observation (kg). */
     grainPeakKg: z.record(z.string(), z.number()).default({}),
+    ledger: z.array(LedgerEntry).default([]),
   }),
 });
 export type SessionState = z.infer<typeof SessionState>;

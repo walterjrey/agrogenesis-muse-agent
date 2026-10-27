@@ -34,6 +34,7 @@ export function buildReport(state: SessionState) {
     netCreditsResult: delta(baseline?.credits, latest?.credits),
     cropCycleCompleted: done("harvestField").length > 0 && done("sellHarvest").length > 0,
   };
+  const attribution = buildAttribution(state);
   const submitted = state.budgets.acceptedMutations + state.budgets.rejectedActions;
   return {
     sessionId: state.sessionId,
@@ -60,6 +61,7 @@ export function buildReport(state: SessionState) {
     progress: state.progress,
     scenario: state.config.scenario,
     lifecycle,
+    attribution,
     farm: {
       revision: { first: baseline?.revision ?? null, last: latest?.revision ?? null },
       credits: { first: baseline?.credits ?? null, last: latest?.credits ?? null, delta: delta(baseline?.credits, latest?.credits) },
@@ -73,5 +75,49 @@ export function buildReport(state: SessionState) {
     budgets: { used: state.budgets, limits: state.config.limits },
     observation: { controllerReads: state.metrics.controllerReads, snapshotRefreshes: state.metrics.snapshotRefreshes, snapshotCacheHits: state.metrics.snapshotCacheHits, mixedRevisionDetections: state.metrics.mixedRevisionDetections },
     notes: "Null means not observable. Farm-outcome deltas describe this session only and are not a comparison against Manual management.",
+  };
+}
+
+/**
+ * Attribution from this session's own action provenance (who planted what), never from timing alone. A harvest is
+ * "muse_planted" only when a completed plantField by this session precedes it on the same field; otherwise its origin
+ * is "preexisting_or_unknown": the simulator does not publish the crops present at the start, so those fields are
+ * not provably pre-existing, only not planted by Muse in this session. Stock deltas are pooled per observation
+ * interval because the depot does not record which harvest produced which kilogram.
+ */
+export function buildAttribution(state: SessionState) {
+  const { baseline, latest, ledger } = state.metrics;
+  const plantings = state.actions.filter((a) => a.type === "plantField" && a.status === "completed" && a.finishedAtS !== null);
+  const harvests = state.actions.filter((a) => a.type === "harvestField" && a.status === "completed" && a.finishedAtS !== null);
+  const origin = new Map<string, { origin: "muse_planted" | "preexisting_or_unknown"; plantingActionId: string | null; crop: string | null }>();
+  const harvestRows = harvests.map((h) => {
+    const planting = plantings.filter((p) => p.target === h.target && p.finishedAtS! <= h.finishedAtS!).at(-1) ?? null;
+    const row = planting ? { origin: "muse_planted" as const, plantingActionId: planting.actionId, crop: typeof planting.params.crop === "string" ? planting.params.crop : null } : { origin: "preexisting_or_unknown" as const, plantingActionId: null, crop: null };
+    origin.set(h.actionId, row);
+    return { actionId: h.actionId, fieldId: h.target, atSimTimeS: h.finishedAtS, ...row };
+  });
+  const intervals = ledger.map((e) => {
+    const origins = new Set(e.harvestActionIds.map((id) => origin.get(id)?.origin ?? "preexisting_or_unknown"));
+    const attributed = origins.size === 0 ? "no_harvest_in_interval" : origins.size === 1 ? [...origins][0]! : "mixed_pooled";
+    return { ...e, harvestOrigin: attributed };
+  });
+  const grain = (o: typeof baseline) => Object.fromEntries((o?.resources ?? []).filter((r) => r.kind === "grain").map((r) => [r.id, r.quantity]));
+  const sales = state.actions.filter((a) => a.type === "sellHarvest" && a.status === "completed");
+  const round2 = (n: number) => Math.round(n * 100) / 100;
+  const sumKg = (rows: typeof intervals, predicate: (origin: string) => boolean) => round2(rows.filter((r) => predicate(r.harvestOrigin)).reduce((s, r) => s + Object.values(r.grainDeltaKg).filter((v) => v > 0).reduce((a, b) => a + b, 0), 0));
+  return {
+    method: "action provenance (completed plantField before harvestField on the same field) + pooled depot-stock deltas between consecutive authorized observations",
+    initialGrainStockKg: grain(baseline),
+    finalGrainStockKg: grain(latest),
+    harvests: harvestRows,
+    harvestCountByOrigin: { muse_planted: harvestRows.filter((h) => h.origin === "muse_planted").length, preexisting_or_unknown: harvestRows.filter((h) => h.origin === "preexisting_or_unknown").length },
+    positiveStockGainKgByHarvestOrigin: { muse_planted: sumKg(intervals, (o) => o === "muse_planted"), preexisting_or_unknown: sumKg(intervals, (o) => o === "preexisting_or_unknown"), mixed_pooled: sumKg(intervals, (o) => o === "mixed_pooled") },
+    intervals,
+    sales: sales.map((s) => ({ actionId: s.actionId, product: s.params.product ?? null, kg: s.params.kg ?? null, atSimTimeS: s.finishedAtS, outcome: s.outcome, measurements: s.measurements, consumedCredits: s.consumedCredits })),
+    realizedRevenue: baseline?.realizedRevenue != null && latest?.realizedRevenue != null ? round2(latest.realizedRevenue - baseline.realizedRevenue) : null,
+    operatingCostsDelta: baseline?.realizedCosts != null && latest?.realizedCosts != null ? round2(latest.realizedCosts - baseline.realizedCosts) : null,
+    netCashChange: baseline?.credits != null && latest?.credits != null ? round2(latest.credits - baseline.credits) : null,
+    unsoldInventoryKg: grain(latest),
+    note: "Revenue from sales is attributed to the sold product, not to who planted it; the depot pools all harvests, so revenue per origin is unknown unless only one origin existed.",
   };
 }

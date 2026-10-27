@@ -47,6 +47,9 @@ const Finance = z.discriminatedUnion("authorized", [
     credits: z.number(),
     realizedRevenue: z.number(),
     realizedCosts: z.number(),
+    // Optional: older simulators do not publish the configured market.
+    marketPricesPerKg: z.record(z.string(), z.number().nonnegative()).optional(),
+    priceConfigVersion: z.number().int().optional(),
   }),
 ]);
 

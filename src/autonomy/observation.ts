@@ -67,6 +67,8 @@ export function summarizeSnapshot(snapshot: Snapshot): ObservationSummary {
     credits: finance.authorized ? finance.credits : null,
     realizedRevenue: finance.authorized ? finance.realizedRevenue : null,
     realizedCosts: finance.authorized ? finance.realizedCosts : null,
+    marketPricesPerKg: finance.authorized ? (finance.marketPricesPerKg ?? null) : null,
+    priceConfigVersion: finance.authorized ? (finance.priceConfigVersion ?? null) : null,
     resources: snapshot.overview.resources.map((r) => ({ id: r.id, kind: r.kind, quantity: r.quantity, unit: r.unit })),
     activeActions: snapshot.overview.status.activeActionCount,
     fields: snapshot.fields.fields.map((f) => ({ fieldId: f.fieldId, knownCrop: f.knownCrop?.value ?? null, knownGrowthStage: f.knownGrowthStage?.value ?? null, missingCount: f.missing.length })),

@@ -13,6 +13,9 @@ export interface ToolCallMeta {
   arguments: string;
 }
 
+/** A successful call of one of these changes the farm or the clock, so every earlier read result is stale. */
+const STATE_CHANGING = new Set(["execute_action", "advance_time", "wait_for_operation", "wait_for_checkpoint"]);
+
 const keyOf = (meta: ToolCallMeta): string => (meta.name === "observe_snapshot" ? meta.name : `${meta.name}:${meta.arguments}`);
 
 function stubFor(name: string, content: string): string | null {
@@ -37,10 +40,17 @@ export function compactHistory(messages: ChatCompletionMessageParam[], calls: Re
     const meta = calls.get(message.tool_call_id);
     if (meta && SUPERSEDABLE.has(meta.name)) lastByKey.set(keyOf(meta), index);
   });
+  let lastChange = -1;
+  messages.forEach((message, index) => {
+    if (message.role !== "tool" || typeof message.content !== "string") return;
+    const meta = calls.get(message.tool_call_id);
+    if (meta && STATE_CHANGING.has(meta.name) && message.content.includes("\"ok\":true")) lastChange = index;
+  });
   return messages.map((message, index) => {
     if (message.role !== "tool" || typeof message.content !== "string") return message;
     const meta = calls.get(message.tool_call_id);
-    if (!meta || !SUPERSEDABLE.has(meta.name) || lastByKey.get(keyOf(meta)) === index) return message;
+    if (!meta || !SUPERSEDABLE.has(meta.name)) return message;
+    if (lastByKey.get(keyOf(meta)) === index && index > lastChange) return message;
     const stub = stubFor(meta.name, message.content);
     return stub && stub.length < message.content.length ? { ...message, content: stub } : message;
   });
