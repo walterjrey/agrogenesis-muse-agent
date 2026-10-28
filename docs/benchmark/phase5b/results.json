@@ -1,0 +1,412 @@
+{
+  "generatedAt": "2026-10-27T20:50:29.391Z",
+  "note": "One paired run. No statistical significance or general superiority can be inferred.",
+  "scenario": {
+    "seed": 3303,
+    "horizonDays": 200,
+    "initialStateFingerprint": "2c86746eb5b20b22d5c1e37a7795ec63c1e7d6ce95960f36943977d198554934"
+  },
+  "initial": {
+    "simDay": 0,
+    "simTimeS": 0,
+    "revision": 1,
+    "credits": 2500,
+    "realizedRevenue": 0,
+    "realizedCosts": 0,
+    "inventoryKg": {
+      "corn": 0,
+      "soybean": 0,
+      "wheat": 0
+    },
+    "marketPricesPerKg": {
+      "hay": 0.1,
+      "corn": 0.2,
+      "wheat": 0.25,
+      "soybean": 0.45
+    },
+    "estimatedInventoryValue": 0,
+    "unpricedProducts": [],
+    "totalEstimatedValue": 2500,
+    "seedKg": {
+      "corn": 800,
+      "soybean": 1500,
+      "wheat": 3000
+    },
+    "fuelDepotL": 3000,
+    "fuelInMachineTanksL": 1000
+  },
+  "strategies": {
+    "baseline": {
+      "kind": "deterministic reference strategy (non-LLM)",
+      "sessionId": "p5a-baseline",
+      "gameId": "e0d6f3cb-d9fd-4e53-8349-c1bfade45e13",
+      "status": "stopped",
+      "stopReason": "horizon_reached",
+      "complete": true,
+      "final": {
+        "simDay": 200,
+        "simTimeS": 12000,
+        "revision": 101,
+        "credits": 5015.82,
+        "realizedRevenue": 2724.65,
+        "realizedCosts": 208.83,
+        "inventoryKg": {
+          "corn": 0.53,
+          "soybean": 0.866,
+          "wheat": 0.784
+        },
+        "marketPricesPerKg": {
+          "hay": 0.1,
+          "corn": 0.2,
+          "wheat": 0.25,
+          "soybean": 0.45
+        },
+        "estimatedInventoryValue": 0.69,
+        "unpricedProducts": [],
+        "totalEstimatedValue": 5016.51,
+        "seedKg": {
+          "corn": 669.5,
+          "soybean": 1082.4,
+          "wheat": 2811
+        },
+        "fuelDepotL": 3000,
+        "fuelInMachineTanksL": 747.016
+      },
+      "comparison": {
+        "simDaysElapsed": 200,
+        "netCashChange": 2515.82,
+        "realizedRevenue": 2724.65,
+        "operationalExpenses": 208.83,
+        "initialInventoryKg": {
+          "corn": 0,
+          "soybean": 0,
+          "wheat": 0
+        },
+        "finalInventoryKg": {
+          "corn": 0.53,
+          "soybean": 0.866,
+          "wheat": 0.784
+        },
+        "inventoryChangeKg": {
+          "corn": 0.53,
+          "soybean": 0.866,
+          "wheat": 0.784
+        },
+        "initialEstimatedInventoryValue": 0,
+        "finalEstimatedInventoryValue": 0.69,
+        "initialTotalEstimatedValue": 2500,
+        "finalTotalEstimatedValue": 5016.51,
+        "totalEstimatedValueChange": 2516.51,
+        "seedConsumedKg": {
+          "corn": 130.5,
+          "soybean": 417.6,
+          "wheat": 189
+        },
+        "fuelDepotChangeL": 0,
+        "fuelInMachineTanksChangeL": -252.984,
+        "notes": []
+      },
+      "attribution": {
+        "harvests": [
+          {
+            "fieldId": "field-3",
+            "harvestedAtDay": 45.2,
+            "grainKg": 2166.78,
+            "hayKg": 0,
+            "provenance": "not_planted_by_strategy",
+            "crop": null
+          },
+          {
+            "fieldId": "field-2",
+            "harvestedAtDay": 90.4,
+            "grainKg": 1700.7,
+            "hayKg": 0,
+            "provenance": "not_planted_by_strategy",
+            "crop": null
+          },
+          {
+            "fieldId": "field-1",
+            "harvestedAtDay": 95.7,
+            "grainKg": 754.2,
+            "hayKg": 0,
+            "provenance": "not_planted_by_strategy",
+            "crop": null
+          },
+          {
+            "fieldId": "field-4",
+            "harvestedAtDay": 95.8,
+            "grainKg": 865.34,
+            "hayKg": 0,
+            "provenance": "planted_by_strategy",
+            "crop": "soybean"
+          },
+          {
+            "fieldId": "field-3",
+            "harvestedAtDay": 121.2,
+            "grainKg": 573.53,
+            "hayKg": 0,
+            "provenance": "planted_by_strategy",
+            "crop": "soybean"
+          },
+          {
+            "fieldId": "field-2",
+            "harvestedAtDay": 161.4,
+            "grainKg": 518.58,
+            "hayKg": 0,
+            "provenance": "planted_by_strategy",
+            "crop": "soybean"
+          },
+          {
+            "fieldId": "field-1",
+            "harvestedAtDay": 166.7,
+            "grainKg": 640.22,
+            "hayKg": 0,
+            "provenance": "planted_by_strategy",
+            "crop": "soybean"
+          },
+          {
+            "fieldId": "field-4",
+            "harvestedAtDay": 171.9,
+            "grainKg": 1675.83,
+            "hayKg": 0,
+            "provenance": "planted_by_strategy",
+            "crop": "corn"
+          }
+        ],
+        "plantedByStrategy": {
+          "harvests": 5,
+          "grainKg": 4273.5,
+          "hayKg": 0,
+          "grainKgByCrop": {
+            "soybean": 2597.67,
+            "corn": 1675.83
+          },
+          "valueAtKnownPrices": 1504.12
+        },
+        "notPlantedByStrategy": {
+          "harvests": 3,
+          "grainKg": 4621.68,
+          "hayKg": 0,
+          "note": "Crop already standing in the initial scenario or of unknown provenance; not production generated by the strategy. Crop type is not observable."
+        },
+        "plantings": 9,
+        "revenueAttribution": "aggregate_only"
+      },
+      "actions": {
+        "byType": {
+          "prepareSoil": 9,
+          "plantField": 9,
+          "harvestField": 8,
+          "sellHarvest": 8
+        },
+        "total": 34,
+        "fuelUsedByOperationsL": 252.981,
+        "seedUsedKg": 737.1,
+        "waterDeliveredM3": 0,
+        "actionCreditsConsumed": 208.83
+      },
+      "inspections": 0,
+      "advanceRequests": 66,
+      "rejections": 0,
+      "conflicts": 0
+    },
+    "muse": {
+      "kind": "Meta Muse Spark 1.3 autonomous agent",
+      "sessionId": "p5b-muse",
+      "gameId": "a384c161-fcf0-429d-bb46-2cc4431d6619",
+      "modelId": "muse-spark-1.3",
+      "status": "completed",
+      "stopReason": "model_declared_done",
+      "stopDetail": "Sim-time budget exhausted after 19.56d wait to Day200; no harvest/plant/sell eligible, no justified field action without observations. Safe idle hold.",
+      "complete": true,
+      "limits": {
+        "maxCostUsd": 2,
+        "maxModelCalls": 220,
+        "maxToolCalls": 660,
+        "maxMutations": 45,
+        "maxSimSeconds": 12000,
+        "maxWallClockMs": 5400000,
+        "maxCycles": 60,
+        "maxConsecutiveErrors": 3,
+        "maxConsecutiveNoProgress": 3,
+        "maxConsecutiveRejections": 3,
+        "maxModelCallsPerCycle": 6,
+        "maxToolCallsPerCycle": 12,
+        "maxAdvanceSecondsPerCall": 3600,
+        "maxOutputTokens": 2048,
+        "maxCostPerRequestUsd": 0.1,
+        "maxAdvanceRequests": 150,
+        "maxConsecutiveAdvances": 40,
+        "maxConflicts": 5,
+        "maxFarmSpendCredits": 1500,
+        "maxWaitChunkSeconds": 600
+      },
+      "final": {
+        "simDay": 200,
+        "simTimeS": 12000,
+        "revision": 87,
+        "credits": 4131.25,
+        "realizedRevenue": 1791.04,
+        "realizedCosts": 159.79,
+        "inventoryKg": {
+          "corn": 0.683,
+          "soybean": 0.003,
+          "wheat": 0
+        },
+        "marketPricesPerKg": {
+          "hay": 0.1,
+          "corn": 0.2,
+          "wheat": 0.25,
+          "soybean": 0.45
+        },
+        "estimatedInventoryValue": 0.14,
+        "unpricedProducts": [],
+        "totalEstimatedValue": 4131.39,
+        "seedKg": {
+          "corn": 800,
+          "soybean": 772.8,
+          "wheat": 3000
+        },
+        "fuelDepotL": 3000,
+        "fuelInMachineTanksL": 806.694
+      },
+      "comparison": {
+        "simDaysElapsed": 200,
+        "netCashChange": 1631.25,
+        "realizedRevenue": 1791.04,
+        "operationalExpenses": 159.79,
+        "initialInventoryKg": {
+          "corn": 0,
+          "soybean": 0,
+          "wheat": 0
+        },
+        "finalInventoryKg": {
+          "corn": 0.683,
+          "soybean": 0.003,
+          "wheat": 0
+        },
+        "inventoryChangeKg": {
+          "corn": 0.683,
+          "soybean": 0.003,
+          "wheat": 0
+        },
+        "initialEstimatedInventoryValue": 0,
+        "finalEstimatedInventoryValue": 0.14,
+        "initialTotalEstimatedValue": 2500,
+        "finalTotalEstimatedValue": 4131.39,
+        "totalEstimatedValueChange": 1631.39,
+        "seedConsumedKg": {
+          "corn": 0,
+          "soybean": 727.2,
+          "wheat": 0
+        },
+        "fuelDepotChangeL": 0,
+        "fuelInMachineTanksChangeL": -193.306,
+        "notes": []
+      },
+      "attribution": {
+        "harvests": [
+          {
+            "fieldId": "field-3",
+            "harvestedAtDay": 60.1,
+            "grainKg": 1731.29,
+            "hayKg": 0,
+            "provenance": "not_planted_by_strategy",
+            "crop": null
+          },
+          {
+            "fieldId": "field-2",
+            "harvestedAtDay": 90.1,
+            "grainKg": 1705.68,
+            "hayKg": 0,
+            "provenance": "not_planted_by_strategy",
+            "crop": null
+          },
+          {
+            "fieldId": "field-4",
+            "harvestedAtDay": 120.2,
+            "grainKg": 699.03,
+            "hayKg": 0,
+            "provenance": "planted_by_strategy",
+            "crop": "soybean"
+          },
+          {
+            "fieldId": "field-1",
+            "harvestedAtDay": 120.2,
+            "grainKg": 600.51,
+            "hayKg": 0,
+            "provenance": "not_planted_by_strategy",
+            "crop": null
+          },
+          {
+            "fieldId": "field-3",
+            "harvestedAtDay": 150.3,
+            "grainKg": 526.34,
+            "hayKg": 0,
+            "provenance": "planted_by_strategy",
+            "crop": "soybean"
+          },
+          {
+            "fieldId": "field-2",
+            "harvestedAtDay": 180.4,
+            "grainKg": 434.61,
+            "hayKg": 0,
+            "provenance": "planted_by_strategy",
+            "crop": "soybean"
+          }
+        ],
+        "plantedByStrategy": {
+          "harvests": 3,
+          "grainKg": 1659.98,
+          "hayKg": 0,
+          "grainKgByCrop": {
+            "soybean": 1659.98
+          },
+          "valueAtKnownPrices": 746.99
+        },
+        "notPlantedByStrategy": {
+          "harvests": 3,
+          "grainKg": 4037.48,
+          "hayKg": 0,
+          "note": "Crop already standing in the initial scenario or of unknown provenance; not production generated by the strategy. Crop type is not observable."
+        },
+        "plantings": 7,
+        "revenueAttribution": "aggregate_only"
+      },
+      "actions": {
+        "byType": {
+          "prepareSoil": 7,
+          "plantField": 7,
+          "harvestField": 6,
+          "sellHarvest": 5
+        },
+        "total": 25,
+        "fuelUsedByOperationsL": 193.305,
+        "seedUsedKg": 727.2,
+        "waterDeliveredM3": 0,
+        "actionCreditsConsumed": 159.79
+      },
+      "toolCalls": {
+        "list_available_actions": 1,
+        "describe_action": 35,
+        "execute_action": 26,
+        "wait_for_operation": 16,
+        "observe_snapshot": 21,
+        "wait_for_checkpoint": 7,
+        "update_plan": 3
+      },
+      "advanceRequests": 60,
+      "rejectedActions": 1,
+      "conflicts": 0,
+      "cycles": 22,
+      "api": {
+        "modelCalls": 130,
+        "inputTokens": 878177,
+        "outputTokens": 42885,
+        "cachedTokens": 365076,
+        "estimatedCostUsd": 0.8784,
+        "wallClockMs": 316926
+      }
+    }
+  }
+}

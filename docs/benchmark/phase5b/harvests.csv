@@ -1,0 +1,15 @@
+strategy,fieldId,harvestedAtDay,grainKg,provenance,crop
+baseline,field-3,45.2,2166.78,not_planted_by_strategy,unknown
+baseline,field-2,90.4,1700.7,not_planted_by_strategy,unknown
+baseline,field-1,95.7,754.2,not_planted_by_strategy,unknown
+baseline,field-4,95.8,865.34,planted_by_strategy,soybean
+baseline,field-3,121.2,573.53,planted_by_strategy,soybean
+baseline,field-2,161.4,518.58,planted_by_strategy,soybean
+baseline,field-1,166.7,640.22,planted_by_strategy,soybean
+baseline,field-4,171.9,1675.83,planted_by_strategy,corn
+muse,field-3,60.1,1731.29,not_planted_by_strategy,unknown
+muse,field-2,90.1,1705.68,not_planted_by_strategy,unknown
+muse,field-4,120.2,699.03,planted_by_strategy,soybean
+muse,field-1,120.2,600.51,not_planted_by_strategy,unknown
+muse,field-3,150.3,526.34,planted_by_strategy,soybean
+muse,field-2,180.4,434.61,planted_by_strategy,soybean
