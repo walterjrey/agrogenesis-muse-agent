@@ -14,7 +14,7 @@ export interface MockServer {
   close(): Promise<void>;
 }
 
-type Handler = (req: MockRequest) => { status: number; body: unknown; delayMs?: number };
+type Handler = (req: MockRequest) => { status: number; body: unknown; delayMs?: number; headers?: Record<string, string> };
 
 /** Local HTTP server standing in for the simulator or the Meta Model API in MOCKED tests. */
 export async function startMockServer(handler: Handler): Promise<MockServer> {
@@ -27,7 +27,7 @@ export async function startMockServer(handler: Handler): Promise<MockServer> {
       requests.push(mock);
       const out = handler(mock);
       setTimeout(() => {
-        res.writeHead(out.status, { "content-type": "application/json" });
+        res.writeHead(out.status, { "content-type": "application/json", ...out.headers });
         res.end(JSON.stringify(out.body));
       }, out.delayMs ?? 0);
     });

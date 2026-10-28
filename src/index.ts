@@ -22,7 +22,7 @@ export type { ControllerOptions, NewSessionOptions } from "./autonomy/controller
 
 export { SimulatorClient, SimulatorError } from "./simulator/client.js";
 export { MetaModelProvider, ModelApiError, META_BASE_URL } from "./model/meta.js";
-export type { ModelProvider } from "./model/meta.js";
+export type { ModelProvider, ModelApiErrorKind, ModelAttempt, RetryPolicy } from "./model/meta.js";
 export { SpendGuard, SpendLimitError } from "./model/spendGuard.js";
 export { createLogger, silentLogger, redact } from "./logging/logger.js";
 export type { Logger, LogLevel } from "./logging/logger.js";

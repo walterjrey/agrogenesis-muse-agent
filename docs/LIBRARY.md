@@ -71,3 +71,14 @@ Run slices from an independent process (a Render *Background Worker*, or a secon
 
 See [RENDER_DEPLOYMENT.md](RENDER_DEPLOYMENT.md). Exports: `runWorker`, `runWorkerOnce`, `buildSessionRecord` (credential-free enqueue), `PostgresSessionStore.migrate/requestControl`, `postgresJsQueryable`. Real-stack check: `examples/real-integration-check/check.mjs`.
 
+
+## Model retries (0.1.1)
+
+`MetaModelProvider` owns retries (the SDK's own retries are disabled so every attempt is recorded):
+
+- Retried: HTTP 408, 429, 5xx, network errors and per-attempt timeouts, up to `maxAttempts` total attempts (default 4, max 8; legacy `maxRetries` = attempts - 1), with exponential backoff and equal jitter. `Retry-After` is honored; a value above 30 s, or one that does not fit the overall `requestDeadlineMs` (default 120 s) or the caller's `deadlineMs`, stops retrying instead of waiting.
+- Never retried: 400, 401, 403, other 404s, malformed requests, spend-limit errors and any simulator mutation (mutations have their own idempotent retry path).
+- `retryModelNotFound` (env `MODEL_RETRY_MODEL_NOT_FOUND=true`, default off): additionally retries `404` whose structured `error.code` is exactly `model_not_found`, only for models in the package's price table. Meta was observed returning this transiently for a valid model.
+- A `signal` (`RunSliceOptions.signal`, `runWorker` signal) aborts an in-flight request or backoff wait.
+- Each attempt is returned in `ModelResponse.attempts` / `ModelApiError.attempts` (status, provider code, latency, request id, backoff, `possiblyBillable`). Only the successful response is priced and charged to the spend guard; timeouts, dropped connections and 5xx are flagged `possiblyBillable` because their cost cannot be known.
+- An observe-only session whose model call failed now ends `failed` / `model_error` instead of `completed` / `observe_only_complete`.

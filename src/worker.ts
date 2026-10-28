@@ -76,6 +76,7 @@ export async function runWorkerOnce(options: WorkerOptions): Promise<number> {
         sessionId,
         mutationsEnabled: options.mutationsAllowed === true,
         sliceCycles: options.sliceCycles ?? DEFAULT_SLICE_CYCLES,
+        ...(options.signal ? { signal: options.signal } : {}),
       });
       slices += 1;
       const { status, stopReason } = result.state;

@@ -22,7 +22,16 @@ export type ModelConnection =
       modelId?: string;
       baseUrl?: string;
       timeoutMs?: number;
+      /** Legacy: retries after the first attempt. `maxAttempts` wins when both are set. */
       maxRetries?: number;
+      /** Total attempts per model request including the original (default 4, max 8). */
+      maxAttempts?: number;
+      retryBaseDelayMs?: number;
+      retryMaxDelayMs?: number;
+      /** Retry HTTP 404 only when the provider code is exactly `model_not_found` (Meta transient). Default false. */
+      retryModelNotFound?: boolean;
+      /** Overall deadline across attempts and backoff, in ms (default 120000). */
+      requestDeadlineMs?: number;
       /** Hard ceilings enforced by the spend guard in addition to the session limits (which can only tighten them). */
       maxCostPerRequestUsd?: number;
       maxSessionCostUsd?: number;
@@ -55,6 +64,8 @@ export interface RunSliceOptions {
   mutationsEnabled?: boolean;
   /** Decision cycles to run before pausing with `slice_complete` (default 3). */
   sliceCycles?: number;
+  /** Aborts an in-flight model request or retry backoff; the slice still stops at its safe boundary. */
+  signal?: AbortSignal;
   onEvent?: (message: string) => void;
 }
 
@@ -88,7 +99,12 @@ function modelProvider(deps: AgentDependencies, limits: SessionLimits, alreadySp
     modelId: model.modelId ?? "muse-spark-1.3",
     baseUrl: model.baseUrl ?? META_BASE_URL,
     timeoutMs: model.timeoutMs ?? 60_000,
-    maxRetries: model.maxRetries ?? 2,
+    ...(model.maxRetries !== undefined ? { maxRetries: model.maxRetries } : {}),
+    ...(model.maxAttempts !== undefined ? { maxAttempts: model.maxAttempts } : {}),
+    ...(model.retryBaseDelayMs !== undefined ? { retryBaseDelayMs: model.retryBaseDelayMs } : {}),
+    ...(model.retryMaxDelayMs !== undefined ? { retryMaxDelayMs: model.retryMaxDelayMs } : {}),
+    ...(model.retryModelNotFound !== undefined ? { retryModelNotFound: model.retryModelNotFound } : {}),
+    ...(model.requestDeadlineMs !== undefined ? { requestDeadlineMs: model.requestDeadlineMs } : {}),
     maxOutputTokens: limits.maxOutputTokens,
     spendGuard: new SpendGuard({
       maxCostPerRequestUsd: Math.min(perRequest, limits.maxCostPerRequestUsd),
@@ -166,6 +182,7 @@ export async function runSessionSlice(deps: AgentDependencies, options: RunSlice
     mutationsEnabled: mutations,
     sliceCycles: options.sliceCycles ?? DEFAULT_SLICE_CYCLES,
     ...(options.onEvent ? { onEvent: options.onEvent } : {}),
+    ...(options.signal ? { signal: options.signal } : {}),
   });
   const state = await controller.run();
   return { state, report: buildReport(state), finished: state.status !== "paused" && state.status !== "running" };

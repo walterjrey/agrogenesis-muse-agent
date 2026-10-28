@@ -263,6 +263,17 @@ describe("MOCKED autonomy: budgets and loop prevention", () => {
     expect(sim.posts).toHaveLength(0);
   });
 
+  it("does not report an observe-only session as complete when the model call failed", async () => {
+    sim = await fakeSimulator();
+    const { store } = setup({}, false);
+    const model = scriptedModel([{ throws: new ModelApiError("Model API error (HTTP 404 model_not_found) after 4 attempts.", "bad_request", 404, { code: "model_not_found" }) }]);
+    const final = await controller(store, sim, model, { mutationsEnabled: false }).run();
+    expect(final).toMatchObject({ status: "failed", stopReason: "model_error" });
+    expect(final.stopDetail).toMatch(/HTTP 404 model_not_found/);
+    expect(final.budgets.modelCalls).toBe(0);
+    expect(final.decisions.at(-1)).toMatchObject({ stopReason: "model_error" });
+  });
+
   it("does not enable mutations on resume unless the caller confirms again", async () => {
     sim = await fakeSimulator();
     const { store } = setup();

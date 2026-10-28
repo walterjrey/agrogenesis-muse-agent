@@ -86,6 +86,8 @@ export interface ControllerOptions {
   /** Where per-cycle JSONL traces are written; defaults to the backend's trace directory (none for non-file backends). */
   traceDirectory?: string | null;
   onEvent?: (message: string) => void;
+  /** Aborts an in-flight model request or retry backoff (e.g. worker shutdown). */
+  signal?: AbortSignal;
 }
 
 const REASONS_RESUMABLE = new Set(["paused", "running"]);
@@ -488,6 +490,7 @@ export class AutonomousController {
           initialState: { observedRevision: snapshot.revision, eventCursor: eventsResponse.nextCursor },
           journal: this.journal,
           deadlineMs,
+          ...(this.options.signal ? { signal: this.options.signal } : {}),
           retryDelayMs: this.options.retryDelayMs ?? 400,
           ...(this.options.newMutationId ? { newMutationId: this.options.newMutationId } : {}),
           limits: {
@@ -563,6 +566,8 @@ export class AutonomousController {
       if (s.pendingMutation) continue; // reconcile first; never act on top of an unknown outcome
       if (result.stopReason === "wall_clock_limit") return this.end("stopped", "wall_clock_exhausted");
       if (sink.latest?.nextStep === "stop") return this.end("completed", "model_declared_done", sink.latest.stopReason);
+      // A cycle whose model request failed produced no observation; it must not read as a finished observe-only session.
+      if (!this.mutationsEnabled && (result.stopReason === "model_error" || result.stopReason === "empty_response")) return this.end("failed", "model_error", result.error ? result.error.slice(0, 300) : `The model produced no decision (${result.stopReason}).`);
       if (!this.mutationsEnabled) return this.end("completed", "observe_only_complete", "Mutations are disabled; one observation-and-planning cycle was run.");
       if (b.consecutiveErrors >= s.config.limits.maxConsecutiveErrors) return this.end("paused", "consecutive_errors");
       if (b.consecutiveRejections >= s.config.limits.maxConsecutiveRejections) return this.end("stopped", "repeated_rejections");

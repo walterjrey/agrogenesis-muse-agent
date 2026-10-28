@@ -57,6 +57,8 @@ export interface RunOptions {
   journal?: MutationJournal;
   /** Epoch milliseconds after which no further model request is started. */
   deadlineMs?: number;
+  /** Aborts an in-flight model request or retry backoff (e.g. worker shutdown). */
+  signal?: AbortSignal;
   /** Asked when the model is about to give its final answer; a non-null message is sent back once instead (e.g. to ask for a missing plan). */
   beforeFinal?: () => string | null;
 }
@@ -112,11 +114,11 @@ export async function runAgent(options: RunOptions): Promise<RunResult & { trace
     let response: ModelResponse;
     try {
       trace.record("model.request", { step, messageCount: messages.length, toolsOffered: toolsEnabled ? tools.length : 0 });
-      response = await options.provider.complete({ messages: compactHistory(messages, callMeta), ...(toolsEnabled ? { tools } : {}), maxOutputTokens: limits.maxOutputTokens });
+      response = await options.provider.complete({ messages: compactHistory(messages, callMeta), ...(toolsEnabled ? { tools } : {}), maxOutputTokens: limits.maxOutputTokens, ...(options.signal ? { signal: options.signal } : {}), ...(options.deadlineMs !== undefined ? { deadlineMs: options.deadlineMs } : {}) });
     } catch (caught) {
       stopReason = caught instanceof SpendLimitError ? "cost_limit" : "model_error";
       error = caught instanceof Error ? caught.message : String(caught);
-      trace.record("model.error", { step, kind: caught instanceof ModelApiError ? caught.kind : caught instanceof SpendLimitError ? caught.limit : "unknown", message: error });
+      trace.record("model.error", { step, kind: caught instanceof ModelApiError ? caught.kind : caught instanceof SpendLimitError ? caught.limit : "unknown", message: error, ...(caught instanceof ModelApiError ? { status: caught.status ?? null, code: caught.code, requestId: caught.requestId, attempts: caught.attempts } : {}) });
       break;
     }
 
@@ -130,6 +132,7 @@ export async function runAgent(options: RunOptions): Promise<RunResult & { trace
       model: response.model,
       finishReason: response.finishReason,
       requestId: response.requestId,
+      attempts: response.attempts?.length ?? 1,
       usage: response.usage,
       estimatedCostUsd: response.estimatedCostUsd,
       latencyMs: response.latencyMs,
