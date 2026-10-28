@@ -1,0 +1,38 @@
+{
+  "policyVersion": "phase5c-v1",
+  "purpose": "Factual planning context and bounded adaptive review timing; no action selection.",
+  "experimentHorizonDays": null,
+  "time": {
+    "secondsPerSimulatedDay": 60,
+    "modelMaximumWaitDays": 30,
+    "defaultReviewCheckpointDays": 5,
+    "farFromGenericWindowCheckpointDays": 10,
+    "genericCropDurationEstimateDays": 100,
+    "genericCropReviewWindowStartDaysSincePlanting": 75,
+    "genericCropReviewWindowEndDaysSincePlanting": 115,
+    "nearWindowMaximumModelWaitDays": 5,
+    "nearWindowCheckpointDays": 2,
+    "staleCriticalObservationMaximumWaitDays": 5,
+    "recentMaterialEventMaximumWaitDays": 5,
+    "minimumPendingOperationReviewDays": 0.5
+  },
+  "dataPolicy": {
+    "cropTypes": "Read from the authorized plantField parameter enum",
+    "salePrices": "Read only from authorized configured market quotes",
+    "seedAndGrainStock": "Read only from the authorized farm overview",
+    "fieldEligibilityAndActionEstimates": "Read only from the authorized available-action catalog; planting estimates are not treated as crop-specific",
+    "expectedYield": "Unknown unless explicitly published by the authorized agent API",
+    "cropSpecificDuration": "Unknown unless explicitly published by the authorized agent API",
+    "seedRateAndWaterRequirement": "Unknown unless explicitly published by the authorized agent API",
+    "hiddenSimulationState": "Never read or included",
+    "runtimeActionSelection": "None; Muse selects every management action"
+  },
+  "adaptiveReviewRules": [
+    "Clamp model-selected wait to 30 days and to the configured experiment horizon when provided.",
+    "Near/after the generic 75-115 day review window for a session-known planting: cap model wait at 5 days and internal review checkpoints at 2 days.",
+    "Far from the generic window: cap internal review checkpoints at 10 days, while preserving the model-selected wait.",
+    "A simulator-reported pending completion bounds the wait to its estimated completion, with a 0.5 day minimum review interval.",
+    "Stale/expired critical sensor observations or recent material events cap model wait at 5 days and checkpoints at 2 days.",
+    "The approximate 100-day duration and review window are generic, not crop-specific estimates, hidden-maturity inference, or simulator guarantees."
+  ]
+}

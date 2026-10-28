@@ -14,7 +14,7 @@ import { SessionLockLostError, type SessionLock, type SessionStore } from "./sto
 import { buildProgress } from "./progress.js";
 import { superviseOperation, type IntervalResult, type WaitResult } from "./supervisor.js";
 import { createAutonomousTools, SnapshotProvider, type PlanSink } from "./tools.js";
-import { DEFAULT_SESSION_LIMITS, TERMINAL_ACTION_STATUSES, type ObservationSummary, type ScenarioManifest, type SessionLimits, type SessionState, type WaitRecord } from "./types.js";
+import { DEFAULT_SESSION_LIMITS, PLANNING_POLICY_VERSION, TERMINAL_ACTION_STATUSES, type ObservationSummary, type PlanningConfig, type ScenarioManifest, type SessionLimits, type SessionState, type WaitRecord } from "./types.js";
 
 export interface NewSessionOptions {
   sessionId?: string;
@@ -27,6 +27,8 @@ export interface NewSessionOptions {
   autoWait?: boolean;
   /** Starting-condition identity supplied by the operator (seed, scenario name, DB snapshot hash). */
   scenario?: Partial<ScenarioManifest>;
+  /** Versioned planning context. Horizon is explicit and independent of the session's time-advance budget. */
+  planning?: Partial<PlanningConfig>;
 }
 
 const EMPTY_SCENARIO: ScenarioManifest = { name: null, seed: null, startSnapshotSha256: null, worldConfigSha256: null, startObservationSha256: null, startRevision: null, startSimTimeS: null, notes: [] };
@@ -51,7 +53,7 @@ export function newSessionState(options: NewSessionOptions): SessionState {
     status: "paused",
     stopReason: "not_started",
     stopDetail: null,
-    config: { modelId: options.modelId, mutationsEnabled: options.mutationsEnabled, objective: options.objective ?? DEFAULT_OBJECTIVE, limits: { ...DEFAULT_SESSION_LIMITS, ...options.limits }, autoWait: options.autoWait ?? true, scenario: { ...EMPTY_SCENARIO, ...options.scenario } },
+    config: { modelId: options.modelId, mutationsEnabled: options.mutationsEnabled, objective: options.objective ?? DEFAULT_OBJECTIVE, limits: { ...DEFAULT_SESSION_LIMITS, ...options.limits }, autoWait: options.autoWait ?? true, planning: { policyVersion: PLANNING_POLICY_VERSION, horizonDays: null, ...options.planning }, scenario: { ...EMPTY_SCENARIO, ...options.scenario } },
     cycle: 0,
     plan: null,
     decisions: [],
@@ -168,7 +170,10 @@ export class AutonomousController {
           s.actions.push({ actionId, type: String(settlement.summary.type ?? ""), status: typeof status === "string" ? (status as SessionState["actions"][number]["status"]) : "scheduled", submittedAtRevision: intent.expectedRevision,           idempotencyKey: intent.idempotencyKey, lastCheckedAt: null, target: typeof intent.request.params === "object" && intent.request.params !== null && typeof (intent.request.params as Record<string, unknown>).fieldId === "string" ? String((intent.request.params as Record<string, unknown>).fieldId) : typeof intent.request.targetId === "string" ? intent.request.targetId : null, startedAtS: null, estimatedCompletionS: null, finishedAtS: null, progress: null, consumedCredits: null, outcome: null, failure: null, params: primitiveParams(intent.request), consumedWaterM3: null, consumedSeedKg: null, consumedFuelL: null, measurements: {} });
           const tracked = s.actions[s.actions.length - 1]!;
           const sum = settlement.summary as Record<string, unknown>;
+          if (typeof sum.startedAtS === "number") tracked.startedAtS = sum.startedAtS;
+          if (typeof sum.estimatedCompletionS === "number") tracked.estimatedCompletionS = sum.estimatedCompletionS;
           if (typeof sum.finishedAtS === "number") tracked.finishedAtS = sum.finishedAtS;
+          if (typeof sum.progress === "number") tracked.progress = sum.progress;
           if (typeof sum.outcomeSummary === "string") tracked.outcome = sum.outcomeSummary;
           if (sum.measurements && typeof sum.measurements === "object") tracked.measurements = Object.fromEntries(Object.entries(sum.measurements).filter(([, v]) => typeof v === "number")) as Record<string, number>;
           const consumed = sum.consumed as { credits?: number; waterM3?: number; seedKg?: number; fuelL?: number } | null | undefined;
@@ -310,6 +315,14 @@ export class AutonomousController {
 
   private recordWait(wait: WaitResult, trigger: WaitRecord["trigger"]): void {
     this.state.waits.push({ cycle: this.state.cycle, actionId: wait.actionId, trigger, outcome: wait.outcome, actionStatus: wait.actionStatus, advanceRequests: wait.advanceRequests, advancedSeconds: wait.advancedSeconds, simTimeStartS: wait.simTimeStartS, simTimeEndS: wait.simTimeEndS, events: wait.events, detail: wait.detail });
+    const action = this.state.actions.find((candidate) => candidate.actionId === wait.actionId);
+    if (action && wait.actionStatus !== null) action.status = wait.actionStatus;
+    if (action && wait.progress !== null) action.progress = wait.progress;
+    if (action && wait.estimatedCompletionS !== null) action.estimatedCompletionS = wait.estimatedCompletionS;
+    if (action && wait.finishedAtS !== null) action.finishedAtS = wait.finishedAtS;
+    if (action && wait.consumedCredits !== null) action.consumedCredits = wait.consumedCredits;
+    if (action && wait.outcomeSummary !== null) action.outcome = wait.outcomeSummary;
+    if (action && wait.failure !== null) action.failure = wait.failure;
     this.save();
   }
 
@@ -453,7 +466,7 @@ export class AutonomousController {
           onConflict: () => undefined,
           finished: (wait) => this.recordWait(wait, "model_tool"),
           finishedInterval: (r) => this.recordInterval(r),
-        } : undefined);
+        } : undefined, { state: s, recentEvents: events });
 
         // The brief carries this exact snapshot, so observe_snapshot must not resend it until something changes.
         this.provider.delivered = { revision: snapshot.revision, simTimeS: snapshot.simTimeS };

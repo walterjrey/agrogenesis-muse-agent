@@ -34,11 +34,11 @@ const PLAN = (nextStep: "continue" | "wait_for_actions" | "stop", summary = `pla
 });
 const TEXT: ScriptedStep = { content: "ok" };
 
-function setup(limits: Partial<SessionLimits> = {}, mutationsEnabled = true) {
+function setup(limits: Partial<SessionLimits> = {}, mutationsEnabled = true, planning: { horizonDays?: number | null } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "autonomy-"));
   dirs.push(dir);
   const store = new SessionStore(dir, 5_000);
-  const state = newSessionState({ sessionId: "t1", gameId: GAME_ID, modelId: "muse-spark-1.3", mutationsEnabled, limits, autoWait: false });
+  const state = newSessionState({ sessionId: "t1", gameId: GAME_ID, modelId: "muse-spark-1.3", mutationsEnabled, limits, planning, autoWait: false });
   const lock = store.acquire("t1");
   lock.save(state);
   lock.release();
@@ -99,7 +99,7 @@ describe("MOCKED autonomy: multi-cycle control and persistence", () => {
 
   it("resumes after a process restart without repeating completed actions or charging twice", async () => {
     sim = await fakeSimulator();
-    const { dir, store } = setup({ maxCycles: 6 });
+    const { dir, store } = setup({ maxCycles: 6 }, true, { horizonDays: 200 });
     const first = await controller(store, sim, scriptedModel([INSPECT, PLAN("continue"), TEXT]), { sliceCycles: 1 }).run();
     expect(first).toMatchObject({ status: "paused", stopReason: "slice_complete", cycle: 1 });
     expect(sim.state.accepted).toBe(1);
@@ -113,10 +113,12 @@ describe("MOCKED autonomy: multi-cycle control and persistence", () => {
     expect(sim.posts.filter((p) => p.path === "/actions")).toHaveLength(1);
     expect(final.budgets.acceptedMutations).toBe(1);
     expect(final.budgets.modelCalls).toBe(6);
+    expect(final.config.planning).toEqual({ policyVersion: "phase5c-v1", horizonDays: 200 });
     // The resumed cycle was shown the earlier plan and decision, and told the action is in flight.
     const brief = String(model.requests[0]!.messages.at(-1)!.content);
     expect(brief).toContain("plan continue");
     expect(brief).toContain("act-1");
+    expect(brief).toContain('"configuredHorizonDays":200');
   });
 
   it("refuses to resume a stopped session", async () => {

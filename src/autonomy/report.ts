@@ -60,6 +60,7 @@ export function buildReport(state: SessionState) {
     waits: { count: state.waits.length, byOutcome: state.waits.reduce<Record<string, number>>((acc, w) => ({ ...acc, [w.outcome]: (acc[w.outcome] ?? 0) + 1 }), {}), byTrigger: { model_tool: state.waits.filter((w) => w.trigger === "model_tool").length, controller: state.waits.filter((w) => w.trigger === "controller").length } },
     progress: state.progress,
     scenario: state.config.scenario,
+    planning: state.config.planning,
     lifecycle,
     attribution,
     farm: {

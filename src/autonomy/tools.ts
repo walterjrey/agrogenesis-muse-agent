@@ -4,8 +4,10 @@ import { createToolRegistry, defineTool, failureFromError, fail, succeed, type R
 import { compactCatalog, describeAction, terseCatalog } from "./catalog.js";
 import { compactFields } from "./compactObservation.js";
 import { collectSnapshot, InconsistentObservationError, type Snapshot } from "./observation.js";
+import { adaptReviewWindow, buildCropEconomics } from "./planning.js";
 import { superviseInterval, superviseOperation, type IntervalResult, type WaitResult } from "./supervisor.js";
-import type { Plan } from "./types.js";
+import type { GameEvent } from "../contracts/time.js";
+import type { Plan, SessionState } from "./types.js";
 
 /**
  * Hands out consistent snapshots. When the overview revision and simulated time have not changed since the last
@@ -82,7 +84,12 @@ const PlanArgs = z.strictObject({
   stopReason: z.string().max(300).optional().describe("Required when nextStep is stop."),
 });
 
-export function createAutonomousTools(provider: SnapshotProvider, sink: PlanSink, wait?: WaitHooks): RegisteredTool[] {
+export function createAutonomousTools(
+  provider: SnapshotProvider,
+  sink: PlanSink,
+  wait?: WaitHooks,
+  planning?: { state: SessionState; recentEvents: GameEvent[] },
+): RegisteredTool[] {
   const base = createToolRegistry();
   const reuse = (name: string): RegisteredTool => {
     const tool = base.find((t) => t.name === name);
@@ -141,6 +148,21 @@ export function createAutonomousTools(provider: SnapshotProvider, sink: PlanSink
           context.state.observedRevision = snapshot.revision;
           const detail = describeAction(snapshot.actions, args.type);
           return detail ? succeed(detail) : fail("unknown_action_type", `The simulator offers no action type "${args.type}".`);
+        } catch (error) {
+          return inconsistent(error);
+        }
+      },
+    }),
+    defineTool({
+      name: "compare_crop_options",
+      description: "Read-only crop comparison from the current authorized snapshot: configured sale quotes, observed seed/grain stock, currently plantable fields, and simulator-published planting previews. Expected yield, crop-specific duration, seed rate, water requirement and profitability are explicitly unknown unless published by the simulator API.",
+      mutating: false,
+      args: z.strictObject({}),
+      async run(context) {
+        try {
+          const snapshot = await provider.get();
+          context.state.observedRevision = snapshot.revision;
+          return succeed(buildCropEconomics(snapshot));
         } catch (error) {
           return inconsistent(error);
         }
@@ -241,6 +263,11 @@ export function createAutonomousTools(provider: SnapshotProvider, sink: PlanSink
             async run(context, args) {
               if (context.state.mutationLocked) return fail("mutation_locked", "A previous state-changing request has an unconfirmed outcome; no further time advancement is allowed in this run.");
               const limits = context.policy.limits;
+              const currentSnapshot = planning ? await provider.get() : null;
+              const reviewSchedule = planning && currentSnapshot
+                ? adaptReviewWindow(planning.state, currentSnapshot, planning.recentEvents, args.maxDays, args.checkpointDays)
+                : null;
+              if (reviewSchedule) context.trace.record("planning.review_schedule", { ...reviewSchedule });
               const result = await superviseInterval(
                 {
                   client: context.client,
@@ -267,7 +294,10 @@ export function createAutonomousTools(provider: SnapshotProvider, sink: PlanSink
                   onConflict: wait.onConflict,
                   record: (event, data) => context.trace.record(event, data),
                 },
-                { maxSeconds: args.maxDays * 60, checkpointSeconds: (args.checkpointDays ?? 5) * 60 },
+                {
+                  maxSeconds: (reviewSchedule?.effectiveMaxDays ?? args.maxDays) * 60,
+                  checkpointSeconds: (reviewSchedule?.effectiveCheckpointDays ?? args.checkpointDays ?? 5) * 60,
+                },
               );
               context.state.observedRevision = null;
               provider.invalidate();
@@ -277,7 +307,11 @@ export function createAutonomousTools(provider: SnapshotProvider, sink: PlanSink
                 context.state.mutationLocked = true;
                 return fail("outcome_unknown", "A time advance may or may not have been applied. Further state-changing calls are blocked for this run; the controller will reconcile it with the original idempotency key.");
               }
-              return succeed({ ...result, note: "Time advanced on the server. Earlier observations are stale; observe again before acting." });
+              return succeed({
+                ...result,
+                ...(reviewSchedule ? { reviewSchedule } : {}),
+                note: "Time advanced on the server. Earlier observations are stale; observe again before acting.",
+              });
             },
           }),
         ]

@@ -59,6 +59,15 @@ export const DEFAULT_SESSION_LIMITS: Readonly<SessionLimits> = {
   maxWaitChunkSeconds: 600,
 };
 
+export const PLANNING_POLICY_VERSION = "phase5c-v1";
+
+export const PlanningConfig = z.strictObject({
+  policyVersion: z.literal(PLANNING_POLICY_VERSION).default(PLANNING_POLICY_VERSION),
+  /** Evaluation horizon measured from the first authorized observation; null means unspecified. */
+  horizonDays: z.number().positive().nullable().default(null),
+});
+export type PlanningConfig = z.infer<typeof PlanningConfig>;
+
 export const Plan = z.strictObject({
   summary: z.string(),
   objective: z.string().nullable(),
@@ -249,6 +258,8 @@ export const SessionState = z.strictObject({
     limits: SessionLimits,
     /** After a model turn, wait mechanically (no model calls) for operations still in flight. */
     autoWait: z.boolean().default(true),
+    /** Versioned planning behavior and optional experiment horizon. Defaults keep old session files loadable. */
+    planning: PlanningConfig.default({ policyVersion: PLANNING_POLICY_VERSION, horizonDays: null }),
     /** Identity of the starting conditions, so a run can be reproduced and audited. */
     scenario: ScenarioManifest.default({ name: null, seed: null, startSnapshotSha256: null, worldConfigSha256: null, startObservationSha256: null, startRevision: null, startSimTimeS: null, notes: [] }),
   }),

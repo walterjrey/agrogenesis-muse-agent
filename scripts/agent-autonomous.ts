@@ -38,6 +38,7 @@ const { values, positionals } = parseArgs({
     "max-mutations": { type: "string" },
     "max-sim-seconds": { type: "string" },
     "max-sim-days": { type: "string" },
+    "planning-horizon-days": { type: "string" },
     "max-advance-requests": { type: "string" },
     "max-consecutive-advances": { type: "string" },
     "max-conflicts": { type: "string" },
@@ -76,6 +77,7 @@ if (command === "status") {
   console.log(JSON.stringify({ report: buildReport(state), plan: state.plan, ...(values.decisions ? { decisions: state.decisions, operations: state.operations, actions: state.actions } : { recentDecisions: state.decisions.slice(-3).map((d) => ({ cycle: d.cycle, summary: d.summary, progress: d.progress })) }) }, null, 2));
   process.exit(0);
 }
+if (command === "resume" && values["planning-horizon-days"] !== undefined) fail("Planning horizon is persisted with the session and cannot be changed on resume.", 2);
 
 const logger = createLogger({ level: (process.env.LOG_LEVEL as LogLevel) || "info", file: "logs/agent-autonomous.jsonl" });
 const say = (m: string) => console.error(`[agent] ${m}`);
@@ -113,6 +115,8 @@ try {
       ...(num("max-consecutive-errors", values["max-consecutive-errors"]) !== undefined && { maxConsecutiveErrors: num("max-consecutive-errors", values["max-consecutive-errors"])! }),
       ...(num("max-consecutive-no-progress", values["max-consecutive-no-progress"]) !== undefined && { maxConsecutiveNoProgress: num("max-consecutive-no-progress", values["max-consecutive-no-progress"])! }),
     };
+    const planningHorizonDays = num("planning-horizon-days", values["planning-horizon-days"]);
+    if (planningHorizonDays !== undefined && planningHorizonDays <= 0) fail("--planning-horizon-days must be greater than 0.", 2);
     if (mutations) {
       for (const flag of ["max-cost-usd", "max-mutations", "max-model-calls"] as const) {
         if (values[flag] === undefined) fail(`--enable-mutations requires explicit budgets: missing --${flag}.`, 2);
@@ -132,7 +136,22 @@ try {
     limits = { ...DEFAULT_SESSION_LIMITS, ...overrides };
     const provider = metaProviderFromEnv(logger, { maxCostPerRequestUsd: limits.maxCostPerRequestUsd, maxSessionCostUsd: limits.maxCostUsd, maxOutputTokens: limits.maxOutputTokens });
     modelId = provider.modelId;
-    const state = newSessionState({ ...(values["session-id"] ? { sessionId: values["session-id"] } : {}), gameId, modelId, mutationsEnabled: mutations, autoWait: values["no-auto-wait"] !== true, ...(values.objective ? { objective: values.objective } : {}), limits, scenario: { name: values["scenario-name"] ?? null, seed: values["scenario-seed"] ? Number(values["scenario-seed"]) : null, startSnapshotSha256: values["start-snapshot-sha256"] ?? null, worldConfigSha256: values["world-config-sha256"] ?? null } });
+    const state = newSessionState({
+      ...(values["session-id"] ? { sessionId: values["session-id"] } : {}),
+      gameId,
+      modelId,
+      mutationsEnabled: mutations,
+      autoWait: values["no-auto-wait"] !== true,
+      ...(values.objective ? { objective: values.objective } : {}),
+      limits,
+      planning: { ...(planningHorizonDays !== undefined ? { horizonDays: planningHorizonDays } : {}) },
+      scenario: {
+        name: values["scenario-name"] ?? null,
+        seed: values["scenario-seed"] ? Number(values["scenario-seed"]) : null,
+        startSnapshotSha256: values["start-snapshot-sha256"] ?? null,
+        worldConfigSha256: values["world-config-sha256"] ?? null,
+      },
+    });
     if (store.exists(state.sessionId)) fail(`Session ${state.sessionId} already exists; use agent:resume.`, 2);
     const lock = store.acquire(state.sessionId);
     lock.save(state);
