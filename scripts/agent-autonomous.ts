@@ -4,7 +4,7 @@ import { createLogger, type LogLevel } from "../src/logging/logger.js";
 import { metaProviderFromEnv } from "../src/model/fromEnv.js";
 import { AutonomousController, newSessionState } from "../src/autonomy/controller.js";
 import { buildReport } from "../src/autonomy/report.js";
-import { SessionLockedError, SessionStore } from "../src/autonomy/store.js";
+import { IncompatibleSessionError, SessionLockedError, SessionStore } from "../src/autonomy/store.js";
 import { DEFAULT_SESSION_LIMITS, type SessionLimits } from "../src/autonomy/types.js";
 import { SimulatorClient } from "../src/simulator/client.js";
 
@@ -68,12 +68,19 @@ if (command !== "start" && command !== "resume" && command !== "status") fail("U
 const store = new SessionStore(values["sessions-dir"] ?? "sessions");
 
 if (command === "status") {
+  const listing = () => ({ sessions: store.list(), incompatible: store.listIncompatible() });
   const id = values["session-id"] ?? store.list().at(-1)?.sessionId;
   if (!id) {
-    console.log(JSON.stringify({ sessions: store.list() }, null, 2));
+    console.log(JSON.stringify(listing(), null, 2));
     process.exit(0);
   }
-  const state = store.load(id);
+  let state;
+  try {
+    state = store.load(id);
+  } catch (error) {
+    if (error instanceof IncompatibleSessionError) fail(error.message, 3);
+    throw error;
+  }
   console.log(JSON.stringify({ report: buildReport(state), plan: state.plan, ...(values.decisions ? { decisions: state.decisions, operations: state.operations, actions: state.actions } : { recentDecisions: state.decisions.slice(-3).map((d) => ({ cycle: d.cycle, summary: d.summary, progress: d.progress })) }) }, null, 2));
   process.exit(0);
 }

@@ -245,7 +245,7 @@ describe("MOCKED controller: supervised waiting", () => {
     const simTime = sim.state.simTimeS;
     expect(first.budgets.advancedSimSeconds).toBe(simTime);
     // A stopped session cannot be resumed (budgets are never raised automatically): nothing is replayed.
-    expect(() => ctl(store, sim!, scriptedModel([TEXT("x")]))).toThrow(/cannot be resumed/);
+    await expect(ctl(store, sim, scriptedModel([TEXT("x")])).run()).rejects.toThrow(/cannot be resumed/);
     expect(sim.state.advances).toHaveLength(advancesAfterFirst);
     expect(sim.state.simTimeS).toBe(simTime);
   });

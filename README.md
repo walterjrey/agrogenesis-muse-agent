@@ -37,6 +37,8 @@ Server-to-server HTTP under `/api/agent/v1` with a scoped per-game bearer token.
 
 Requires Node.js ≥ 20.12.
 
+> **Using this as a library** (for example from AgroGenesis): see [docs/LIBRARY.md](docs/LIBRARY.md).
+
 ```bash
 npm install
 cp .env.example .env   # then fill in values; .env is git-ignored

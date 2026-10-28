@@ -58,8 +58,8 @@ export interface WaitHooks {
   maxChunkSeconds: number;
   conflictsLeft(): number;
   onConflict(): void;
-  finished(result: WaitResult): void;
-  finishedInterval(result: IntervalResult): void;
+  finished(result: WaitResult): void | Promise<void>;
+  finishedInterval(result: IntervalResult): void | Promise<void>;
 }
 
 export interface PlanSink {
@@ -237,7 +237,7 @@ export function createAutonomousTools(
               );
               context.state.observedRevision = null;
               provider.invalidate();
-              wait.finished(result);
+              await wait.finished(result);
               context.trace.record("supervisor.result", { ...result });
               if (result.outcome === "outcome_unknown") {
                 context.state.mutationLocked = true;
@@ -301,7 +301,7 @@ export function createAutonomousTools(
               );
               context.state.observedRevision = null;
               provider.invalidate();
-              wait.finishedInterval(result);
+              await wait.finishedInterval(result);
               context.trace.record("supervisor.interval_result", { ...result });
               if (result.outcome === "outcome_unknown") {
                 context.state.mutationLocked = true;

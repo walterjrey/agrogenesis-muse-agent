@@ -126,7 +126,7 @@ describe("MOCKED autonomy: multi-cycle control and persistence", () => {
     const { store } = setup({ maxModelCalls: 3 });
     const stopped = await controller(store, sim, scriptedModel([PLAN("continue"), TEXT])).run();
     expect(stopped.status).toBe("stopped");
-    expect(() => controller(store, sim!, scriptedModel([TEXT]))).toThrow(/cannot be resumed/);
+    await expect(controller(store, sim, scriptedModel([TEXT])).run()).rejects.toThrow(/cannot be resumed/);
   });
 });
 
@@ -134,9 +134,11 @@ describe("MOCKED autonomy: single session owner", () => {
   it("refuses a second controller while the first owns the session, and allows it afterwards", async () => {
     sim = await fakeSimulator();
     const { store } = setup();
-    const first = controller(store, sim, scriptedModel([PLAN("stop"), TEXT]));
-    expect(() => controller(store, sim!, scriptedModel([TEXT]))).toThrow(SessionLockedError);
-    await first.run();
+    const held = store.acquire("t1");
+    await expect(controller(store, sim, scriptedModel([TEXT])).run()).rejects.toBeInstanceOf(SessionLockedError);
+    held.release();
+    const final = await controller(store, sim, scriptedModel([PLAN("stop"), TEXT])).run();
+    expect(final.status).toBe("completed");
     expect(store.acquire("t1")).toBeDefined();
   });
 
@@ -207,7 +209,7 @@ describe("MOCKED autonomy: budgets and loop prevention", () => {
     const { store } = setup(limits);
     const final = await controller(store, sim, scriptedModel(steps), { retryDelayMs: 1 }).run();
     expect(final).toMatchObject({ status: "stopped", stopReason: reason });
-    expect(() => controller(store, sim!, scriptedModel([TEXT]))).toThrow(/cannot be resumed/);
+    await expect(controller(store, sim, scriptedModel([TEXT])).run()).rejects.toThrow(/cannot be resumed/);
   });
 
   it("stops on the mutation budget once the action has finished", async () => {
@@ -279,7 +281,7 @@ describe("MOCKED autonomy: failures", () => {
     expect(final).toMatchObject({ status: "paused", stopReason: "consecutive_errors", cycle: 3 });
     expect(final.decisions.every((d) => d.summary.startsWith("(no decision summary produced"))).toBe(true);
     expect(final.budgets.costUsd).toBe(0);
-    expect(() => controller(store, sim!, scriptedModel([PLAN("stop")]))).not.toThrow();
+    expect(store.acquire("t1")).toBeDefined();
   });
 
   it("pauses on a model authentication failure", async () => {

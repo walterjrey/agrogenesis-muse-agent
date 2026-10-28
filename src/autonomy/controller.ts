@@ -1,5 +1,4 @@
 import { createHash, randomUUID } from "node:crypto";
-import { join } from "node:path";
 import { runAgent } from "../agent/runtime.js";
 import type { MutationIntent, MutationJournal, MutationSettlement } from "../agent/tools.js";
 import type { ExecuteActionRequest } from "../contracts/execute.js";
@@ -10,7 +9,8 @@ import { SimulatorError, type SimulatorClient } from "../simulator/client.js";
 import { InconsistentObservationError, summarizeSnapshot, isAuthFailure } from "./observation.js";
 import { buildEconomics, ledgerEntry } from "./economics.js";
 import { AUTONOMOUS_SYSTEM_PROMPT, DEFAULT_OBJECTIVE, cycleBrief } from "./prompt.js";
-import { SessionLockLostError, type SessionLock, type SessionStore } from "./store.js";
+import { SessionLockLostError } from "./store.js";
+import type { SessionBackend, SessionLease } from "./storage.js";
 import { buildProgress } from "./progress.js";
 import { superviseOperation, type IntervalResult, type WaitResult } from "./supervisor.js";
 import { createAutonomousTools, SnapshotProvider, type PlanSink } from "./tools.js";
@@ -73,7 +73,7 @@ export function newSessionState(options: NewSessionOptions): SessionState {
 }
 
 export interface ControllerOptions {
-  store: SessionStore;
+  store: SessionBackend;
   sessionId: string;
   provider: ModelProvider;
   client: SimulatorClient;
@@ -83,7 +83,7 @@ export interface ControllerOptions {
   sliceCycles?: number;
   newMutationId?: () => string;
   retryDelayMs?: number;
-  /** Where per-cycle JSONL traces are written; defaults to `<session dir>/runs`. */
+  /** Where per-cycle JSONL traces are written; defaults to the backend's trace directory (none for non-file backends). */
   traceDirectory?: string | null;
   onEvent?: (message: string) => void;
 }
@@ -106,27 +106,31 @@ const isDefinitiveRefusal = (error: unknown): boolean => error instanceof Simula
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 export class AutonomousController {
-  private readonly lock: SessionLock;
-  private state: SessionState;
-  private readonly provider: SnapshotProvider;
+  private lock!: SessionLease;
+  private state!: SessionState;
+  private provider!: SnapshotProvider;
   private readonly startedAt = Date.now();
-  private wallBase: number;
-  private readonly mutationsEnabled: boolean;
+  private wallBase = 0;
+  private mutationsEnabled = false;
 
-  constructor(private readonly options: ControllerOptions) {
-    this.lock = options.store.acquire(options.sessionId);
+  constructor(private readonly options: ControllerOptions) {}
+
+  /** Takes exclusive ownership of the session and loads it. Called once, by run(). */
+  private async open(): Promise<void> {
+    const { store, sessionId } = this.options;
+    this.lock = await store.acquire(sessionId);
     try {
-      this.state = options.store.load(options.sessionId);
+      this.state = await store.load(sessionId);
     } catch (error) {
-      this.lock.release();
+      await this.lock.release();
       throw error;
     }
     if (!REASONS_RESUMABLE.has(this.state.status)) {
-      this.lock.release();
-      throw new Error(`Session ${options.sessionId} is ${this.state.status} (${this.state.stopReason}) and cannot be resumed. Budgets are never raised automatically; start a new session.`);
+      await this.lock.release();
+      throw new Error(`Session ${sessionId} is ${this.state.status} (${this.state.stopReason}) and cannot be resumed. Budgets are never raised automatically; start a new session.`);
     }
-    this.mutationsEnabled = this.state.config.mutationsEnabled && options.mutationsEnabled;
-    this.provider = new SnapshotProvider(options.client, this.state.gameId, { retryDelayMs: options.retryDelayMs ?? 250 });
+    this.mutationsEnabled = this.state.config.mutationsEnabled && this.options.mutationsEnabled;
+    this.provider = new SnapshotProvider(this.options.client, this.state.gameId, { retryDelayMs: this.options.retryDelayMs ?? 250 });
     this.wallBase = this.state.budgets.wallClockMs;
   }
 
@@ -134,27 +138,27 @@ export class AutonomousController {
     this.options.onEvent?.(message);
   }
 
-  private save(): void {
+  private async save(): Promise<void> {
     this.state.budgets.wallClockMs = this.wallBase + (Date.now() - this.startedAt);
     this.state.metrics.controllerReads += this.provider.reads;
     this.state.metrics.snapshotRefreshes += this.provider.refreshes;
     this.state.metrics.snapshotCacheHits += this.provider.cacheHits;
     this.state.metrics.mixedRevisionDetections += this.provider.mixedRevisionDetections;
     this.provider.reads = this.provider.refreshes = this.provider.cacheHits = this.provider.mixedRevisionDetections = 0;
-    this.lock.save(this.state);
+    await this.lock.save(this.state);
   }
 
-  private end(status: SessionState["status"], reason: string, detail: string | null = null): SessionState {
+  private async end(status: SessionState["status"], reason: string, detail: string | null = null): Promise<SessionState> {
     this.state.status = status;
     this.state.stopReason = reason;
     this.state.stopDetail = detail;
     this.log(`session ${status}: ${reason}${detail ? ` (${detail})` : ""}`);
-    this.save();
+    await this.save();
     return this.state;
   }
 
   /** Records a settled mutation exactly once, updates counters and clears the pending record. */
-  private settle(intent: MutationIntent, settlement: MutationSettlement, via: "direct" | "reconciled"): void {
+  private async settle(intent: MutationIntent, settlement: MutationSettlement, via: "direct" | "reconciled"): Promise<void> {
     const s = this.state;
     const b = s.budgets;
     s.operations.push({ tool: intent.tool, idempotencyKey: intent.idempotencyKey, status: settlement.status, expectedRevision: intent.expectedRevision, revisionAfter: settlement.revisionAfter, summary: settlement.summary, cycle: s.cycle, settledAt: new Date().toISOString(), via });
@@ -199,13 +203,13 @@ export class AutonomousController {
     if (settlement.status === "not_applied" && settlement.summary.code === "stale_revision") b.conflicts += 1;
     s.pendingMutation = null;
     this.provider.invalidate();
-    this.save();
+    await this.save();
   }
 
   private readonly journal: MutationJournal = {
     begin: async (intent) => {
       this.state.pendingMutation = { tool: intent.tool, idempotencyKey: intent.idempotencyKey, expectedRevision: intent.expectedRevision, request: intent.request, rationale: intent.rationale, recordedAt: new Date().toISOString(), cycle: this.state.cycle };
-      this.save();
+      await this.save();
     },
     settle: async (intent, settlement) => this.settle(intent, settlement, "direct"),
   };
@@ -224,15 +228,15 @@ export class AutonomousController {
       try {
         if (pending.tool === "execute_action") {
           const response = await this.options.client.executeAction(this.state.gameId, pending.request as unknown as ExecuteActionRequest);
-          this.settle(intent, settledExecute(String(pending.request.type ?? ""), response), "reconciled");
+          await this.settle(intent, settledExecute(String(pending.request.type ?? ""), response), "reconciled");
         } else {
           const response = await this.options.client.advance(this.state.gameId, pending.request as unknown as AdvanceRequest);
-          this.settle(intent, settledAdvance(response), "reconciled");
+          await this.settle(intent, settledAdvance(response), "reconciled");
         }
         return true;
       } catch (error) {
         if (isDefinitiveRefusal(error)) {
-          this.settle(intent, { status: "not_applied", revisionAfter: null, summary: { reason: error instanceof SimulatorError ? error.message : "refused" } }, "reconciled");
+          await this.settle(intent, { status: "not_applied", revisionAfter: null, summary: { reason: error instanceof SimulatorError ? error.message : "refused" } }, "reconciled");
           return true;
         }
         await sleep((this.options.retryDelayMs ?? 250) * (attempt + 1));
@@ -313,7 +317,7 @@ export class AutonomousController {
     this.state.waits.push({ cycle: this.state.cycle, actionId: "checkpoint-interval", trigger: "model_tool", outcome: r.outcome, actionStatus: null, advanceRequests: r.advanceRequests, advancedSeconds: r.advancedSeconds, simTimeStartS: r.simTimeStartS, simTimeEndS: r.simTimeEndS, events: r.events, detail: r.detail });
   }
 
-  private recordWait(wait: WaitResult, trigger: WaitRecord["trigger"]): void {
+  private async recordWait(wait: WaitResult, trigger: WaitRecord["trigger"]): Promise<void> {
     this.state.waits.push({ cycle: this.state.cycle, actionId: wait.actionId, trigger, outcome: wait.outcome, actionStatus: wait.actionStatus, advanceRequests: wait.advanceRequests, advancedSeconds: wait.advancedSeconds, simTimeStartS: wait.simTimeStartS, simTimeEndS: wait.simTimeEndS, events: wait.events, detail: wait.detail });
     const action = this.state.actions.find((candidate) => candidate.actionId === wait.actionId);
     if (action && wait.actionStatus !== null) action.status = wait.actionStatus;
@@ -323,7 +327,7 @@ export class AutonomousController {
     if (action && wait.consumedCredits !== null) action.consumedCredits = wait.consumedCredits;
     if (action && wait.outcomeSummary !== null) action.outcome = wait.outcomeSummary;
     if (action && wait.failure !== null) action.failure = wait.failure;
-    this.save();
+    await this.save();
   }
 
   /**
@@ -362,7 +366,7 @@ export class AutonomousController {
       },
       { actionId: target.actionId },
     );
-    this.recordWait(wait, "controller");
+    await this.recordWait(wait, "controller");
     this.log(`auto-wait ${wait.actionId}: ${wait.outcome} (${wait.advanceRequests} advance request(s), ${wait.advancedSeconds}s)`);
     return wait.outcome === "completed" || wait.outcome === "failed" || wait.outcome === "cancelled";
   }
@@ -395,10 +399,11 @@ export class AutonomousController {
     } catch {
       /* keep last known */
     }
-    this.save();
+    await this.save();
   }
 
   async run(): Promise<SessionState> {
+    await this.open();
     try {
       const final = await this.loop();
       await this.finalize();
@@ -406,12 +411,12 @@ export class AutonomousController {
     } catch (error) {
       if (error instanceof SessionLockLostError) throw error;
       try {
-        return this.end("paused", "controller_error", error instanceof Error ? error.message.slice(0, 300) : "unknown");
+        return await this.end("paused", "controller_error", error instanceof Error ? error.message.slice(0, 300) : "unknown");
       } catch {
         throw error;
       }
     } finally {
-      this.lock.release();
+      await this.lock.release();
     }
   }
 
@@ -420,14 +425,14 @@ export class AutonomousController {
     s.status = "running";
     s.stopReason = null;
     s.stopDetail = null;
-    this.save();
+    await this.save();
     let cyclesThisRun = 0;
 
     for (;;) {
-      if (!(await this.reconcile())) return this.end("paused", "unresolved_mutation", "The outcome of a state-changing request could not be confirmed; resume to retry the same idempotency key.");
+      if (!(await this.reconcile())) return await this.end("paused", "unresolved_mutation", "The outcome of a state-changing request could not be confirmed; resume to retry the same idempotency key.");
       await this.refreshActions();
       const stop = this.budgetStop();
-      if (stop) return this.end("stopped", stop.reason, stop.detail);
+      if (stop) return await this.end("stopped", stop.reason, stop.detail);
 
       s.cycle += 1;
       cyclesThisRun += 1;
@@ -453,7 +458,7 @@ export class AutonomousController {
 
         const eligible = snapshot.actions.actions.some((a) => a.eligibility.eligible);
         const inFlight = s.actions.some((a) => !TERMINAL_ACTION_STATUSES.has(a.status)) || snapshot.overview.status.activeActionCount > 0;
-        if (!eligible && !inFlight) return this.end("completed", "no_eligible_actions", "The simulator offers no eligible action and no operation is in flight.");
+        if (!eligible && !inFlight) return await this.end("completed", "no_eligible_actions", "The simulator offers no eligible action and no operation is in flight.");
 
         const l = s.config.limits;
         const b = s.budgets;
@@ -479,7 +484,7 @@ export class AutonomousController {
           systemPrompt: AUTONOMOUS_SYSTEM_PROMPT,
           brief: cycleBrief({ state: s, snapshot, events, progress: buildProgress(s), economics: buildEconomics(s) }),
           runId: `${s.sessionId}-c${s.cycle}`,
-          traceDirectory: this.options.traceDirectory === undefined ? join(this.options.store.sessionDir(s.sessionId), "runs") : this.options.traceDirectory,
+          traceDirectory: this.options.traceDirectory === undefined ? (this.options.store.traceDirectory?.(s.sessionId) ?? null) : this.options.traceDirectory,
           initialState: { observedRevision: snapshot.revision, eventCursor: eventsResponse.nextCursor },
           journal: this.journal,
           deadlineMs,
@@ -503,12 +508,12 @@ export class AutonomousController {
         s.modelEventCursor = Math.max(eventsResponse.nextCursor, result.state.eventCursor);
       } catch (error) {
         if (error instanceof SessionLockLostError) throw error;
-        if (isAuthFailure(error)) return this.end("paused", "authentication_failure", "The simulator rejected the agent credentials (401/403).");
-        if (error instanceof InconsistentObservationError) return this.end("paused", "inconsistent_observation", error.message);
+        if (isAuthFailure(error)) return await this.end("paused", "authentication_failure", "The simulator rejected the agent credentials (401/403).");
+        if (error instanceof InconsistentObservationError) return await this.end("paused", "inconsistent_observation", error.message);
         s.budgets.consecutiveErrors += 1;
         this.log(`cycle error: ${error instanceof Error ? error.message : "unknown"}`);
-        if (s.budgets.consecutiveErrors >= s.config.limits.maxConsecutiveErrors) return this.end("paused", "consecutive_errors", error instanceof Error ? error.message.slice(0, 300) : null);
-        this.save();
+        if (s.budgets.consecutiveErrors >= s.config.limits.maxConsecutiveErrors) return await this.end("paused", "consecutive_errors", error instanceof Error ? error.message.slice(0, 300) : null);
+        await this.save();
         continue;
       }
 
@@ -552,7 +557,7 @@ export class AutonomousController {
       const hadUnknown = s.pendingMutation !== null;
       b.consecutiveErrors = failedRun || hadUnknown ? b.consecutiveErrors + 1 : 0;
       b.consecutiveNoProgress = progress ? 0 : b.consecutiveNoProgress + 1;
-      this.save();
+      await this.save();
 
       if (result.error && /HTTP (401|403)/.test(result.error)) return this.end("paused", "authentication_failure", "The model API rejected the credentials (401/403).");
       if (s.pendingMutation) continue; // reconcile first; never act on top of an unknown outcome

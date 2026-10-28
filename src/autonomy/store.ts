@@ -2,17 +2,21 @@ import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { hostname } from "node:os";
 import { join } from "node:path";
+import {
+  IncompatibleSessionError,
+  SessionAlreadyExistsError,
+  SessionLockLostError,
+  SessionLockedError,
+  parseSessionState,
+  type SessionBackend,
+  type SessionLease,
+} from "./storage.js";
 import { SessionState } from "./types.js";
 
-const SESSION_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$/;
+export { IncompatibleSessionError, SessionLockLostError, SessionLockedError };
 
-export class SessionLockedError extends Error {
-  constructor(readonly sessionId: string, readonly holder: { pid: number; host: string; heartbeatAt: string }) {
-    super(`Session ${sessionId} is owned by another controller (pid ${holder.pid} on ${holder.host}, last heartbeat ${holder.heartbeatAt}).`);
-  }
-}
-
-export class SessionLockLostError extends Error {}
+export const SESSION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$/;
+const SESSION_ID = SESSION_ID_PATTERN;
 
 interface LockFile {
   ownerId: string;
@@ -35,9 +39,23 @@ const isProcessAlive = (pid: number): boolean => {
  * Durable session storage: one directory per session holding `state.json` (credential-free, schema validated,
  * written atomically via temp file + rename) and `lock.json` (single active controller).
  */
-export class SessionStore {
+export class SessionStore implements SessionBackend {
   constructor(readonly root: string, private readonly lockTtlMs = 60_000) {
     mkdirSync(root, { recursive: true });
+  }
+
+  traceDirectory(sessionId: string): string {
+    return join(this.sessionDir(sessionId), "runs");
+  }
+
+  create(state: SessionState): void {
+    if (this.exists(state.sessionId)) throw new SessionAlreadyExistsError(state.sessionId);
+    const lock = this.acquire(state.sessionId);
+    try {
+      lock.save(state);
+    } finally {
+      lock.release();
+    }
   }
 
   sessionDir(sessionId: string): string {
@@ -52,16 +70,40 @@ export class SessionStore {
   load(sessionId: string): SessionState {
     const file = join(this.sessionDir(sessionId), "state.json");
     if (!existsSync(file)) throw new Error(`Session ${sessionId} does not exist.`);
-    return SessionState.parse(JSON.parse(readFileSync(file, "utf8")));
+    let raw: unknown;
+    try {
+      raw = JSON.parse(readFileSync(file, "utf8"));
+    } catch {
+      throw new IncompatibleSessionError(sessionId, "state.json is not valid JSON");
+    }
+    return parseSessionState(sessionId, raw);
   }
 
+  /** Readable autonomous sessions only. Directories holding other record types or schemas are skipped, never modified. */
   list(): Array<{ sessionId: string; status: string; gameId: string; updatedAt: string }> {
-    if (!existsSync(this.root)) return [];
-    return readdirSync(this.root, { withFileTypes: true })
-      .filter((entry) => entry.isDirectory() && SESSION_ID.test(entry.name) && this.exists(entry.name))
-      .map((entry) => this.load(entry.name))
-      .map((s) => ({ sessionId: s.sessionId, status: s.status, gameId: s.gameId, updatedAt: s.updatedAt }))
-      .sort((a, b) => a.updatedAt.localeCompare(b.updatedAt));
+    return this.scan().sessions;
+  }
+
+  /** Directory entries that are not compatible autonomous sessions (e.g. baseline runs), with the reason. */
+  listIncompatible(): Array<{ sessionId: string; reason: string }> {
+    return this.scan().incompatible;
+  }
+
+  private scan() {
+    const sessions: Array<{ sessionId: string; status: string; gameId: string; updatedAt: string }> = [];
+    const incompatible: Array<{ sessionId: string; reason: string }> = [];
+    if (!existsSync(this.root)) return { sessions, incompatible };
+    for (const entry of readdirSync(this.root, { withFileTypes: true })) {
+      if (!entry.isDirectory() || !SESSION_ID.test(entry.name) || !this.exists(entry.name)) continue;
+      try {
+        const s = this.load(entry.name);
+        sessions.push({ sessionId: s.sessionId, status: s.status, gameId: s.gameId, updatedAt: s.updatedAt });
+      } catch (error) {
+        if (!(error instanceof IncompatibleSessionError)) throw error;
+        incompatible.push({ sessionId: entry.name, reason: error.reason });
+      }
+    }
+    return { sessions: sessions.sort((a, b) => a.updatedAt.localeCompare(b.updatedAt)), incompatible };
   }
 
   /** Takes exclusive ownership of a session. A lock whose process is gone, or whose heartbeat expired, is taken over. */
@@ -95,7 +137,7 @@ export class SessionStore {
   }
 }
 
-export class SessionLock {
+export class SessionLock implements SessionLease {
   private timer: NodeJS.Timeout | undefined;
   private released = false;
 
