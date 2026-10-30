@@ -37,6 +37,81 @@ describe("MOCKED tool registry and policy", () => {
   });
 });
 
+describe("MOCKED runtime: unusable (HTTP 200) model responses", () => {
+  const SECRET_TEXT = "SECRET-REASONING-TEXT";
+
+  it("recovers from one empty response with exactly one retry, counting both physical requests", async () => {
+    sim = await fakeSimulator();
+    const provider = scriptedModel([{ content: null }, { content: "Final plan." }]);
+    const result = await runAgent({ ...base(sim), provider, mode: "observe_only" });
+    expect(result).toMatchObject({ status: "completed", stopReason: "final_answer", finalSummary: "Final plan." });
+    // modelCalls counts each physical request once; failedModelCalls only the unusable one; one retry.
+    expect(result.totals).toMatchObject({ modelCalls: 2, failedModelCalls: 1, modelRetryAttempts: 1 });
+    expect(result.totals.estimatedCostUsd).toBeCloseTo(0.002, 6);
+    // The empty assistant message is not replayed to the model.
+    expect(provider.requests[1]!.messages.filter((m) => m.role === "assistant")).toHaveLength(0);
+    expect(result.trace.entries.filter((e) => e.event === "model.unusable_response")).toHaveLength(1);
+  });
+
+  it("retries a reasoning-only response and reports the classification, finish reason and request id when it repeats", async () => {
+    sim = await fakeSimulator();
+    const provider = scriptedModel([{ content: null, reasoningTokens: 900 }]);
+    const result = await runAgent({ ...base(sim), provider, mode: "observe_only" });
+    expect(provider.requests).toHaveLength(2); // never more than one retry
+    expect(result).toMatchObject({ status: "limited", stopReason: "empty_response" });
+    expect(result.totals).toMatchObject({ modelCalls: 2, failedModelCalls: 2, modelRetryAttempts: 1 });
+    expect(result.error).toMatch(/^empty_response: reasoning_only \(HTTP 200, finish_reason=stop, choices=1, content=no, tool_calls=0, tokens in=100 out=20 reasoning=900, request=req-2\)$/);
+  });
+
+  it("does not retry truncated or malformed-tool responses", async () => {
+    sim = await fakeSimulator();
+    const truncated = scriptedModel([{ content: null, finishReason: "length", reasoningTokens: 2000 }, { content: "never reached" }]);
+    const t = await runAgent({ ...base(sim), provider: truncated, mode: "observe_only" });
+    expect(truncated.requests).toHaveLength(1);
+    expect(t.stopReason).toBe("empty_response");
+    expect(t.error).toContain("truncated");
+    expect(t.totals).toMatchObject({ modelCalls: 1, failedModelCalls: 1, modelRetryAttempts: 0 });
+
+    const dropped = scriptedModel([{ content: null, rawToolCallCount: 1 }, { content: "never reached" }]);
+    const d = await runAgent({ ...base(sim), provider: dropped, mode: "observe_only" });
+    expect(dropped.requests).toHaveLength(1);
+    expect(d.error).toContain("unexpected_tool_format");
+
+    const announced = scriptedModel([{ content: null, finishReason: "tool_calls" }, { content: "never reached" }]);
+    await runAgent({ ...base(sim), provider: announced, mode: "observe_only" });
+    expect(announced.requests).toHaveLength(1);
+  });
+
+  it("does not retry when the model-call budget is already spent", async () => {
+    sim = await fakeSimulator();
+    const provider = scriptedModel([{ content: null }, { content: "never reached" }]);
+    const result = await runAgent({ ...base(sim), provider, mode: "observe_only", limits: { maxModelCalls: 1 } });
+    expect(provider.requests).toHaveLength(1);
+    expect(result.stopReason).toBe("empty_response");
+    expect(result.totals).toMatchObject({ modelCalls: 1, failedModelCalls: 1, modelRetryAttempts: 0 });
+  });
+
+  it("does not retry when the cost limit is already reached", async () => {
+    sim = await fakeSimulator();
+    const provider = scriptedModel([{ content: null, costUsd: 0.5 }, { content: "never reached" }]);
+    const result = await runAgent({ ...base(sim), provider, mode: "observe_only", limits: { maxCostUsd: 0.25 } });
+    expect(provider.requests).toHaveLength(1);
+    expect(result.totals.modelRetryAttempts).toBe(0);
+  });
+
+  it("never treats a response with a usable tool call or text as unusable, and keeps content out of diagnostics", async () => {
+    sim = await fakeSimulator();
+    const ok = await runAgent({ ...base(sim), provider: scriptedModel([{ calls: [{ name: "observe_farm" }], finishReason: "length" }, { content: "done" }]), mode: "observe_only" });
+    expect(ok.totals).toMatchObject({ failedModelCalls: 0, modelRetryAttempts: 0 });
+
+    const bad = await runAgent({ ...base(sim), provider: scriptedModel([{ content: "  ", reasoningTokens: 5 }]), mode: "observe_only" });
+    expect(JSON.stringify(bad.trace.entries.filter((e) => e.event === "model.unusable_response"))).not.toContain(SECRET_TEXT);
+    const entry = bad.trace.entries.find((e) => e.event === "model.unusable_response")!;
+    expect(entry).toMatchObject({ classification: "reasoning_only", finishReason: "stop", choiceCount: 1, hasContent: false, toolCallCount: 0, reasoningTokens: 5, requestId: expect.any(String) });
+    expect(JSON.stringify(entry)).not.toMatch(/"content"|"messages"|apiKey|authorization/i);
+  });
+});
+
 describe("MOCKED runtime: native tool-call exchange", () => {
   it("executes several read-only calls in one step and returns one tool message per call id", async () => {
     sim = await fakeSimulator();

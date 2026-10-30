@@ -2,6 +2,7 @@ import OpenAI from "openai";
 import type { ChatCompletionMessageParam, ChatCompletionTool } from "openai/resources/chat/completions";
 import { silentLogger, type Logger } from "../logging/logger.js";
 import { estimateCostUsd, priceFor, type TokenUsage } from "./pricing.js";
+import { classifyResponse, describeResponse } from "./responseClass.js";
 import { SpendGuard } from "./spendGuard.js";
 import { backoffDelayMs, isRetryableStatus, MODEL_NOT_FOUND_CODE, parseRetryAfterMs, RequestAbortedError, resolveRetryPolicy, safeProviderCode, safeRequestId, sleepAbortable, type ModelAttempt, type RetryPolicy } from "./retry.js";
 
@@ -36,6 +37,10 @@ export interface ModelResponse {
   estimatedCostUsd: number | null;
   latencyMs: number;
   requestId: string | null;
+  /** Number of choices the provider returned (diagnostics only). */
+  choiceCount?: number;
+  /** Tool calls in the raw message, including ones that were not usable function calls (diagnostics only). */
+  rawToolCallCount?: number;
   /** Every attempt made for this completion, including the successful one. Contains no prompts or credentials. */
   attempts?: ModelAttempt[];
 }
@@ -188,7 +193,14 @@ export class MetaModelProvider implements ModelProvider {
           latencyMs: Date.now() - started,
           requestId,
           attempts,
+          choiceCount: data.choices.length,
+          rawToolCallCount: (choice.message.tool_calls ?? []).length,
         };
+        const classification = classifyResponse(response);
+        if (classification !== "ok") {
+          // Content-free: no prompt, no response text, no credentials.
+          this.logger.log("error", "model.unusable_response", { model: this.modelId, latencyMs: response.latencyMs, ...describeResponse(response, classification) });
+        }
         this.logger.log("info", "model.completion", {
           model: this.modelId,
           finishReason: response.finishReason,

@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
 import { ModelApiError, type ModelProvider, type ModelResponse, type ModelToolCall } from "../model/meta.js";
 import { SpendLimitError } from "../model/spendGuard.js";
+import { classifyResponse, describeResponse, formatResponseDiagnostic, RETRYABLE_CLASSIFICATIONS } from "../model/responseClass.js";
 import type { SimulatorClient } from "../simulator/client.js";
 import { DEFAULT_LIMITS, RunPolicy, type ExecutionMode, type RunLimits } from "./policy.js";
 import { SYSTEM_PROMPT, userBrief } from "./prompt.js";
@@ -111,6 +112,7 @@ export async function runAgent(options: RunOptions): Promise<RunResult & { trace
   let error: string | null = null;
   let toolsEnabled = true;
   let nudgedBeforeFinal = false;
+  let retriedUnusable = false;
   const callMeta = new Map<string, ToolCallMeta>();
 
   for (let step = 1; ; step += 1) {
@@ -158,6 +160,25 @@ export async function runAgent(options: RunOptions): Promise<RunResult & { trace
       assistantText: response.content,
       toolCalls: response.toolCalls.map((c) => ({ id: c.id, name: c.name })),
     });
+    const classification = classifyResponse(response);
+    if (classification !== "ok") {
+      // HTTP 200 but nothing executable or usable: a failed logical call. It is already counted once in modelCalls
+      // (and priced), so only failedModelCalls moves. The unusable message is never replayed to the model.
+      totals.failedModelCalls += 1;
+      const diagnostic = describeResponse(response, classification);
+      trace.record("model.unusable_response", { step, cycle: options.cycle ?? null, ...diagnostic });
+      const budgetLeft = policy.modelCalls < limits.maxModelCalls && totals.estimatedCostUsd < limits.maxCostUsd && (options.deadlineMs === undefined || Date.now() < options.deadlineMs) && !options.signal?.aborted;
+      if (RETRYABLE_CLASSIFICATIONS.has(classification) && !retriedUnusable && budgetLeft) {
+        retriedUnusable = true;
+        totals.modelRetryAttempts += 1;
+        continue;
+      }
+      stopReason = "empty_response";
+      error = formatResponseDiagnostic(diagnostic);
+      break;
+    }
+    retriedUnusable = false;
+
     messages.push(response.assistantMessage);
     for (const call of response.toolCalls) callMeta.set(call.id, { name: call.name, arguments: call.arguments });
 

@@ -79,9 +79,10 @@ export async function runWorkerOnce(options: WorkerOptions): Promise<number> {
         ...(options.signal ? { signal: options.signal } : {}),
       });
       slices += 1;
-      const { status, stopReason } = result.state;
+      const { status, stopReason, stopDetail } = result.state;
       const resumable = status === "paused" && stopReason === "slice_complete";
-      await backend.settleControl(sessionId, { stopRunning: !resumable, lastError: resumable || status === "completed" ? null : truncate(`${status}: ${stopReason ?? "unknown"}`) });
+      const cause = `${status}: ${stopReason ?? "unknown"}${stopDetail ? ` — ${stopDetail}` : ""}`;
+      await backend.settleControl(sessionId, { stopRunning: !resumable, lastError: resumable || status === "completed" ? null : truncate(cause) });
       emit({ type: "slice_finished", sessionId, status, stopReason, finished: result.finished });
     } catch (error) {
       if (error instanceof SessionLockedError) {

@@ -618,7 +618,10 @@ export class AutonomousController {
       // A cycle whose model request failed produced no observation; it must not read as a finished observe-only session.
       if (!this.mutationsEnabled && (result.stopReason === "model_error" || result.stopReason === "empty_response")) return this.end("failed", "model_error", result.error ? result.error.slice(0, 300) : `The model produced no decision (${result.stopReason}).`);
       if (!this.mutationsEnabled) return this.end("completed", "observe_only_complete", "Mutations are disabled; one observation-and-planning cycle was run.");
-      if (b.consecutiveErrors >= s.config.limits.maxConsecutiveErrors) return this.end("paused", "consecutive_errors");
+      if (b.consecutiveErrors >= s.config.limits.maxConsecutiveErrors) {
+        const modelFailure = result.stopReason === "model_error" || result.stopReason === "empty_response";
+        return this.end("paused", "consecutive_errors", modelFailure && result.error ? result.error.slice(0, 300) : undefined);
+      }
       if (b.consecutiveRejections >= s.config.limits.maxConsecutiveRejections) return this.end("stopped", "repeated_rejections");
       if (b.consecutiveNoProgress >= s.config.limits.maxConsecutiveNoProgress) return this.end("stopped", "no_progress", `${b.consecutiveNoProgress} consecutive cycles without progress`);
       const budget = this.budgetStop();
