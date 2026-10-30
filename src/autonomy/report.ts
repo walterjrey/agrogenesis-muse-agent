@@ -72,7 +72,7 @@ export function buildReport(state: SessionState) {
       resourcesLast: latest?.resources ?? null,
       fieldsLast: latest?.fields ?? null,
     },
-    model_usage: { ...state.usage, modelCalls: state.budgets.modelCalls, estimatedCostUsd: Math.round(state.budgets.costUsd * 1e6) / 1e6 },
+    model_usage: { ...state.usage, modelCalls: state.budgets.modelCalls, failedModelCalls: state.budgets.failedModelCalls, modelRetryAttempts: state.budgets.modelRetryAttempts, estimatedCostUsd: Math.round(state.budgets.costUsd * 1e6) / 1e6 },
     budgets: { used: state.budgets, limits: state.config.limits },
     observation: { controllerReads: state.metrics.controllerReads, snapshotRefreshes: state.metrics.snapshotRefreshes, snapshotCacheHits: state.metrics.snapshotCacheHits, mixedRevisionDetections: state.metrics.mixedRevisionDetections },
     notes: "Null means not observable. Farm-outcome deltas describe this session only and are not a comparison against Manual management.",

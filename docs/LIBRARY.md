@@ -59,6 +59,26 @@ const { finished } = await runSessionSlice(deps, { sessionId, mutationsEnabled: 
 - **Crash safety.** Every state-changing request is journaled in the backend before it is sent and replayed with the same idempotency key after a crash, so a lost response never repeats an action or a time advance.
 - **Single owner per session.** A second controller gets `SessionLockedError`; a displaced controller gets `SessionLockLostError` on its next save.
 
+## Model-call budget accounting
+
+`maxModelCalls` (and `budgets.modelCalls`) counts **logical model calls only**: one entry per `provider.complete()` call that
+returned a usable response. A logical call may need several **physical HTTP attempts** internally (timeouts, HTTP 429/5xx are
+retried up to the provider's `maxAttempts`, default 4); those retries are transparent to the model-call budget and are never
+separately billed or counted against it — only the final, successful attempt's token usage is priced.
+
+A logical call that exhausts every retry and never returns a response does **not** consume `modelCalls` (it was never
+"used"), but it does count toward `budgets.failedModelCalls`, and its physical retries toward `budgets.modelRetryAttempts`
+(both persisted, cumulative across cycles and resumes, like every other budget). It also ends that cycle immediately
+(`stopReason: "model_error"`) and increments the session's `consecutiveErrors` counter, which is bounded independently by
+`maxConsecutiveErrors`. `buildReport(...).model_usage` exposes `modelCalls`, `failedModelCalls` and `modelRetryAttempts`
+alongside token usage, so logical calls, physical attempts, successes and failures stay distinguishable without exposing
+API keys or request bodies (only status codes, provider error codes, request ids and latencies are ever recorded).
+
+A session stopped by `model_call_budget_exhausted` (or `cost_budget_exhausted`) reached its own configured limit; this is
+never the same condition as Meta API rate limiting. A Meta 429 is retried internally and, only if every retry is exhausted,
+surfaces as a per-cycle `stopReason: "model_error"` (with the HTTP status in the error message) — a transient provider
+condition, not an exhausted session budget.
+
 ## Session storage on Render
 
 Render web-service disks are ephemeral and not shared between instances, so do not use `FileSessionStore` there. Use `PostgresSessionStore` against a PostgreSQL database that the service can reach (the application's own database is fine; the store only touches its own `agent_sessions` table). The lease TTL (default 60 s) lets a restarted or redeployed worker take over a session whose previous owner stopped heartbeating.

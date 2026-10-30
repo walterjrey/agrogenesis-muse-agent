@@ -292,6 +292,10 @@ export const SessionState = z.strictObject({
     advanceRequests: z.number().int().default(0),
     consecutiveAdvances: z.number().int().default(0),
     conflicts: z.number().int().default(0),
+    /** Logical model calls that never produced a usable response (retries exhausted); never counted against maxModelCalls. Defaulted for sessions persisted before this field existed. */
+    failedModelCalls: z.number().int().default(0),
+    /** Physical HTTP retry attempts beyond the first, summed across every logical model call, successful or failed. */
+    modelRetryAttempts: z.number().int().default(0),
   }),
   usage: z.strictObject({ inputTokens: z.number().int(), outputTokens: z.number().int(), cachedTokens: z.number().int() }),
   metrics: z.strictObject({

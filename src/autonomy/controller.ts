@@ -66,7 +66,7 @@ export function newSessionState(options: NewSessionOptions): SessionState {
     lastSimTimeS: null,
     modelEventCursor: 0,
     progressCursor: 0,
-    budgets: { costUsd: 0, modelCalls: 0, toolCalls: 0, acceptedMutations: 0, mutationAttempts: 0, rejectedActions: 0, advancedSimSeconds: 0, wallClockMs: 0, consecutiveErrors: 0, consecutiveNoProgress: 0,     consecutiveRejections: 0, advanceRequests: 0, consecutiveAdvances: 0, conflicts: 0 },
+    budgets: { costUsd: 0, modelCalls: 0, toolCalls: 0, acceptedMutations: 0, mutationAttempts: 0, rejectedActions: 0, advancedSimSeconds: 0, wallClockMs: 0, consecutiveErrors: 0, consecutiveNoProgress: 0,     consecutiveRejections: 0, advanceRequests: 0, consecutiveAdvances: 0, conflicts: 0, failedModelCalls: 0, modelRetryAttempts: 0 },
     usage: { inputTokens: 0, outputTokens: 0, cachedTokens: 0 },
     metrics: { baseline: null, latest: null, controllerReads: 0, snapshotRefreshes: 0, snapshotCacheHits: 0, mixedRevisionDetections: 0, grainPeakKg: {}, ledger: [] },
   };
@@ -524,6 +524,8 @@ export class AutonomousController {
       b.costUsd += result.totals.estimatedCostUsd;
       b.modelCalls += result.totals.modelCalls;
       b.toolCalls += result.totals.toolCalls;
+      b.failedModelCalls += result.totals.failedModelCalls;
+      b.modelRetryAttempts += result.totals.modelRetryAttempts;
       s.usage.inputTokens += result.totals.inputTokens;
       s.usage.outputTokens += result.totals.outputTokens;
       s.usage.cachedTokens += result.totals.cachedTokens;

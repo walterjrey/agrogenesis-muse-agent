@@ -65,7 +65,7 @@ export async function fakeSimulator(override?: Override, clientTimeoutMs = 2000,
 }
 
 export interface ScriptedCall { name: string; args?: unknown; id?: string; rawArguments?: string }
-export interface ScriptedStep { content?: string | null; calls?: ScriptedCall[]; costUsd?: number; throws?: Error }
+export interface ScriptedStep { content?: string | null; calls?: ScriptedCall[]; costUsd?: number; throws?: Error; attempts?: number }
 
 export interface ScriptedProvider extends ModelProvider {
   requests: ModelRequest[];
@@ -99,6 +99,9 @@ export function scriptedModel(steps: ScriptedStep[]): ScriptedProvider {
         estimatedCostUsd: step.costUsd ?? 0.001,
         latencyMs: 1,
         requestId: `req-${index}`,
+        ...(step.attempts !== undefined
+          ? { attempts: Array.from({ length: step.attempts }, (_, i) => ({ attempt: i + 1, status: i + 1 < step.attempts! ? 503 : 200, code: null, latencyMs: 1, requestId: `req-${index}-${i}`, outcome: (i + 1 < step.attempts! ? "retry" : "success") as "retry" | "success", backoffMs: i + 1 < step.attempts! ? 10 : null, possiblyBillable: false })) }
+          : {}),
       };
       return response;
     },

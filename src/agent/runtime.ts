@@ -12,6 +12,7 @@ import { RunTrace } from "./trace.js";
 export type StopReason = "final_answer" | "model_call_limit" | "cost_limit" | "model_error" | "empty_response" | "wall_clock_limit";
 
 export interface RunTotals {
+  /** Successful logical model calls only (each may have taken several physical HTTP attempts; see modelRetryAttempts). */
   modelCalls: number;
   toolCalls: number;
   inputTokens: number;
@@ -21,6 +22,10 @@ export interface RunTotals {
   acceptedMutations: number;
   mutationAttempts: number;
   advancedSimSeconds: number;
+  /** Logical model calls that never produced a usable response, after the provider's retry policy was exhausted. Excludes local spend-guard refusals, which never reach the network. */
+  failedModelCalls: number;
+  /** Physical HTTP retry attempts beyond the first, summed across every logical call (successful or failed) in this run. */
+  modelRetryAttempts: number;
 }
 
 export interface RunResult {
@@ -86,7 +91,7 @@ export async function runAgent(options: RunOptions): Promise<RunResult & { trace
   };
   const exposed = registry.filter((tool) => policy.isExposed(tool));
   const tools = toolSpecs(registry, (tool) => policy.isExposed(tool));
-  const totals = { inputTokens: 0, outputTokens: 0, cachedTokens: 0, estimatedCostUsd: 0 };
+  const totals = { inputTokens: 0, outputTokens: 0, cachedTokens: 0, estimatedCostUsd: 0, failedModelCalls: 0, modelRetryAttempts: 0 };
 
   trace.record("run.start", { runId, gameId: options.gameId, modelId: options.provider.modelId, mode: options.mode, limits, exposedTools: exposed.map((t) => t.name) });
 
@@ -118,6 +123,11 @@ export async function runAgent(options: RunOptions): Promise<RunResult & { trace
     } catch (caught) {
       stopReason = caught instanceof SpendLimitError ? "cost_limit" : "model_error";
       error = caught instanceof Error ? caught.message : String(caught);
+      // A spend-guard refusal never reaches the network, so it is not a failed request and carries no retry attempts.
+      if (!(caught instanceof SpendLimitError)) {
+        totals.failedModelCalls += 1;
+        totals.modelRetryAttempts += Math.max(0, (caught instanceof ModelApiError ? Math.max(1, caught.attempts.length) : 1) - 1);
+      }
       trace.record("model.error", { step, kind: caught instanceof ModelApiError ? caught.kind : caught instanceof SpendLimitError ? caught.limit : "unknown", message: error, ...(caught instanceof ModelApiError ? { status: caught.status ?? null, code: caught.code, requestId: caught.requestId, attempts: caught.attempts } : {}) });
       break;
     }
@@ -127,6 +137,8 @@ export async function runAgent(options: RunOptions): Promise<RunResult & { trace
     totals.outputTokens += response.usage?.completionTokens ?? 0;
     totals.cachedTokens += response.usage?.cachedPromptTokens ?? 0;
     totals.estimatedCostUsd += response.estimatedCostUsd ?? 0;
+    // One logical call may have needed several physical HTTP attempts (timeouts/429/5xx) before it succeeded.
+    totals.modelRetryAttempts += Math.max(0, (response.attempts?.length ?? 1) - 1);
     trace.record("model.response", {
       step,
       model: response.model,

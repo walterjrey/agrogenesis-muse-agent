@@ -247,6 +247,33 @@ describe("MOCKED runtime: failures, limits and partial observability", () => {
     expect(result.trace.entries.some((e) => e.event === "model.error" && e.kind === "timeout")).toBe(true);
   });
 
+  it("counts physical retry attempts within a logical call without inflating modelCalls, and never charges a spend-guard refusal as a failed request", async () => {
+    sim = await fakeSimulator();
+    // The provider's own retry policy already resolved three physical HTTP attempts into one successful logical call.
+    const retried = await runAgent({ ...base(sim), provider: scriptedModel([{ content: "ok", attempts: 3 }]), mode: "observe_only" });
+    expect(retried.totals).toMatchObject({ modelCalls: 1, failedModelCalls: 0, modelRetryAttempts: 2 });
+
+    // A local spend-guard refusal never reaches the network, so it is not a failed request and has no retry attempts.
+    const refused = await runAgent({ ...base(sim), provider: scriptedModel([{ throws: new SpendLimitError("too expensive", "session") }]), mode: "observe_only" });
+    expect(refused.totals).toMatchObject({ modelCalls: 0, failedModelCalls: 0, modelRetryAttempts: 0 });
+  });
+
+  it("counts a logical call that exhausts retries as one failed request, with its physical attempts as retries, and never credits it toward modelCalls", async () => {
+    sim = await fakeSimulator();
+    const attempts = [
+      { attempt: 1, status: 503, code: null, latencyMs: 1, requestId: "r1", outcome: "retry" as const, backoffMs: 10, possiblyBillable: true },
+      { attempt: 2, status: 503, code: null, latencyMs: 1, requestId: "r2", outcome: "retry" as const, backoffMs: 20, possiblyBillable: true },
+      { attempt: 3, status: 503, code: null, latencyMs: 1, requestId: "r3", outcome: "failed" as const, backoffMs: null, possiblyBillable: true },
+    ];
+    const result = await runAgent({
+      ...base(sim),
+      provider: scriptedModel([{ throws: new ModelApiError("Model API error (HTTP 503).", "server", 503, { attempts }) }]),
+      mode: "observe_only",
+    });
+    expect(result).toMatchObject({ status: "failed", stopReason: "model_error" });
+    expect(result.totals).toMatchObject({ modelCalls: 0, failedModelCalls: 1, modelRetryAttempts: 2 });
+  });
+
   it("persists a structured audit trail that never contains credentials", async () => {
     sim = await fakeSimulator();
     const dir = mkdtempSync(join(tmpdir(), "muse-trace-"));

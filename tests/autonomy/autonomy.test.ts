@@ -271,6 +271,7 @@ describe("MOCKED autonomy: budgets and loop prevention", () => {
     expect(final).toMatchObject({ status: "failed", stopReason: "model_error" });
     expect(final.stopDetail).toMatch(/HTTP 404 model_not_found/);
     expect(final.budgets.modelCalls).toBe(0);
+    expect(final.budgets.failedModelCalls).toBe(1);
     expect(final.decisions.at(-1)).toMatchObject({ stopReason: "model_error" });
   });
 
@@ -292,6 +293,8 @@ describe("MOCKED autonomy: failures", () => {
     expect(final).toMatchObject({ status: "paused", stopReason: "consecutive_errors", cycle: 3 });
     expect(final.decisions.every((d) => d.summary.startsWith("(no decision summary produced"))).toBe(true);
     expect(final.budgets.costUsd).toBe(0);
+    // Repeated failures never consume the model-call budget, but they are counted separately so they remain observable.
+    expect(final.budgets).toMatchObject({ modelCalls: 0, failedModelCalls: 3 });
     expect(store.acquire("t1")).toBeDefined();
   });
 
