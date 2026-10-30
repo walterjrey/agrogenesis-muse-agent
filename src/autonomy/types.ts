@@ -8,8 +8,15 @@ export const SessionLimits = z.strictObject({
   maxCostUsd: z.number().positive(),
   maxModelCalls: z.number().int().positive(),
   maxToolCalls: z.number().int().positive(),
-  /** Accepted state-changing farm actions. */
+  /** Accepted state-changing farm actions (prepareSoil, plantField, irrigateField, harvestField, ...). */
   maxMutations: z.number().int().nonnegative(),
+  /**
+   * Accepted observation-only actions (inspectField, surveyField, inspectLocation, sampleSoil, inspectPestPressure;
+   * see autonomy/actionClassification.ts), enforced independently of maxMutations so inspecting a field doesn't
+   * compete with planting/harvesting for the same scarce farm-action budget. Defaulted for sessions persisted
+   * before this field existed.
+   */
+  maxInspections: z.number().int().nonnegative().default(3),
   /** Simulated seconds the agent may advance in total. */
   maxSimSeconds: z.number().nonnegative(),
   /** Active wall-clock milliseconds, accumulated over all controller runs. */
@@ -41,6 +48,7 @@ export const DEFAULT_SESSION_LIMITS: Readonly<SessionLimits> = {
   maxModelCalls: 20,
   maxToolCalls: 60,
   maxMutations: 3,
+  maxInspections: 3,
   maxSimSeconds: 86_400,
   maxWallClockMs: 15 * 60_000,
   maxCycles: 8,
@@ -284,6 +292,12 @@ export const SessionState = z.strictObject({
     acceptedMutations: z.number().int(),
     mutationAttempts: z.number().int(),
     rejectedActions: z.number().int(),
+    /** Accepted observation-only actions, tracked independently of acceptedMutations. Defaulted for sessions persisted before this field existed. */
+    acceptedInspections: z.number().int().default(0),
+    /** Submitted observation-only actions, accepted or rejected (mirrors mutationAttempts for the inspection budget). */
+    inspectionAttempts: z.number().int().default(0),
+    /** Observation-only submissions the simulator rejected; also included in rejectedActions above. */
+    rejectedInspections: z.number().int().default(0),
     advancedSimSeconds: z.number(),
     wallClockMs: z.number(),
     consecutiveErrors: z.number().int(),

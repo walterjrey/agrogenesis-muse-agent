@@ -1,3 +1,5 @@
+import { isInspectionActionType } from "../autonomy/actionClassification.js";
+
 export type ExecutionMode = "observe_only" | "controlled_mutation";
 
 export interface RunLimits {
@@ -9,10 +11,14 @@ export interface RunLimits {
   maxCostUsd: number;
   maxAdvanceSecondsPerCall: number;
   maxTotalAdvanceSeconds: number;
-  /** Accepted state-changing actions. */
+  /** Accepted state-changing (farm-mutating) actions. Observation-only actions never count against this. */
   maxMutations: number;
-  /** Submitted actions, accepted or rejected; bounds retries after rejections. */
+  /** Submitted farm-mutating actions, accepted or rejected; bounds retries after rejections. */
   maxMutationAttempts: number;
+  /** Accepted observation-only actions (inspectField, surveyField, inspectLocation, sampleSoil, inspectPestPressure). */
+  maxInspections: number;
+  /** Submitted observation-only actions, accepted or rejected; bounds retries after rejections. */
+  maxInspectionAttempts: number;
   /** HTTP advance requests (model-requested or supervised) in one run. */
   maxAdvanceRequests: number;
   /** Largest single advance a supervised wait requests. */
@@ -30,6 +36,8 @@ export const DEFAULT_LIMITS: Readonly<RunLimits> = {
   maxTotalAdvanceSeconds: 3600,
   maxMutations: 1,
   maxMutationAttempts: 3,
+  maxInspections: 2,
+  maxInspectionAttempts: 4,
   maxAdvanceRequests: 30,
   maxWaitChunkSeconds: 600,
 };
@@ -50,6 +58,9 @@ export class RunPolicy {
   toolCalls = 0;
   acceptedMutations = 0;
   mutationAttempts = 0;
+  /** Accepted/attempted observation-only actions (see autonomy/actionClassification.ts), tracked independently of farm mutations. */
+  acceptedInspections = 0;
+  inspectionAttempts = 0;
   advancedSimSeconds = 0;
   advanceRequests = 0;
 
@@ -66,7 +77,11 @@ export class RunPolicy {
     if (!tool.mutating) return { allowed: true };
 
     if (tool.name === "execute_action") {
-      if (this.acceptedMutations >= this.limits.maxMutations || this.mutationAttempts >= this.limits.maxMutationAttempts) {
+      if (isInspectionActionType(args.type)) {
+        if (this.acceptedInspections >= this.limits.maxInspections || this.inspectionAttempts >= this.limits.maxInspectionAttempts) {
+          return { allowed: false, code: "inspection_limit_reached", message: `This run may perform at most ${this.limits.maxInspections} observation-only action(s) (${this.limits.maxInspectionAttempts} submission attempts). The inspection budget is reached; this does not affect the farm-action budget.` };
+        }
+      } else if (this.acceptedMutations >= this.limits.maxMutations || this.mutationAttempts >= this.limits.maxMutationAttempts) {
         return { allowed: false, code: "mutation_limit_reached", message: `This run may execute at most ${this.limits.maxMutations} action(s) (${this.limits.maxMutationAttempts} submission attempts). The limit is reached.` };
       }
     }

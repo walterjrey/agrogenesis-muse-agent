@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { ChatCompletionTool } from "openai/resources/chat/completions";
 import { z } from "zod";
+import { isInspectionActionType } from "../autonomy/actionClassification.js";
 import { SimulatorError, type SimulatorClient } from "../simulator/client.js";
 import type { RunPolicy } from "./policy.js";
 import type { RunTrace } from "./trace.js";
@@ -238,7 +239,9 @@ export function createToolRegistry(): RegisteredTool[] {
         if (context.state.mutationLocked) return fail("mutation_locked", "A previous state-changing request has an unconfirmed outcome; no further actions are allowed in this run.");
         if (expectedRevision === null) return fail("observation_required", "Observe the farm first (observe_farm, observe_fields or list_available_actions): an action must be based on a current observation.");
 
-        context.policy.mutationAttempts += 1;
+        const inspectionOnly = isInspectionActionType(args.type);
+        if (inspectionOnly) context.policy.inspectionAttempts += 1;
+        else context.policy.mutationAttempts += 1;
         const idempotencyKey = context.newMutationId();
         const request = { type: args.type, params: args.params, expectedRevision, dryRun: false, idempotencyKey };
         const intent: MutationIntent = { tool: "execute_action", idempotencyKey, expectedRevision, request, rationale: args.rationale ?? null };
@@ -266,7 +269,8 @@ export function createToolRegistry(): RegisteredTool[] {
           });
           context.trace.record("mutation.result", { tool: "execute_action", accepted: response.accepted, revision: response.revision, actionId: response.action?.actionId ?? null, status: response.action?.status ?? null, errors: response.errors });
           if (response.accepted) {
-            context.policy.acceptedMutations += 1;
+            if (inspectionOnly) context.policy.acceptedInspections += 1;
+            else context.policy.acceptedMutations += 1;
             context.state.observedRevision = null;
           } else {
             context.state.observedRevision = response.revision;

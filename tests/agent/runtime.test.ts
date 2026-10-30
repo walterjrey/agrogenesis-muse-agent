@@ -128,6 +128,26 @@ describe("MOCKED runtime: mutation safety", () => {
     expect(result.totals.acceptedMutations).toBe(1);
   });
 
+  it("tracks observation-only actions (e.g. inspectField) as inspections, never as mutations, and does not let them exhaust the mutation budget", async () => {
+    sim = await fakeSimulator();
+    const INSPECT_ACTION = { name: "execute_action", args: { type: "inspectField", params: { fieldId: "field-1" }, rationale: "Moisture reading is stale." } };
+    const model = scriptedModel([{ calls: OBSERVE }, { calls: [INSPECT_ACTION] }, { calls: [{ name: "observe_farm" }] }, { calls: [EXECUTE] }, { content: "inspected then irrigated" }]);
+    const result = await runAgent({ ...base(sim), provider: model, mode: "controlled_mutation", limits: { maxMutations: 1 } });
+    expect(result.totals).toMatchObject({ acceptedInspections: 1, inspectionAttempts: 1, acceptedMutations: 1, mutationAttempts: 1 });
+    expect(sim.posts.filter((p) => p.path === "/actions")).toHaveLength(2);
+    expect(result.status).toBe("completed");
+  });
+
+  it("enforces the inspection budget independently of the mutation budget", async () => {
+    sim = await fakeSimulator();
+    const INSPECT_ACTION = { name: "execute_action", args: { type: "inspectField", params: { fieldId: "field-1" }, rationale: "Checking moisture." } };
+    const model = scriptedModel([{ calls: OBSERVE }, { calls: [INSPECT_ACTION] }, { calls: [{ name: "observe_farm" }] }, { calls: [INSPECT_ACTION] }, { content: "limit hit" }]);
+    const result = await runAgent({ ...base(sim), provider: model, mode: "controlled_mutation", limits: { maxInspections: 1, maxMutations: 5 } });
+    expect(toolMessages(model, 4).at(-1)!.body.error).toMatchObject({ code: "inspection_limit_reached" });
+    expect(sim.posts.filter((p) => p.path === "/actions")).toHaveLength(1);
+    expect(result.totals).toMatchObject({ acceptedInspections: 1, acceptedMutations: 0 });
+  });
+
   it("rejects advances beyond the per-call and total limits without calling the simulator", async () => {
     sim = await fakeSimulator();
     const model = scriptedModel([{ calls: [{ name: "observe_farm" }] }, { calls: [{ name: "advance_time", args: { requestedSeconds: 5000 } }] }, { calls: [{ name: "advance_time", args: { requestedSeconds: 1800 } }] }, { calls: [{ name: "observe_farm" }] }, { calls: [{ name: "advance_time", args: { requestedSeconds: 1800 } }] }, { calls: [{ name: "observe_farm" }] }, { calls: [{ name: "advance_time", args: { requestedSeconds: 1800 } }] }, { content: "done" }]);

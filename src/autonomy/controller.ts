@@ -12,6 +12,7 @@ import { AUTONOMOUS_SYSTEM_PROMPT, DEFAULT_OBJECTIVE, cycleBrief } from "./promp
 import { measureCycleBrief } from "./promptMetrics.js";
 import { SessionLockLostError } from "./store.js";
 import type { SessionBackend, SessionLease } from "./storage.js";
+import { isInspectionActionType } from "./actionClassification.js";
 import { buildProgress } from "./progress.js";
 import { superviseOperation, type IntervalResult, type WaitResult } from "./supervisor.js";
 import { createAutonomousTools, SnapshotProvider, type PlanSink } from "./tools.js";
@@ -67,7 +68,7 @@ export function newSessionState(options: NewSessionOptions): SessionState {
     lastSimTimeS: null,
     modelEventCursor: 0,
     progressCursor: 0,
-    budgets: { costUsd: 0, modelCalls: 0, toolCalls: 0, acceptedMutations: 0, mutationAttempts: 0, rejectedActions: 0, advancedSimSeconds: 0, wallClockMs: 0, consecutiveErrors: 0, consecutiveNoProgress: 0,     consecutiveRejections: 0, advanceRequests: 0, consecutiveAdvances: 0, conflicts: 0, failedModelCalls: 0, modelRetryAttempts: 0 },
+    budgets: { costUsd: 0, modelCalls: 0, toolCalls: 0, acceptedMutations: 0, mutationAttempts: 0, rejectedActions: 0, acceptedInspections: 0, inspectionAttempts: 0, rejectedInspections: 0, advancedSimSeconds: 0, wallClockMs: 0, consecutiveErrors: 0, consecutiveNoProgress: 0,     consecutiveRejections: 0, advanceRequests: 0, consecutiveAdvances: 0, conflicts: 0, failedModelCalls: 0, modelRetryAttempts: 0 },
     usage: { inputTokens: 0, outputTokens: 0, cachedTokens: 0 },
     metrics: { baseline: null, latest: null, controllerReads: 0, snapshotRefreshes: 0, snapshotCacheHits: 0, mixedRevisionDetections: 0, grainPeakKg: {}, ledger: [] },
   };
@@ -167,9 +168,15 @@ export class AutonomousController {
     s.operations.push({ tool: intent.tool, idempotencyKey: intent.idempotencyKey, status: settlement.status, expectedRevision: intent.expectedRevision, revisionAfter: settlement.revisionAfter, summary: settlement.summary, cycle: s.cycle, settledAt: new Date().toISOString(), via });
     if (settlement.revisionAfter !== null) s.lastRevision = settlement.revisionAfter;
     if (intent.tool === "execute_action") {
+      const inspectionOnly = isInspectionActionType(intent.request.type);
       if (settlement.status === "applied") {
-        b.acceptedMutations += 1;
-        b.mutationAttempts += 1;
+        if (inspectionOnly) {
+          b.acceptedInspections += 1;
+          b.inspectionAttempts += 1;
+        } else {
+          b.acceptedMutations += 1;
+          b.mutationAttempts += 1;
+        }
         b.consecutiveRejections = 0;
         const actionId = settlement.summary.actionId;
         if (typeof actionId === "string") {
@@ -194,7 +201,12 @@ export class AutonomousController {
                   b.consecutiveAdvances = 0;
       } else if (settlement.status === "rejected") {
         b.rejectedActions += 1;
-        b.mutationAttempts += 1;
+        if (inspectionOnly) {
+          b.rejectedInspections += 1;
+          b.inspectionAttempts += 1;
+        } else {
+          b.mutationAttempts += 1;
+        }
         b.consecutiveRejections += 1;
       }
     } else if (settlement.status === "applied") {
@@ -466,6 +478,7 @@ export class AutonomousController {
         const l = s.config.limits;
         const b = s.budgets;
         const remainingMutations = this.mutationsEnabled ? Math.max(0, l.maxMutations - b.acceptedMutations) : 0;
+        const remainingInspections = this.mutationsEnabled ? Math.max(0, l.maxInspections - b.acceptedInspections) : 0;
         const remainingSim = Math.max(0, l.maxSimSeconds - b.advancedSimSeconds);
         const deadlineMs = this.startedAt + (l.maxWallClockMs - this.wallBase);
         const tools = createAutonomousTools(this.provider, sink, this.mutationsEnabled ? {
@@ -511,6 +524,8 @@ export class AutonomousController {
             maxAdvanceRequests: Math.max(0, Math.min(l.maxAdvanceRequests - b.advanceRequests, l.maxConsecutiveAdvances - b.consecutiveAdvances)),
             maxWaitChunkSeconds: l.maxWaitChunkSeconds,
             maxMutationAttempts: remainingMutations + Math.max(0, l.maxConsecutiveRejections - b.consecutiveRejections),
+            maxInspections: remainingInspections,
+            maxInspectionAttempts: remainingInspections + Math.max(0, l.maxConsecutiveRejections - b.consecutiveRejections),
           },
         });
         s.modelEventCursor = Math.max(eventsResponse.nextCursor, result.state.eventCursor);

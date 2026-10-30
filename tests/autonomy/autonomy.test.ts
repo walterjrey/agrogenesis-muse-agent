@@ -27,7 +27,9 @@ afterEach(async () => {
   for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
 });
 
-const INSPECT: ScriptedStep = { calls: [{ name: "execute_action", args: { type: "inspectField", params: { fieldId: "field-1" }, rationale: "Moisture is stale." } }] };
+// Generic "accepted mutating action" stand-in for budget/crash-recovery mechanics tests (the fake simulator always
+// returns a canned "accepted" response regardless of the submitted type, so any real mutating type works here).
+const INSPECT: ScriptedStep = { calls: [{ name: "execute_action", args: { type: "irrigateField", params: { fieldId: "field-1" }, rationale: "Moisture is stale." } }] };
 const ADVANCE = (seconds = 600): ScriptedStep => ({ calls: [{ name: "advance_time", args: { requestedSeconds: seconds, stopOn: ["action_completion"] } }] });
 const PLAN = (nextStep: "continue" | "wait_for_actions" | "stop", summary = `plan ${nextStep}`): ScriptedStep => ({
   calls: [{ name: "update_plan", args: { summary, nextStep, priorities: ["verify moisture"], ...(nextStep === "stop" ? { stopReason: "nothing useful left" } : {}) } }],
@@ -68,7 +70,7 @@ describe("MOCKED autonomy: multi-cycle control and persistence", () => {
     expect(final.decisions[1]).toMatchObject({ advancedSeconds: 600, tools: { advance_time: 1, update_plan: 1 } });
     expect(sim.posts.map((p) => p.path)).toEqual(["/actions", "/clock/advance"]);
     expect(final.operations.map((o) => [o.tool, o.status])).toEqual([["execute_action", "applied"], ["advance_time", "applied"]]);
-    expect(final.actions).toEqual([expect.objectContaining({ actionId: "act-1", type: "inspectField" })]);
+    expect(final.actions).toEqual([expect.objectContaining({ actionId: "act-1", type: "irrigateField" })]);
 
     // Costs and tokens come from the scripted per-call figures (0.001 USD, 100 in / 20 out) and must add up exactly.
     expect(final.budgets.modelCalls).toBe(model.requests.length);
@@ -228,6 +230,16 @@ describe("MOCKED autonomy: budgets and loop prevention", () => {
     expect(final.budgets.acceptedMutations).toBe(1);
   });
 
+  it("enforces the inspection budget independently: an observation-only action does not spend the farm-mutation budget", async () => {
+    sim = await fakeSimulator((req) => completedEvents(req));
+    const SURVEY: ScriptedStep = { calls: [{ name: "execute_action", args: { type: "inspectField", params: { fieldId: "field-1" }, rationale: "Stale moisture reading before deciding." } }] };
+    const { store } = setup({ maxMutations: 1, maxInspections: 1, maxCycles: 4 });
+    const final = await controller(store, sim, scriptedModel([SURVEY, PLAN("continue", "Inspected."), TEXT, INSPECT, PLAN("stop", "Irrigated after inspecting."), TEXT])).run();
+    // The inspection (cycle 1) left the full mutation budget available for the real farm action (cycle 2).
+    expect(final.budgets).toMatchObject({ acceptedInspections: 1, inspectionAttempts: 1, acceptedMutations: 1, mutationAttempts: 1, rejectedActions: 0 });
+    expect(final).toMatchObject({ status: "completed", stopReason: "model_declared_done" });
+  });
+
   it("stops an observe/plan loop that makes no progress", async () => {
     sim = await fakeSimulator();
     const { store } = setup({ maxConsecutiveNoProgress: 3, maxCycles: 8 });
@@ -343,7 +355,7 @@ describe("MOCKED autonomy: crash and timeout recovery for mutations", () => {
     tool: "execute_action" as const,
     idempotencyKey: key,
     expectedRevision,
-    request: { type: "inspectField", params: { fieldId: "field-1" }, expectedRevision, dryRun: false, idempotencyKey: key },
+    request: { type: "irrigateField", params: { fieldId: "field-1" }, expectedRevision, dryRun: false, idempotencyKey: key },
     rationale: "recorded before sending",
     recordedAt: new Date().toISOString(),
     cycle: 1,

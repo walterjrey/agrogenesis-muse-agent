@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { FileSessionStore, IncompatibleSessionError, newSessionState } from "../src/index.js";
+import { SessionState } from "../src/autonomy/types.js";
 
 /** Regression: baseline-run records and damaged files share the sessions directory and must not break unrelated sessions. */
 const dirs: string[] = [];
@@ -47,5 +48,19 @@ describe("incompatible persisted sessions (file store)", () => {
     store.listIncompatible();
     expect(readFileSync(join(root, "p5a-baseline", "state.json"), "utf8")).toBe(baseline);
     expect(readFileSync(join(root, "broken", "state.json"), "utf8")).toBe("{not json");
+  });
+});
+
+describe("sessions persisted before the inspection budget existed", () => {
+  it("loads with zero accrued inspection usage and the conservative default inspection budget", () => {
+    const fresh = newSessionState({ sessionId: "old", gameId: "game-1", modelId: "muse-spark-1.3", mutationsEnabled: true, limits: { maxCostUsd: 1, maxMutations: 3, maxModelCalls: 20, maxSimSeconds: 600 } });
+    const legacyJson = JSON.parse(JSON.stringify(fresh)) as Record<string, any>;
+    delete legacyJson.config.limits.maxInspections;
+    delete legacyJson.budgets.acceptedInspections;
+    delete legacyJson.budgets.inspectionAttempts;
+    delete legacyJson.budgets.rejectedInspections;
+    const parsed = SessionState.parse(legacyJson);
+    expect(parsed.config.limits.maxInspections).toBe(3);
+    expect(parsed.budgets).toMatchObject({ acceptedInspections: 0, inspectionAttempts: 0, rejectedInspections: 0 });
   });
 });

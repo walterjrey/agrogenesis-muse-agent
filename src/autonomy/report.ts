@@ -35,7 +35,7 @@ export function buildReport(state: SessionState) {
     cropCycleCompleted: done("harvestField").length > 0 && done("sellHarvest").length > 0,
   };
   const attribution = buildAttribution(state);
-  const submitted = state.budgets.acceptedMutations + state.budgets.rejectedActions;
+  const submitted = state.budgets.acceptedMutations + state.budgets.acceptedInspections + state.budgets.rejectedActions;
   return {
     sessionId: state.sessionId,
     gameId: state.gameId,
@@ -54,6 +54,12 @@ export function buildReport(state: SessionState) {
       completed: state.actions.filter((a) => a.status === "completed").length,
       failed: state.actions.filter((a) => a.status === "failed").length,
       inFlight: state.actions.filter((a) => a.status === "scheduled" || a.status === "running").length,
+    },
+    inspections: {
+      accepted: state.budgets.acceptedInspections,
+      attempts: state.budgets.inspectionAttempts,
+      rejected: state.budgets.rejectedInspections,
+      limit: state.config.limits.maxInspections,
     },
     pendingMutation: state.pendingMutation ? { tool: state.pendingMutation.tool, idempotencyKey: state.pendingMutation.idempotencyKey } : null,
     time: { advancedSimSeconds: state.budgets.advancedSimSeconds, simulatedDaysElapsed: Math.round((state.budgets.advancedSimSeconds / SECONDS_PER_SIM_DAY) * 1000) / 1000, advanceRequests: state.budgets.advanceRequests, lastSimTimeS: state.lastSimTimeS },

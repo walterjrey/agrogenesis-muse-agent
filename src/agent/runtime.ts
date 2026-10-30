@@ -21,6 +21,9 @@ export interface RunTotals {
   estimatedCostUsd: number;
   acceptedMutations: number;
   mutationAttempts: number;
+  /** Accepted/attempted observation-only actions (inspectField/surveyField/inspectLocation/sampleSoil/inspectPestPressure); never counted against acceptedMutations. */
+  acceptedInspections: number;
+  inspectionAttempts: number;
   advancedSimSeconds: number;
   /** Logical model calls that never produced a usable response, after the provider's retry policy was exhausted. Excludes local spend-guard refusals, which never reach the network. */
   failedModelCalls: number;
@@ -197,6 +200,8 @@ export async function runAgent(options: RunOptions): Promise<RunResult & { trace
       ...totals,
       acceptedMutations: policy.acceptedMutations,
       mutationAttempts: policy.mutationAttempts,
+      acceptedInspections: policy.acceptedInspections,
+      inspectionAttempts: policy.inspectionAttempts,
       advancedSimSeconds: policy.advancedSimSeconds,
     },
     error,

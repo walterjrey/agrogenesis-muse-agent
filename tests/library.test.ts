@@ -13,7 +13,8 @@ afterEach(async () => {
 
 const SCOPES = ["observe", "act", "advance"];
 const gamesBody = (managementMode: string, scopes: string[]) => ({ status: 200, body: { games: [{ gameId: GAME_ID, name: "Test farm", managementMode, lifecycle: "running", scopes }] } });
-const INSPECT: ScriptedStep = { calls: [{ name: "execute_action", args: { type: "inspectField", params: { fieldId: "field-1" }, rationale: "Moisture is stale." } }] };
+// Generic "accepted mutating action" stand-in (the fake simulator always accepts regardless of submitted type).
+const INSPECT: ScriptedStep = { calls: [{ name: "execute_action", args: { type: "irrigateField", params: { fieldId: "field-1" }, rationale: "Moisture is stale." } }] };
 const PLAN = (nextStep: "continue" | "stop"): ScriptedStep => ({ calls: [{ name: "update_plan", args: { summary: `plan ${nextStep}`, nextStep, priorities: ["verify"], ...(nextStep === "stop" ? { stopReason: "done" } : {}) } }] });
 const TEXT: ScriptedStep = { content: "ok" };
 const LIMITS = { maxCostUsd: 1, maxMutations: 3, maxModelCalls: 20, maxSimSeconds: 600 };
