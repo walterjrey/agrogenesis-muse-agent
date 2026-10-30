@@ -240,12 +240,107 @@ describe("MOCKED autonomy: budgets and loop prevention", () => {
     expect(final).toMatchObject({ status: "completed", stopReason: "model_declared_done" });
   });
 
-  it("stops an observe/plan loop that makes no progress", async () => {
+  it("stops an observe/plan loop that makes no progress, naming what failed to advance", async () => {
     sim = await fakeSimulator();
     const { store } = setup({ maxConsecutiveNoProgress: 3, maxCycles: 8 });
     const final = await controller(store, sim, scriptedModel([PLAN("continue"), TEXT])).run();
     expect(final).toMatchObject({ status: "stopped", stopReason: "no_progress", cycle: 3 });
     expect(final.decisions.every((d) => !d.progress)).toBe(true);
+    expect(final.stopDetail).toMatch(/3 consecutive cycles without progress: no server time was granted.*no action or inspection was accepted.*eligible actions did not change.*Continuing would spend model calls/);
+  });
+
+  it("does not stop a long crop-growth wait: granted simulated time counts as progress across many cycles", async () => {
+    sim = await fakeSimulator();
+    const { store } = setup({ maxConsecutiveNoProgress: 3, maxCycles: 10, maxSimSeconds: 100_000, maxAdvanceRequests: 20, maxConsecutiveAdvances: 20 });
+    const wait = [ADVANCE(600), PLAN("continue", "Crops are still developing."), TEXT];
+    const final = await controller(store, sim, scriptedModel([...wait, ...wait, ...wait, ...wait, ...wait, ...wait, PLAN("stop", "Nothing left."), TEXT])).run();
+    expect(final.stopReason).not.toBe("no_progress");
+    expect(final.budgets.acceptedMutations).toBe(0);
+  });
+
+  it("still enforces the consecutive-advance limit on endless waiting", async () => {
+    sim = await fakeSimulator();
+    const { store } = setup({ maxConsecutiveNoProgress: 3, maxCycles: 20, maxSimSeconds: 100_000, maxAdvanceRequests: 20, maxConsecutiveAdvances: 3 });
+    const wait = [ADVANCE(600), PLAN("continue"), TEXT];
+    const final = await controller(store, sim, scriptedModel([...wait, ...wait, ...wait, ...wait])).run();
+    expect(final.stopReason).toBe("consecutive_advance_limit");
+  });
+
+  it("counts an accepted inspection and a field-attention warning as progress without any mutation", async () => {
+    sim = await fakeSimulator((req) => {
+      if (req.url.includes("/events") && /cursor=0\b/.test(req.url)) {
+        return { status: 200, body: { gameId: GAME_ID, clock, events: [{ eventId: 7, simTimeS: clock.simTimeS, kind: "field_attention", actionId: null, summary: "attention", data: { fieldId: "field-1", category: "crop_water_stress", level: 2 } }], nextCursor: 7 } };
+      }
+      return undefined;
+    });
+    const { store } = setup({ maxConsecutiveNoProgress: 2, maxCycles: 3 });
+    const final = await controller(store, sim, scriptedModel([PLAN("continue"), TEXT])).run();
+    expect(final.decisions.length, `${final.stopReason}: ${final.stopDetail}`).toBeGreaterThan(0);
+    expect(final.decisions[0]!.progressReasons).toContain("field_attention");
+    expect(final.decisions[0]!.progress).toBe(true);
+    expect(final).toMatchObject({ stopReason: "no_progress", cycle: 3 }); // the warning bought one cycle, not an unlimited pass
+  });
+
+  it("does not credit an unchanged or replayed field_attention warning again", async () => {
+    sim = await fakeSimulator((req) =>
+      req.url.includes("/events") ? { status: 200, body: { gameId: GAME_ID, clock, events: [{ eventId: 7, simTimeS: clock.simTimeS, kind: "field_attention", actionId: null, summary: "attention", data: { fieldId: "field-1", category: "crop_water_stress", level: 2 } }], nextCursor: 7 } } : undefined,
+    );
+    const { store } = setup({ maxConsecutiveNoProgress: 3, maxCycles: 8 });
+    const final = await controller(store, sim, scriptedModel([PLAN("continue"), TEXT])).run();
+    expect(final.decisions.map((d) => d.progress)).toEqual([true, false, false, false]);
+    expect(final).toMatchObject({ stopReason: "no_progress", cycle: 4 });
+  });
+
+  it("counts an accepted inspection as progress even though no farm mutation happens", async () => {
+    sim = await fakeSimulator();
+    const SURVEY: ScriptedStep = { calls: [{ name: "execute_action", args: { type: "inspectField", params: { fieldId: "field-1" }, rationale: "Stale moisture reading before deciding." } }] };
+    const { store } = setup({ maxInspections: 1, maxConsecutiveNoProgress: 1, maxCycles: 4 });
+    const final = await controller(store, sim, scriptedModel([SURVEY, PLAN("continue", "Inspected."), TEXT])).run();
+    expect(final.budgets).toMatchObject({ acceptedInspections: 1, acceptedMutations: 0 });
+    expect(final.decisions[0]!.progress).toBe(true);
+    expect(final.decisions[0]!.progressReasons).toEqual(expect.arrayContaining(["inspection_accepted"]));
+    expect(final.decisions[0]!.progressReasons).not.toContain("action_accepted");
+    expect(final.decisions[1]!.progress).toBe(false); // with a limit of 1, only the inspection cycle was spared
+  });
+
+  describe("eligibility changes", () => {
+    // Eligibility changes only once the game revision moves (a snapshot is reused while revision and time are unchanged).
+    const changingEligibility = () =>
+      fakeSimulator((req, state) => {
+        if (req.method !== "GET" || !req.url.split("?")[0]!.endsWith("/actions")) return undefined;
+        const first = availableActions.actions.find((a) => a.eligibility.eligible)!;
+        const spare = { ...first, type: "spareAction" }; // keeps one action eligible so the session is not completed
+        return { status: 200, body: { ...availableActions, revision: state.revision, actions: [spare, ...availableActions.actions].map((a) => (state.revision > 4 && a.type === first.type ? { ...a, eligibility: { eligible: false, issues: [{ code: "not_ready", detail: "x" }] } } : a)) } };
+      });
+
+    it("counts a genuine change in eligible actions as progress", async () => {
+      sim = await changingEligibility();
+      const { store } = setup({ maxConsecutiveNoProgress: 5, maxCycles: 3, maxSimSeconds: 100_000, maxAdvanceRequests: 5 });
+      const final = await controller(store, sim, scriptedModel([PLAN("continue"), TEXT, ADVANCE(600), PLAN("continue"), TEXT, PLAN("continue"), TEXT])).run();
+      expect(final.decisions.length, `${final.stopReason}: ${final.stopDetail}`).toBe(3); expect(final.decisions[0]!.progressReasons).not.toContain("eligible_actions_changed"); // first observation is only a baseline
+      expect(final.decisions[1]!.progressReasons).not.toContain("eligible_actions_changed"); // snapshot predates the advance
+      expect(final.decisions[2]!.progressReasons).toEqual(["eligible_actions_changed"]);
+    });
+
+    it("treats the first observation after a restart as a baseline, not as a change", async () => {
+      sim = await changingEligibility();
+      const { store } = setup({ maxConsecutiveNoProgress: 5, maxCycles: 4 });
+      await controller(store, sim, scriptedModel([PLAN("continue"), TEXT]), { sliceCycles: 1 }).run();
+      sim.state.revision = 5; // the world changed while the worker was down
+      // A new controller is a restarted worker: it has no memory of the previous eligibility.
+      const resumed = await controller(store, sim, scriptedModel([PLAN("continue"), TEXT]), { sliceCycles: 1 }).run();
+      expect(resumed.decisions).toHaveLength(2);
+      expect(resumed.decisions[1]!.progressReasons).not.toContain("eligible_actions_changed");
+    });
+  });
+
+  it("does not credit empty model responses or blocked execution as progress", async () => {
+    sim = await fakeSimulator();
+    const { store } = setup({ maxConsecutiveNoProgress: 3, maxCycles: 8, maxConsecutiveErrors: 10 });
+    const final = await controller(store, sim, scriptedModel([{ content: null }])).run();
+    expect(final.stopReason).toBe("no_progress");
+    expect(final.decisions.every((d) => !d.progress)).toBe(true);
+    expect(final.stopDetail).toMatch(/3 cycle\(s\) ended without a usable model decision/);
   });
 
   it("stops after repeated rejected actions", async () => {

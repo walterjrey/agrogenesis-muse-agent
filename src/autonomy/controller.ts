@@ -55,6 +55,22 @@ export function describeInactivity(state: SessionState): string {
   return `${base} ${planted.length} planted field(s) were growing (oldest ${oldest} sim days since planting), so this is an inactivity cap on a long wait for crop growth, not a failure; start a new session to continue monitoring.`;
 }
 
+/** Why no_progress fired: names what failed to advance over the stagnant cycles so the stop is actionable. */
+export function describeNoProgress(state: SessionState): string {
+  const n = state.budgets.consecutiveNoProgress;
+  const recent = state.decisions.slice(-n);
+  const failedModel = recent.filter((d) => d.stopReason === "model_error" || d.stopReason === "empty_response").length;
+  const rejected = recent.reduce((sum, d) => sum + Math.max(0, d.actionsSubmitted - d.actionsAccepted), 0);
+  const waited = recent.reduce((sum, d) => sum + d.advancedSeconds, 0);
+  const causes = [
+    failedModel > 0 ? `${failedModel} cycle(s) ended without a usable model decision` : null,
+    rejected > 0 ? `${rejected} action(s) were rejected` : null,
+    waited === 0 ? "no server time was granted (simulated time did not advance)" : null,
+    "no action or inspection was accepted, no operation completed or failed, no new observation or field warning arrived, and the set of eligible actions did not change",
+  ].filter((c) => c !== null);
+  return `${n} consecutive cycles without progress: ${causes.join("; ")}. Continuing would spend model calls without changing the farm or the simulation clock; review the plan, then resume.`;
+}
+
 export function newSessionState(options: NewSessionOptions): SessionState {
   const now = new Date().toISOString();
   return {
@@ -126,6 +142,8 @@ export class AutonomousController {
   private provider!: SnapshotProvider;
   private readonly startedAt = Date.now();
   private wallBase = 0;
+  /** Eligible-action signature of the previous cycle (in memory only: the first cycle after a restart sets the baseline). */
+  private lastEligibility: string | null = null;
   private mutationsEnabled = false;
 
   constructor(private readonly options: ControllerOptions) {}
@@ -329,15 +347,25 @@ export class AutonomousController {
     }
   }
 
-  /** Progress = an accepted mutation, or a simulator event proving something completed/failed/delivered information. */
-  private async evaluateProgress(acceptedBefore: number): Promise<{ progress: boolean; reasons: string[] }> {
+  /**
+   * Progress = something verifiably moved: an accepted mutation or inspection, server time actually granted by an
+   * advance (waiting for crops is legitimate), a simulator event (completion, failure, delivered observation or a
+   * redacted field-attention warning), or a change in which actions the simulator says are eligible (e.g. harvest
+   * becoming available). Failed model runs earn no credit, so empty responses and blocked execution still stagnate.
+   */
+  private async evaluateProgress(before: { accepted: number; inspections: number; advanced: number }, failedRun: boolean, eligibilityChanged: boolean): Promise<{ progress: boolean; reasons: string[] }> {
     const reasons: string[] = [];
-    if (this.state.budgets.acceptedMutations > acceptedBefore) reasons.push("action_accepted");
+    if (this.state.budgets.acceptedMutations > before.accepted) reasons.push("action_accepted");
+    if (this.state.budgets.acceptedInspections > before.inspections) reasons.push("inspection_accepted");
+    if (!failedRun && this.state.budgets.advancedSimSeconds > before.advanced) reasons.push("sim_time_advanced");
+    if (eligibilityChanged) reasons.push("eligible_actions_changed");
     try {
-      const events = await this.options.client.getEvents(this.state.gameId, this.state.progressCursor);
-      this.state.progressCursor = Math.max(this.state.progressCursor, events.nextCursor);
-      const kinds = new Set(events.events.map((e) => e.kind));
-      for (const kind of ["action_completed", "action_failed", "observation_delivered"] as const) if (kinds.has(kind)) reasons.push(kind);
+      const cursorBefore = this.state.progressCursor;
+      const events = await this.options.client.getEvents(this.state.gameId, cursorBefore);
+      this.state.progressCursor = Math.max(cursorBefore, events.nextCursor);
+      // Only events newer than the cursor count: a replayed or unchanged warning must not keep resetting the counter.
+      const kinds = new Set(events.events.filter((e) => e.eventId > cursorBefore).map((e) => e.kind));
+      for (const kind of ["action_completed", "action_failed", "observation_delivered", "field_attention"] as const) if (kinds.has(kind)) reasons.push(kind);
     } catch {
       /* no evidence available: not counted as progress */
     }
@@ -478,7 +506,8 @@ export class AutonomousController {
       this.log(`cycle ${s.cycle}`);
       const sink: PlanSink = { latest: null, updates: 0 };
       let result: Awaited<ReturnType<typeof runAgent>>;
-      const before = { accepted: s.budgets.acceptedMutations, rejected: s.budgets.rejectedActions, advanced: s.budgets.advancedSimSeconds, cost: s.budgets.costUsd };
+      const before = { accepted: s.budgets.acceptedMutations, rejected: s.budgets.rejectedActions, advanced: s.budgets.advancedSimSeconds, cost: s.budgets.costUsd, inspections: s.budgets.acceptedInspections };
+      let eligibilityChanged = false;
 
       try {
         const snapshot = await this.provider.get();
@@ -496,6 +525,9 @@ export class AutonomousController {
         const events: GameEvent[] = eventsResponse.events;
 
         const eligible = snapshot.actions.actions.some((a) => a.eligibility.eligible);
+        const signature = snapshot.actions.actions.filter((a) => a.eligibility.eligible).map((a) => a.type).sort().join(",");
+        eligibilityChanged = this.lastEligibility !== null && this.lastEligibility !== signature;
+        this.lastEligibility = signature;
         const inFlight = s.actions.some((a) => !TERMINAL_ACTION_STATUSES.has(a.status)) || snapshot.overview.status.activeActionCount > 0;
         if (!eligible && !inFlight) return await this.end("completed", "no_eligible_actions", "The simulator offers no eligible action and no operation is in flight.");
 
@@ -582,7 +614,8 @@ export class AutonomousController {
       if (!s.pendingMutation) waitedProgress = await this.autoWait();
       await this.refreshActions();
       s.progress = buildProgress(s);
-      const { progress: eventProgress, reasons } = await this.evaluateProgress(before.accepted);
+      const failedRun = result.stopReason === "model_error" || result.stopReason === "empty_response" || (result.stopReason === "cost_limit" && b.costUsd < s.config.limits.maxCostUsd);
+      const { progress: eventProgress, reasons } = await this.evaluateProgress(before, failedRun, eligibilityChanged);
       const progress = eventProgress || waitedProgress;
       if (waitedProgress && !eventProgress) reasons.push("supervised_operation_finished");
       const toolCounts: Record<string, number> = {};
@@ -605,7 +638,6 @@ export class AutonomousController {
         stopReason: result.stopReason,
       });
 
-      const failedRun = result.stopReason === "model_error" || result.stopReason === "empty_response" || (result.stopReason === "cost_limit" && b.costUsd < s.config.limits.maxCostUsd);
       const hadUnknown = s.pendingMutation !== null;
       b.consecutiveErrors = failedRun || hadUnknown ? b.consecutiveErrors + 1 : 0;
       b.consecutiveNoProgress = progress ? 0 : b.consecutiveNoProgress + 1;
@@ -623,7 +655,7 @@ export class AutonomousController {
         return this.end("paused", "consecutive_errors", modelFailure && result.error ? result.error.slice(0, 300) : undefined);
       }
       if (b.consecutiveRejections >= s.config.limits.maxConsecutiveRejections) return this.end("stopped", "repeated_rejections");
-      if (b.consecutiveNoProgress >= s.config.limits.maxConsecutiveNoProgress) return this.end("stopped", "no_progress", `${b.consecutiveNoProgress} consecutive cycles without progress`);
+      if (b.consecutiveNoProgress >= s.config.limits.maxConsecutiveNoProgress) return this.end("stopped", "no_progress", describeNoProgress(s));
       const budget = this.budgetStop();
       if (budget) return this.end("stopped", budget.reason, budget.detail);
       if (this.options.sliceCycles !== undefined && cyclesThisRun >= this.options.sliceCycles) return this.end("paused", "slice_complete", `${cyclesThisRun} cycle(s) run in this process; resume continues the same budgets.`);
