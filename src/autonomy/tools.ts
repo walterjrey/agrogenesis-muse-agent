@@ -57,6 +57,11 @@ export class SnapshotProvider {
 export interface WaitHooks {
   maxChunkSeconds: number;
   conflictsLeft(): number;
+  /**
+   * Server advances a review interval may still send. When omitted it is limited like any other advance. The
+   * consecutive-wait guard counts a whole interval once, so it does not shrink this number.
+   */
+  intervalRequestsLeft?(): number;
   onConflict(): void;
   finished(result: WaitResult): void | Promise<void>;
   finishedInterval(result: IntervalResult): void | Promise<void>;
@@ -277,7 +282,7 @@ export function createAutonomousTools(
                   retryDelayMs: context.retryDelayMs,
                   maxMutationRetries: context.maxMutationRetries,
                   budget: {
-                    requestsLeft: Math.max(0, limits.maxAdvanceRequests - context.policy.advanceRequests),
+                    requestsLeft: wait.intervalRequestsLeft ? wait.intervalRequestsLeft() : Math.max(0, limits.maxAdvanceRequests - context.policy.advanceRequests),
                     simSecondsLeft: Math.max(0, limits.maxTotalAdvanceSeconds - context.policy.advancedSimSeconds),
                     maxChunkSeconds: Math.min(wait.maxChunkSeconds, limits.maxAdvanceSecondsPerCall),
                     maxCallSeconds: limits.maxAdvanceSecondsPerCall,

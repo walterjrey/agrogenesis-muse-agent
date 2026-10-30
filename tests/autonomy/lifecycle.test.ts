@@ -5,7 +5,7 @@ import { buildProgress } from "../../src/autonomy/progress.js";
 import { buildReport } from "../../src/autonomy/report.js";
 import { newSessionState } from "../../src/autonomy/controller.js";
 import type { SessionState, TrackedAction } from "../../src/autonomy/types.js";
-import type { FieldObservations } from "../../src/contracts/fieldObservations.js";
+import { FieldObservation, type FieldObservations } from "../../src/contracts/fieldObservations.js";
 import { fieldObservations, GAME_ID } from "../fixtures.js";
 import { countingIds } from "../agent/harness.js";
 import { timedSim, type TimedSim, type TimedSimOptions } from "./timedSim.js";
@@ -141,6 +141,37 @@ describe("MOCKED context compaction of field observations", () => {
       expect(missing).toEqual(f.missing);
     }
     expect(compact.note).toMatch(/crop identity or growth stage/);
+  });
+
+  it("surfaces only a redacted warning (category, level, since) and omits it when there is none", () => {
+    const withWarn: FieldObservations = {
+      ...obs,
+      fields: obs.fields.map((f, i) => (i === 0 ? { ...f, attention: [{ alertId: "evt-0007", category: "pest_outbreak", level: 2, sinceSimTimeS: 2820, status: "active" as const }] } : f)),
+    };
+    const compact = compactFields(withWarn);
+    const first = compact.fields.find((f) => f.id === "field-1") as { warn?: unknown[] };
+    expect(first.warn).toEqual([{ cat: "pest_outbreak", lvl: 2, since: 2820 }]);
+    expect(JSON.stringify(first.warn)).not.toMatch(/evt-|density|stress|health|value/i);
+    expect(compact.fields.filter((f) => "warn" in f)).toHaveLength(1);
+    expect(JSON.stringify(compactFields(obs))).not.toContain("warn");
+  });
+
+  it("accepts servers that predate redacted alerts (no attention field)", () => {
+    expect(FieldObservation.parse((fieldObservations as unknown as FieldObservations).fields[0]).attention).toBeUndefined();
+    expect(() => FieldObservation.parse({ ...(fieldObservations as unknown as FieldObservations).fields[0], attention: [{ alertId: "e", category: "pest_outbreak", level: 2, sinceSimTimeS: 1, status: "active", pestDensity: 0.5 }] })).toThrow();
+  });
+});
+
+describe("MOCKED review-interval supervisor: redacted warnings", () => {
+  it("does not interrupt a review interval for a resolved warning", async () => {
+    const s = await start();
+    const seen = [{ eventId: 1, simTimeS: 10, kind: "field_attention", actionId: null, summary: "resolved", data: { status: "resolved" } }];
+    const stubbed = {
+      getFarmOverview: (id: string) => s.client.getFarmOverview(id),
+      advance: async (gameId: string, request: Parameters<typeof s.client.advance>[1]) => ({ ...(await s.client.advance(gameId, request)), events: seen }),
+    } as unknown as typeof s.client;
+    const result = await superviseInterval(deps(s, { client: stubbed }).deps, { maxSeconds: 600, checkpointSeconds: 300 });
+    expect(result.outcome).toBe("horizon_reached");
   });
 });
 

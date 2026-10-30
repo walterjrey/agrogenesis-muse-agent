@@ -33,6 +33,7 @@ export function compactFields(observations: FieldObservations) {
       ...(f.knownGrowthStage ? { stage: f.knownGrowthStage } : {}),
       lastObservedAtS: f.lastObservedAtSimTimeS,
       ...(f.activeOperationActionId ? { activeOp: f.activeOperationActionId } : {}),
+      ...(f.attention && f.attention.length > 0 ? { warn: f.attention.map((a) => ({ cat: a.category, lvl: a.level, since: round(a.sinceSimTimeS, 2) })) } : {}),
       m: measurements,
       unobserved: f.missing,
     };
@@ -45,6 +46,6 @@ export function compactFields(observations: FieldObservations) {
     note: "No sensor reports crop identity or growth stage. Measurements: v=value, sd=uncertainty (1 sigma), at=observation sim time, fresh=freshness, c=confidence. Age = simTimeS - at.",
     units,
     ...(sameMissing && first.length > 0 ? { unobservedInEveryField: first } : {}),
-    fields: sameMissing ? fields.map((f) => ({ id: f.id, ha: f.ha, ...(f.crop ? { crop: f.crop } : {}), ...(f.stage ? { stage: f.stage } : {}), lastObservedAtS: f.lastObservedAtS, ...(f.activeOp ? { activeOp: f.activeOp } : {}), m: f.m })) : fields,
+    fields: sameMissing ? fields.map((f) => ({ id: f.id, ha: f.ha, ...(f.crop ? { crop: f.crop } : {}), ...(f.stage ? { stage: f.stage } : {}), lastObservedAtS: f.lastObservedAtS, ...(f.activeOp ? { activeOp: f.activeOp } : {}), ...(f.warn ? { warn: f.warn } : {}), m: f.m })) : fields,
   };
 }

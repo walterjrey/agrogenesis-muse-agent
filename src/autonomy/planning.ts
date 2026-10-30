@@ -18,6 +18,14 @@ const RECENT_EVENT_MAX_WAIT_DAYS = 5;
 const MIN_OPERATION_REVIEW_DAYS = 0.5;
 const CRITICAL_MEASUREMENTS = new Set(["soilMoisture", "cropHealth", "pestPressure"]);
 const MATERIAL_EVENT_KINDS = new Set(["action_failed", "action_cancelled", "weather_alert", "mode_changed", "equipment_status_changed", "action_completed"]);
+const SEVERE_ATTENTION_MAX_WAIT_DAYS = 2;
+const SEVERE_ATTENTION_CHECKPOINT_DAYS = 1;
+const ATTENTION_MAX_WAIT_DAYS = 3;
+
+/** A resolved warning is information; a new or escalated active one is a material planning signal. */
+function isMaterialEvent(event: GameEvent): boolean {
+  return MATERIAL_EVENT_KINDS.has(event.kind) || (event.kind === "field_attention" && event.data.status !== "resolved");
+}
 
 const round2 = (n: number): number => Math.round(n * 100) / 100;
 
@@ -153,7 +161,7 @@ export function buildPlanningContext(state: SessionState, snapshot: Snapshot, ev
       return value ? [{ fieldId: field.fieldId, measurement, freshness: value.freshness, ageS: value.ageS }] : [];
     }),
   );
-  const relevantEvents = events.filter((event) => MATERIAL_EVENT_KINDS.has(event.kind));
+  const relevantEvents = events.filter(isMaterialEvent);
 
   return {
     policyVersion: state.config.planning.policyVersion,
@@ -253,7 +261,26 @@ export function adaptReviewWindow(
     reasons.push("critical sensor evidence is stale; review sooner without treating stale values as current");
   }
 
-  if (events.some((event) => MATERIAL_EVENT_KINDS.has(event.kind))) {
+  // A planted field with a critical quantity that was never observed is entirely unmonitored.
+  const plantedIds = new Set(buildProgress(state).fields.filter((field) => field.plantedCrop !== null).map((field) => field.fieldId));
+  const plantedUnmonitored = snapshot.fields.fields.some((field) =>
+    plantedIds.has(field.fieldId) && [...CRITICAL_MEASUREMENTS].some((measurement) => !field.measurements[measurement]),
+  );
+  if (plantedUnmonitored) {
+    effectiveMaxDays = Math.min(effectiveMaxDays, UNCERTAIN_OBSERVATION_MAX_WAIT_DAYS);
+    effectiveCheckpointDays = Math.min(effectiveCheckpointDays, NEAR_WINDOW_CHECKPOINT_DAYS);
+    reasons.push("a planted field has never had its critical quantities observed; review sooner (this does not require an inspection)");
+  }
+
+  const attentionLevels = snapshot.fields.fields.flatMap((field) => (plantedIds.has(field.fieldId) ? (field.attention ?? []).map((alert) => alert.level) : []));
+  if (attentionLevels.length > 0) {
+    const severe = Math.max(...attentionLevels) >= 2;
+    effectiveMaxDays = Math.min(effectiveMaxDays, severe ? SEVERE_ATTENTION_MAX_WAIT_DAYS : ATTENTION_MAX_WAIT_DAYS);
+    effectiveCheckpointDays = Math.min(effectiveCheckpointDays, severe ? SEVERE_ATTENTION_CHECKPOINT_DAYS : NEAR_WINDOW_CHECKPOINT_DAYS);
+    reasons.push(`a planted field has an active level ${severe ? "2+" : "1"} environmental warning; review sooner without assuming its cause`);
+  }
+
+  if (events.some(isMaterialEvent)) {
     effectiveMaxDays = Math.min(effectiveMaxDays, RECENT_EVENT_MAX_WAIT_DAYS);
     effectiveCheckpointDays = Math.min(effectiveCheckpointDays, NEAR_WINDOW_CHECKPOINT_DAYS);
     reasons.push("recent material event warrants a shorter follow-up review");

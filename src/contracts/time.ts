@@ -12,6 +12,8 @@ export const GameEvent = z.strictObject({
     "action_cancelled",
     "observation_delivered",
     "weather_alert",
+    /** Redacted environmental warning for one field; data carries only fieldId, category, level, status and alertId. */
+    "field_attention",
     "equipment_status_changed",
     "mode_changed",
   ]),

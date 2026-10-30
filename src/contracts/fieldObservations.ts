@@ -28,6 +28,16 @@ const KnownLabel = z.strictObject({
   confidence: Fraction,
 });
 
+/** Redacted warning that a field has an active environmental alert. Carries no measurement or threshold. */
+export const FieldAttention = z.strictObject({
+  alertId: z.string(),
+  category: z.string(),
+  level: z.number().int().min(1).max(3),
+  sinceSimTimeS: SimTimeS,
+  status: z.literal("active"),
+});
+export type FieldAttention = z.infer<typeof FieldAttention>;
+
 export const FieldObservation = z.strictObject({
   fieldId: Id,
   label: z.string(),
@@ -40,6 +50,8 @@ export const FieldObservation = z.strictObject({
   /** Quantities the agent has no usable observation for; the agent must not assume values for them. */
   missing: z.array(z.string()),
   activeOperationActionId: z.string().nullable(),
+  /** Absent on servers that predate redacted alerts. */
+  attention: z.array(FieldAttention).optional(),
 });
 export type FieldObservation = z.infer<typeof FieldObservation>;
 

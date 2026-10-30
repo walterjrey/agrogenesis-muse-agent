@@ -297,7 +297,7 @@ export async function superviseInterval(deps: SupervisorDeps, params: { maxSecon
     if (step.status === "retry") continue;
     if (step.status === "end") return finish(step.outcome as IntervalOutcome, step.detail);
     checkpoints += 1;
-    const material = step.response.events.find((e) => !ROUTINE_EVENT_KINDS.has(e.kind));
+    const material = step.response.events.find((e) => !ROUTINE_EVENT_KINDS.has(e.kind) && !(e.kind === "field_attention" && e.data.status === "resolved"));
     if (material) {
       interrupt = describeEvent(material);
       return finish("event_interrupt");

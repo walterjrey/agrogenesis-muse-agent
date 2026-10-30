@@ -13,7 +13,7 @@ import {
   GENERIC_CROP_WINDOW_START_DAYS,
 } from "../../src/autonomy/planning.js";
 import { createAutonomousTools, SnapshotProvider } from "../../src/autonomy/tools.js";
-import { newSessionState } from "../../src/autonomy/controller.js";
+import { newSessionState, describeInactivity } from "../../src/autonomy/controller.js";
 import { summarizeSnapshot } from "../../src/autonomy/observation.js";
 import { SessionStore } from "../../src/autonomy/store.js";
 import type { Snapshot } from "../../src/autonomy/observation.js";
@@ -85,6 +85,19 @@ function snapshotAt(simTimeS = 0, freshness: "fresh" | "stale" | "expired" = "fr
     rounds: 1,
     mixedRevisionsDetected: 0,
   };
+}
+
+/** Every field has all critical quantities, fresh; optionally with redacted warnings on field-1. */
+function observedSnapshot(simTimeS: number, attention: NonNullable<FieldObservations["fields"][number]["attention"]> = []): Snapshot {
+  const base = snapshotAt(simTimeS);
+  const fields = FieldObservations.parse({
+    ...base.fields,
+    fields: base.fields.fields.map((field) => {
+      const sample = field.measurements.soilMoisture!;
+      return { ...field, attention, measurements: { ...field.measurements, cropHealth: sample, pestPressure: sample } };
+    }),
+  });
+  return { ...base, fields };
 }
 
 function stateAt(simTimeS: number, horizonDays: number | null = 200, plantedAtS?: number) {
@@ -218,6 +231,43 @@ describe("Phase 5C adaptive review windows", () => {
     expect(result.effectiveCheckpointDays).toBe(1);
     expect(result.reasons).toHaveLength(3);
     expect(result.reasons.join(" ")).toMatch(/pending-operation|stale|material event/);
+  });
+
+  it("shortens review for a planted field whose critical quantities were never observed, but not for unplanted fields", () => {
+    const planted = adaptReviewWindow(stateAt(5 * 60, 200, 0), snapshotAt(5 * 60), [], 30, 10);
+    expect(planted).toMatchObject({ effectiveMaxDays: 5, effectiveCheckpointDays: 2 });
+    expect(planted.reasons.join(" ")).toContain("never had its critical quantities observed");
+    const unplanted = adaptReviewWindow(stateAt(5 * 60, 200), snapshotAt(5 * 60), [], 30, 10);
+    expect(unplanted).toMatchObject({ effectiveMaxDays: 30, effectiveCheckpointDays: 10 });
+  });
+
+  it("keeps long waits while planted fields are fully and freshly observed with no warning", () => {
+    const stable = adaptReviewWindow(stateAt(5 * 60, 200, 0), observedSnapshot(5 * 60), [], 30, 10);
+    expect(stable).toMatchObject({ effectiveMaxDays: 30, effectiveCheckpointDays: 10 });
+  });
+
+  it("shortens review further for an active redacted warning on a planted field, scaled by level", () => {
+    const warn = (level: number) => observedSnapshot(5 * 60, [{ alertId: "evt-0001", category: "crop_water_stress", level, sinceSimTimeS: 200, status: "active" as const }]);
+    expect(adaptReviewWindow(stateAt(5 * 60, 200, 0), warn(2), [], 30, 10)).toMatchObject({ effectiveMaxDays: 2, effectiveCheckpointDays: 1 });
+    expect(adaptReviewWindow(stateAt(5 * 60, 200, 0), warn(1), [], 30, 10)).toMatchObject({ effectiveMaxDays: 3, effectiveCheckpointDays: 2 });
+  });
+
+  it("treats a new field_attention event as material but a resolved one as information", () => {
+    const attention = (status: string): GameEvent => ({ ...event("field_attention"), data: { fieldId: "field-1", category: "pest_outbreak", level: 2, status } });
+    const state = stateAt(5 * 60, 200);
+    expect(adaptReviewWindow(state, snapshotAt(5 * 60), [attention("active")], 30, 10).effectiveMaxDays).toBe(5);
+    expect(adaptReviewWindow(state, snapshotAt(5 * 60), [attention("resolved")], 30, 10).effectiveMaxDays).toBe(30);
+    expect(buildPlanningContext(state, snapshotAt(5 * 60), [attention("active")]).relevantRecentEvents).toHaveLength(1);
+    expect(buildPlanningContext(state, snapshotAt(5 * 60), [attention("resolved")]).relevantRecentEvents).toHaveLength(0);
+  });
+
+  it("explains the consecutive-wait guard as crop-growth waiting or plain inactivity", () => {
+    const growing = stateAt(60 * 60, 200, 0);
+    growing.budgets.consecutiveAdvances = 12;
+    expect(describeInactivity(growing)).toMatch(/12\/12 consecutive waits.*1 planted field\(s\) were growing \(oldest 60 sim days.*not a failure/);
+    const idle = stateAt(60 * 60, 200);
+    idle.budgets.consecutiveAdvances = 12;
+    expect(describeInactivity(idle)).toMatch(/No crop is known to be growing, so this is inactivity/);
   });
 
   it("exports the comparison as a native function tool and preserves tool-call/result pairing", async () => {

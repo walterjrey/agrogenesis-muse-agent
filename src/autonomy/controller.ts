@@ -44,6 +44,17 @@ function primitiveParams(request: Record<string, unknown>): Record<string, strin
   return out;
 }
 
+/** Why the consecutive-wait guard fired: waiting for known crop growth versus plain inactivity. */
+export function describeInactivity(state: SessionState): string {
+  const n = state.budgets.consecutiveAdvances;
+  const max = state.config.limits.maxConsecutiveAdvances;
+  const planted = buildProgress(state).fields.filter((f) => f.plantedCrop !== null && f.simDaysSincePlanting !== null);
+  const base = `${n}/${max} consecutive waits without an accepted farm action or inspection.`;
+  if (planted.length === 0) return `${base} No crop is known to be growing, so this is inactivity: nothing in progress justified further waiting.`;
+  const oldest = Math.max(...planted.map((f) => f.simDaysSincePlanting!));
+  return `${base} ${planted.length} planted field(s) were growing (oldest ${oldest} sim days since planting), so this is an inactivity cap on a long wait for crop growth, not a failure; start a new session to continue monitoring.`;
+}
+
 export function newSessionState(options: NewSessionOptions): SessionState {
   const now = new Date().toISOString();
   return {
@@ -274,13 +285,18 @@ export class AutonomousController {
     if (this.mutationsEnabled) {
       if (b.advancedSimSeconds >= l.maxSimSeconds) return { reason: "sim_time_limit_reached", detail: `${b.advancedSimSeconds}/${l.maxSimSeconds} s` };
       if (b.advanceRequests >= l.maxAdvanceRequests) return { reason: "advance_request_budget_exhausted", detail: `${b.advanceRequests}/${l.maxAdvanceRequests}` };
-      if (b.consecutiveAdvances >= l.maxConsecutiveAdvances) return { reason: "consecutive_advance_limit", detail: `${b.consecutiveAdvances}/${l.maxConsecutiveAdvances} advances without a new action` };
+      if (b.consecutiveAdvances >= l.maxConsecutiveAdvances) return { reason: "consecutive_advance_limit", detail: this.inactivityDetail() };
       const spent = this.farmSpend();
       if (spent !== null && spent >= l.maxFarmSpendCredits) return { reason: "farm_spend_limit_reached", detail: `${spent} of ${l.maxFarmSpendCredits} credits` };
       const inFlight = this.state.actions.some((a) => !TERMINAL_ACTION_STATUSES.has(a.status));
       if (b.acceptedMutations >= l.maxMutations && !inFlight) return { reason: "mutation_budget_exhausted", detail: `${b.acceptedMutations}/${l.maxMutations}` };
     }
     return null;
+  }
+
+  /** Explains the consecutive-wait guard in terms of what the session was actually doing. */
+  private inactivityDetail(): string {
+    return describeInactivity(this.state);
   }
 
   /** Realized farm costs since the first observation of this session; null when finance is not authorized/observed. */
@@ -328,8 +344,16 @@ export class AutonomousController {
     return { progress: reasons.length > 0, reasons };
   }
 
-  private recordInterval(r: IntervalResult): void {
+  /**
+   * A review interval is one waiting decision, however many server checkpoints it was split into. Every applied
+   * checkpoint was counted when it settled, so only the extra ones are given back here; maxAdvanceRequests and the
+   * simulated-time budget still bound the real number of server advances.
+   */
+  private async recordInterval(r: IntervalResult): Promise<void> {
+    const b = this.state.budgets;
+    b.consecutiveAdvances = Math.max(0, b.consecutiveAdvances - Math.max(0, r.advanceRequests - 1));
     this.state.waits.push({ cycle: this.state.cycle, actionId: "checkpoint-interval", trigger: "model_tool", outcome: r.outcome, actionStatus: null, advanceRequests: r.advanceRequests, advancedSeconds: r.advancedSeconds, simTimeStartS: r.simTimeStartS, simTimeEndS: r.simTimeEndS, events: r.events, detail: r.detail });
+    await this.save();
   }
 
   private async recordWait(wait: WaitResult, trigger: WaitRecord["trigger"]): Promise<void> {
@@ -487,6 +511,7 @@ export class AutonomousController {
           onConflict: () => undefined,
           finished: (wait) => this.recordWait(wait, "model_tool"),
           finishedInterval: (r) => this.recordInterval(r),
+          intervalRequestsLeft: () => Math.max(0, l.maxAdvanceRequests - s.budgets.advanceRequests),
         } : undefined, { state: s, recentEvents: events });
 
         // The brief carries this exact snapshot, so observe_snapshot must not resend it until something changes.

@@ -255,7 +255,29 @@ describe("MOCKED controller: supervised waiting", () => {
     const { store } = sessionSetup({ maxConsecutiveAdvances: 3, maxWaitChunkSeconds: 60, maxCycles: 5 });
     const final = await ctl(store, sim, scriptedModel([EXECUTE, TEXT("Started.")])).run();
     expect(final.stopReason).toBe("consecutive_advance_limit");
+    expect(final.stopDetail).toMatch(/3\/3 consecutive waits without an accepted farm action or inspection/);
     expect(sim.state.advances).toHaveLength(3);
+  });
+
+  it("counts one review interval as one waiting decision, however many checkpoints it used", async () => {
+    sim = await timedSim({ durationS: 30, estimateS: 30 });
+    const { store } = sessionSetup({ maxConsecutiveAdvances: 2, maxCycles: 2 });
+    const interval: ScriptedStep = { calls: [{ name: "wait_for_checkpoint", args: { maxDays: 8, checkpointDays: 2, rationale: "Let time pass." } }] };
+    const final = await ctl(store, sim, scriptedModel([interval, TEXT("Waited."), TEXT("Nothing justified.")])).run();
+    expect(sim.state.advances.length).toBeGreaterThan(2);
+    expect(final.budgets.advanceRequests).toBe(sim.state.advances.length);
+    expect(final.budgets.consecutiveAdvances).toBe(1);
+    expect(final.stopReason).not.toBe("consecutive_advance_limit");
+  });
+
+  it("cannot bypass the consecutive-wait limit by repeating wait_for_checkpoint across cycles", async () => {
+    sim = await timedSim({ durationS: 30, estimateS: 30 });
+    const { store } = sessionSetup({ maxConsecutiveAdvances: 2, maxCycles: 8 });
+    const interval: ScriptedStep = { calls: [{ name: "wait_for_checkpoint", args: { maxDays: 4, checkpointDays: 2, rationale: "Let time pass." } }] };
+    const final = await ctl(store, sim, scriptedModel([interval, TEXT("Waited."), interval, TEXT("Waited."), interval, TEXT("Waited."), interval, TEXT("Waited.")])).run();
+    expect(final.stopReason).toBe("consecutive_advance_limit");
+    expect(final.budgets.consecutiveAdvances).toBe(2);
+    expect(final.waits.filter((w) => w.actionId === "checkpoint-interval")).toHaveLength(2);
   });
 
   it("stops on persistent database conflicts", async () => {
