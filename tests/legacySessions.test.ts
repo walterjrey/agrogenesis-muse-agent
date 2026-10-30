@@ -54,7 +54,7 @@ describe("incompatible persisted sessions (file store)", () => {
 describe("sessions persisted before the inspection budget existed", () => {
   it("loads with zero accrued inspection usage and the conservative default inspection budget", () => {
     const fresh = newSessionState({ sessionId: "old", gameId: "game-1", modelId: "muse-spark-1.3", mutationsEnabled: true, limits: { maxCostUsd: 1, maxMutations: 3, maxModelCalls: 20, maxSimSeconds: 600 } });
-    const legacyJson = JSON.parse(JSON.stringify(fresh)) as Record<string, any>;
+    const legacyJson = JSON.parse(JSON.stringify(fresh)) as { config: { limits: Record<string, unknown> }; budgets: Record<string, unknown> };
     delete legacyJson.config.limits.maxInspections;
     delete legacyJson.budgets.acceptedInspections;
     delete legacyJson.budgets.inspectionAttempts;

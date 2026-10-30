@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildBriefSections, cycleBrief, promptOperationalRecord } from "../../src/autonomy/prompt.js";
+import { AUTONOMOUS_SYSTEM_PROMPT, buildBriefSections, cycleBrief, promptOperationalRecord } from "../../src/autonomy/prompt.js";
 import { buildPlanningContext } from "../../src/autonomy/planning.js";
 import { measureCycleBrief, estimateTokens } from "../../src/autonomy/promptMetrics.js";
 import { buildProgress } from "../../src/autonomy/progress.js";
@@ -60,7 +60,7 @@ function stateAt(simTimeS: number, plantedField = "field-1", plantedAtS = 10 * 6
   state.lastSimTimeS = simTimeS;
   state.metrics.baseline = summarizeSnapshot(snapshotAt(0));
   state.metrics.latest = summarizeSnapshot(snapshotAt(simTimeS));
-  state.plan = { priorities: ["Monitor corn"], constraints: [], missingObservations: [], nextStep: "continue" };
+  state.plan = { summary: "", objective: null, priorities: ["Monitor corn"], constraints: [], missingObservations: [], pendingOperations: [], nextReviewSimSeconds: null, nextStep: "continue", stopReason: null };
   state.actions.push(TrackedAction.parse({
     actionId: "plant-1", type: "plantField", status: "completed", submittedAtRevision: 1, idempotencyKey: "test-key",
     lastCheckedAt: null, target: plantedField, startedAtS: plantedAtS, estimatedCompletionS: null, finishedAtS: plantedAtS,
@@ -168,6 +168,39 @@ describe("cycle brief decision-critical information is preserved after dedup", (
     expect(sections.objective).toBeTruthy();
     expect(sections.planning.horizon).toMatchObject({ configuredHorizonDays: 200 });
     expect(sections.planning.knownCropCommitments.length).toBeGreaterThan(0);
+  });
+});
+
+describe("tool-usage guidance and inspection visibility", () => {
+  const input = (mutationsEnabled: boolean, acceptedInspections = 0) => {
+    const state = stateAt(150 * 60);
+    state.config.mutationsEnabled = mutationsEnabled;
+    state.config.limits = { ...state.config.limits, maxInspections: 6 };
+    state.budgets.acceptedInspections = acceptedInspections;
+    return { state, snapshot: snapshotAt(150 * 60), events: [], progress: buildProgress(state), economics: buildEconomics(state) };
+  };
+
+  it("exposes the remaining inspection budget independently of mutations, and 0 when observe-only", () => {
+    expect(buildBriefSections(input(true)).remainingBudgets).toMatchObject({ inspections: 6 });
+    expect(buildBriefSections(input(true, 4)).remainingBudgets).toMatchObject({ inspections: 2 });
+    expect(buildBriefSections(input(true, 9)).remainingBudgets).toMatchObject({ inspections: 0 });
+    expect(buildBriefSections(input(false)).remainingBudgets).toMatchObject({ inspections: 0 });
+  });
+
+  it("does not instruct the model to inspect, only that an allowance is not a reason to use it", () => {
+    expect(AUTONOMOUS_SYSTEM_PROMPT).toContain("Having an allowance is not a reason to use it");
+    expect(AUTONOMOUS_SYSTEM_PROMPT).not.toMatch(/(always|must) (inspect|survey|irrigate)/i);
+  });
+
+  it("keeps wait_for_operation available but points at automatic supervision, and keeps mandatory re-observation", () => {
+    expect(AUTONOMOUS_SYSTEM_PROMPT).toContain("wait_for_operation remains available");
+    expect(AUTONOMOUS_SYSTEM_PROMPT).toContain("automatically supervises a pending operation");
+    expect(AUTONOMOUS_SYSTEM_PROMPT).toContain("call observe_snapshot again before the next mutation");
+  });
+
+  it("asks for describe_action once per type while still allowing it when needed", () => {
+    expect(AUTONOMOUS_SYSTEM_PROMPT).toContain("only once per action type");
+    expect(AUTONOMOUS_SYSTEM_PROMPT).toContain("call describe_action again only when");
   });
 });
 
