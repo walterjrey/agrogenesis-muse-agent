@@ -95,6 +95,8 @@ export interface MetaModelConfig {
   /** Overall deadline across all attempts and backoff waits (default 120 s). */
   requestDeadlineMs?: number;
   maxOutputTokens?: number;
+  /** Chat Completions `reasoning_effort`; omitted (provider default) when unset. "none" is rejected by Muse Spark (HTTP 400). */
+  reasoningEffort?: ReasoningEffort;
   spendGuard: SpendGuard;
   logger?: Logger;
   /** Test seams. */
@@ -103,6 +105,9 @@ export interface MetaModelConfig {
 }
 
 export const META_BASE_URL = "https://api.meta.ai/v1";
+/** Documented Chat Completions values; "none" is excluded because Muse Spark rejects it with HTTP 400. */
+export type ReasoningEffort = "minimal" | "low" | "medium" | "high" | "xhigh";
+export const DEFAULT_REASONING_EFFORT: ReasoningEffort = "medium";
 export const DEFAULT_REQUEST_DEADLINE_MS = 120_000;
 
 /** Meta Model API via its OpenAI-compatible Chat Completions endpoint (https://dev.meta.ai/docs). */
@@ -157,6 +162,7 @@ export class MetaModelProvider implements ModelProvider {
               messages: request.messages,
               ...(request.tools?.length ? { tools: request.tools } : {}),
               max_completion_tokens: maxOutputTokens,
+              ...(this.config.reasoningEffort ? { reasoning_effort: this.config.reasoningEffort } : {}),
             },
             { timeout: Math.max(1, Math.min(attemptTimeoutMs, remainingMs)), ...(request.signal ? { signal: request.signal } : {}) },
           )

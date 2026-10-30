@@ -1,4 +1,4 @@
-import { MetaModelProvider, META_BASE_URL, type ModelProvider } from "./model/meta.js";
+import { MetaModelProvider, META_BASE_URL, DEFAULT_REASONING_EFFORT, type ModelProvider, type ReasoningEffort } from "./model/meta.js";
 import { SpendGuard } from "./model/spendGuard.js";
 import { silentLogger, type Logger } from "./logging/logger.js";
 import { SimulatorClient } from "./simulator/client.js";
@@ -32,6 +32,8 @@ export type ModelConnection =
       retryModelNotFound?: boolean;
       /** Overall deadline across attempts and backoff, in ms (default 120000). */
       requestDeadlineMs?: number;
+      /** Chat Completions reasoning_effort for autonomous calls (default "medium"). "none" is not supported by Muse Spark. */
+      reasoningEffort?: ReasoningEffort;
       /** Hard ceilings enforced by the spend guard in addition to the session limits (which can only tighten them). */
       maxCostPerRequestUsd?: number;
       maxSessionCostUsd?: number;
@@ -106,6 +108,7 @@ function modelProvider(deps: AgentDependencies, limits: SessionLimits, alreadySp
     ...(model.retryModelNotFound !== undefined ? { retryModelNotFound: model.retryModelNotFound } : {}),
     ...(model.requestDeadlineMs !== undefined ? { requestDeadlineMs: model.requestDeadlineMs } : {}),
     maxOutputTokens: limits.maxOutputTokens,
+    reasoningEffort: model.reasoningEffort ?? DEFAULT_REASONING_EFFORT,
     spendGuard: new SpendGuard({
       maxCostPerRequestUsd: Math.min(perRequest, limits.maxCostPerRequestUsd),
       maxSessionCostUsd: Math.min(session, Math.max(0.0001, limits.maxCostUsd - alreadySpentUsd)),

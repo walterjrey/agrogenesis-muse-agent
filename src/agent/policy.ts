@@ -29,7 +29,7 @@ export const DEFAULT_LIMITS: Readonly<RunLimits> = {
   maxModelCalls: 10,
   maxToolCallsPerStep: 4,
   maxTotalToolCalls: 20,
-  maxOutputTokens: 2048,
+  maxOutputTokens: 4096,
   maxCostPerRequestUsd: 0.1,
   maxCostUsd: 0.25,
   maxAdvanceSecondsPerCall: 1800,

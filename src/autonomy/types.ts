@@ -58,7 +58,7 @@ export const DEFAULT_SESSION_LIMITS: Readonly<SessionLimits> = {
   maxModelCallsPerCycle: 6,
   maxToolCallsPerCycle: 12,
   maxAdvanceSecondsPerCall: 3_600,
-  maxOutputTokens: 2_048,
+  maxOutputTokens: 4_096,
   maxCostPerRequestUsd: 0.1,
   maxAdvanceRequests: 60,
   maxConsecutiveAdvances: 12,

@@ -31,6 +31,28 @@ describe("Meta model provider (MOCKED Meta API, not proof of real connectivity)"
     expect(res.estimatedCostUsd).toBeCloseTo((600 * 1.25 + 400 * 0.15 + 200 * 4.25) / 1e6, 8);
   });
 
+  it("sends max_completion_tokens and reasoning_effort, never max_output_tokens; omits effort when unset", async () => {
+    server = await startMockServer(() => ({ status: 200, body: completion() }));
+    const mk = (extra: object) => new MetaModelProvider({ apiKey: "k", modelId: "muse-spark-1.3", baseUrl: server!.url, maxRetries: 0, timeoutMs: 1000, spendGuard: guard(), ...extra });
+    await mk({ maxOutputTokens: 4096, reasoningEffort: "medium" }).complete({ messages: [{ role: "user", content: "x" }] });
+    await mk({}).complete({ messages: [{ role: "user", content: "x" }] });
+    const a = JSON.parse(server.requests[0]!.body) as Record<string, unknown>;
+    const b = JSON.parse(server.requests[1]!.body) as Record<string, unknown>;
+    expect(a).toMatchObject({ max_completion_tokens: 4096, reasoning_effort: "medium" });
+    expect(a).not.toHaveProperty("max_output_tokens");
+    expect(b).not.toHaveProperty("reasoning_effort");
+  });
+
+  it("classifies finish_reason=length with reasoning-only output as truncated, with diagnostics, and does not retry", async () => {
+    const body = { ...completion(), choices: [{ index: 0, finish_reason: "length", message: { role: "assistant", content: null } }], usage: { prompt_tokens: 7650, completion_tokens: 2048, total_tokens: 9698, completion_tokens_details: { reasoning_tokens: 2046 } } };
+    server = await startMockServer(() => ({ status: 200, body }));
+    const p = new MetaModelProvider({ apiKey: "k", modelId: "muse-spark-1.3", baseUrl: server.url, maxRetries: 3, timeoutMs: 1000, spendGuard: guard() });
+    const res = await p.complete({ messages: [{ role: "user", content: "x" }] });
+    expect(res.finishReason).toBe("length");
+    expect(res.usage).toMatchObject({ completionTokens: 2048, reasoningTokens: 2046 });
+    expect(server.requests).toHaveLength(1);
+  });
+
   it("returns native tool calls with raw, unvalidated arguments", async () => {
     const tool_calls = [{ id: "call_1", type: "function", function: { name: "get_overview", arguments: "{not json" } }];
     server = await startMockServer(() => ({ status: 200, body: { ...completion({ content: null, tool_calls }), choices: [{ index: 0, finish_reason: "tool_calls", message: { role: "assistant", content: null, tool_calls } }] } }));
