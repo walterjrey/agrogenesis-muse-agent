@@ -1,6 +1,6 @@
 {
   "name": "agrogenesis-muse-agent",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "private": true,
   "description": "Meta Muse-powered autonomous agent foundation for the AgroGenesis simulator (hackathon submission).",
   "type": "module",

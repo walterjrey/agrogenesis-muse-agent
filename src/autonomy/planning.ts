@@ -1,8 +1,7 @@
 import type { GameEvent } from "../contracts/time.js";
 import type { Snapshot } from "./observation.js";
-import { buildEconomics } from "./economics.js";
 import { buildProgress } from "./progress.js";
-import type { SessionState } from "./types.js";
+import type { ProgressRecord, SessionState } from "./types.js";
 
 export const GENERIC_CROP_DURATION_ESTIMATE_DAYS = 100;
 export const GENERIC_CROP_WINDOW_START_DAYS = 75;
@@ -19,6 +18,8 @@ const RECENT_EVENT_MAX_WAIT_DAYS = 5;
 const MIN_OPERATION_REVIEW_DAYS = 0.5;
 const CRITICAL_MEASUREMENTS = new Set(["soilMoisture", "cropHealth", "pestPressure"]);
 const MATERIAL_EVENT_KINDS = new Set(["action_failed", "action_cancelled", "weather_alert", "mode_changed", "equipment_status_changed", "action_completed"]);
+
+const round2 = (n: number): number => Math.round(n * 100) / 100;
 
 export interface CropOptionFacts {
   crop: string;
@@ -93,21 +94,41 @@ function currentCropDays(snapshot: Snapshot, state: SessionState): number {
     : (snapshot.simTimeS - state.config.scenario.startSimTimeS) / DAY_SECONDS;
 }
 
-/** Compact planning facts: estimates remain explicitly generic, while all farm facts come from authorized API data. */
-export function buildPlanningContext(state: SessionState, snapshot: Snapshot, events: GameEvent[]) {
+/**
+ * Per-cycle embedding of the crop comparison: drops the always-null agronomic fields (never published by the
+ * agent API; the `unknowns` note already says so once) and the `asOf` stamp (the snapshot revision/simTimeS are
+ * already at the top of this same brief). Also drops the per-preview `note` (static boilerplate repeated once per
+ * plantable field, every cycle; the same fact is already covered once by `unknowns`). The full detail, including
+ * explicit nulls and the per-preview note, stays available on demand via the compare_crop_options tool, which
+ * calls buildCropEconomics directly and is unaffected by this.
+ */
+function compactCropOptions(facts: ReturnType<typeof buildCropEconomics>) {
+  return {
+    currency: facts.currency,
+    crops: facts.crops.map(({ crop, configuredSalePriceCreditsPerKg, seedStockKg, harvestInventoryKg }) => ({ crop, configuredSalePriceCreditsPerKg, seedStockKg, harvestInventoryKg })),
+    currentlyEligiblePlantActionTargets: facts.currentlyEligiblePlantActionTargets,
+    plantActionPreviews: facts.plantActionPreviews.map(({ note: _note, ...rest }) => { void _note; return rest; }),
+    unknowns: facts.unknowns,
+  };
+}
+
+/**
+ * Compact planning facts: estimates remain explicitly generic, while all farm facts come from authorized API data.
+ * `progress` may be supplied by the caller to avoid recomputing it (it is already built once per cycle); omitting
+ * it keeps this function usable on its own.
+ */
+export function buildPlanningContext(state: SessionState, snapshot: Snapshot, events: GameEvent[], progress: ProgressRecord = buildProgress(state)) {
   const currentDay = snapshot.simTimeS / DAY_SECONDS;
   const reportedWholeDay = snapshot.overview.clock.simDay;
   const startSimTimeS = state.config.scenario.startSimTimeS ?? snapshot.simTimeS;
   const horizonEndDay = state.config.planning.horizonDays === null ? null : startSimTimeS / DAY_SECONDS + state.config.planning.horizonDays;
   const daysRemaining = horizonEndDay === null ? null : Math.max(0, horizonEndDay - currentDay);
   const elapsedSessionDays = currentCropDays(snapshot, state);
-  const progress = buildProgress(state);
-  const economics = buildEconomics(state);
+  // Numeric guidance only; the rationale (generic, not crop-specific, not a maturity observation) lives once in
+  // the system prompt instead of being restated in every cycle's brief.
   const cropWindow = {
     estimateDays: GENERIC_CROP_DURATION_ESTIMATE_DAYS,
-    source: "generic approximate guidance in the agent system prompt; not crop-specific, not a simulator guarantee, and not a maturity observation",
     reviewWindowDaysSincePlanting: [GENERIC_CROP_WINDOW_START_DAYS, GENERIC_CROP_WINDOW_END_DAYS],
-    note: "A possible review window only. Crop readiness is unknown until directly observed through the eligible-action catalog.",
   };
   const commitments = progress.fields
     .filter((field) => field.plantedCrop !== null && field.plantedAtSimTimeS !== null)
@@ -124,7 +145,6 @@ export function buildPlanningContext(state: SessionState, snapshot: Snapshot, ev
         genericMaturityEstimateMayFallAfterHorizon: horizonEndDay === null
           ? null
           : field.plantedAtSimTimeS! / DAY_SECONDS + GENERIC_CROP_DURATION_ESTIMATE_DAYS > horizonEndDay,
-        durationEstimateSource: cropWindow.source,
       };
     });
   const criticalFreshness = snapshot.fields.fields.flatMap((field) =>
@@ -144,33 +164,22 @@ export function buildPlanningContext(state: SessionState, snapshot: Snapshot, ev
       endDay: horizonEndDay,
       daysRemaining,
       configuredHorizonDays: state.config.planning.horizonDays,
+      /** Does not reveal crop maturity; see knownCropCommitments for per-field generic maturity estimates. */
+      elapsedSessionDays: round2(Math.max(0, elapsedSessionDays)),
       note: horizonEndDay === null ? "Evaluation horizon not configured; session time budget remains a separate hard limit." : "Horizon is measured from the first authorized observation; it informs planning but does not prohibit any action.",
     },
-    currentCashCredits: snapshot.overview.finance.authorized ? snapshot.overview.finance.credits : null,
-    resourceInventory: snapshot.overview.resources.map(({ id, kind, quantity, unit }) => ({ id, kind, quantity, unit })),
-    marketPricesPerKg: snapshot.overview.finance.authorized ? (snapshot.overview.finance.marketPricesPerKg ?? null) : null,
-    economicLedger: economics ? {
-      realizedRevenueTotal: economics.realizedRevenueTotal,
-      realizedOperatingCostsTotal: economics.realizedOperatingCostsTotal,
-      unsoldInventory: economics.inventory,
-      estimatedUnsoldValueCredits: economics.estimatedUnsoldValueCredits,
-      estimateNote: "Inventory value is a configured quote times observed stock; not realized cash or a forecast.",
-    } : null,
-    cropOptions: buildCropEconomics(snapshot),
+    // currentCashCredits, resourceInventory and marketPricesPerKg are not repeated here: they are already in
+    // this same brief's snapshot.overview (finance.credits, resources, finance.marketPricesPerKg).
+    cropOptions: compactCropOptions(buildCropEconomics(snapshot)),
     genericCropWindow: cropWindow,
     knownCropCommitments: commitments,
-    pendingOperations: progress.pendingOperations,
+    // pendingOperations is not repeated here: it is already in operationalRecord.pendingOperations.
     criticalObservationFreshness: criticalFreshness,
     missingCriticalObservations: snapshot.fields.fields.map((field) => ({
       fieldId: field.fieldId,
       missing: field.missing.filter((measurement) => CRITICAL_MEASUREMENTS.has(measurement)),
     })).filter((field) => field.missing.length > 0),
     relevantRecentEvents: relevantEvents.map(({ eventId, simTimeS, kind, actionId, summary }) => ({ eventId, simTimeS, kind, actionId, summary })),
-    uncertainty: [
-      "No hidden crop stage, actual future yield, future weather, RNG state or ground-truth soil condition is included.",
-      "Crop identity/duration is included only for this session's own completed planting records; sensor observations keep their reported freshness.",
-      `Elapsed session time is approximately ${Math.max(0, elapsedSessionDays).toFixed(2)} days; this does not reveal crop maturity.`,
-    ],
   };
 }
 

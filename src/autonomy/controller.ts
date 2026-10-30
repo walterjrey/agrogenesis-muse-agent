@@ -9,6 +9,7 @@ import { SimulatorError, type SimulatorClient } from "../simulator/client.js";
 import { InconsistentObservationError, summarizeSnapshot, isAuthFailure } from "./observation.js";
 import { buildEconomics, ledgerEntry } from "./economics.js";
 import { AUTONOMOUS_SYSTEM_PROMPT, DEFAULT_OBJECTIVE, cycleBrief } from "./prompt.js";
+import { measureCycleBrief } from "./promptMetrics.js";
 import { SessionLockLostError } from "./store.js";
 import type { SessionBackend, SessionLease } from "./storage.js";
 import { buildProgress } from "./progress.js";
@@ -477,6 +478,9 @@ export class AutonomousController {
 
         // The brief carries this exact snapshot, so observe_snapshot must not resend it until something changes.
         this.provider.delivered = { revision: snapshot.revision, simTimeS: snapshot.simTimeS };
+        const briefInput = { state: s, snapshot, events, progress: buildProgress(s), economics: buildEconomics(s) };
+        const briefSizeEstimate = measureCycleBrief(briefInput);
+        this.log(`cycle ${s.cycle} prompt estimate ${JSON.stringify({ cycle: s.cycle, source: "estimated", charsPerTokenHeuristic: 4, totalEstimatedTokens: briefSizeEstimate.totalEstimatedTokens, systemPromptEstimatedTokens: briefSizeEstimate.systemPromptEstimatedTokens, sections: Object.fromEntries(briefSizeEstimate.sections.map((sec) => [sec.section, sec.estimatedTokens])) })}`);
         result = await runAgent({
           provider: this.options.provider,
           client: this.options.client,
@@ -484,7 +488,8 @@ export class AutonomousController {
           mode: this.mutationsEnabled ? "controlled_mutation" : "observe_only",
           tools,
           systemPrompt: AUTONOMOUS_SYSTEM_PROMPT,
-          brief: cycleBrief({ state: s, snapshot, events, progress: buildProgress(s), economics: buildEconomics(s) }),
+          brief: cycleBrief(briefInput),
+          cycle: s.cycle,
           runId: `${s.sessionId}-c${s.cycle}`,
           traceDirectory: this.options.traceDirectory === undefined ? (this.options.store.traceDirectory?.(s.sessionId) ?? null) : this.options.traceDirectory,
           initialState: { observedRevision: snapshot.revision, eventCursor: eventsResponse.nextCursor },
@@ -529,6 +534,8 @@ export class AutonomousController {
       s.usage.inputTokens += result.totals.inputTokens;
       s.usage.outputTokens += result.totals.outputTokens;
       s.usage.cachedTokens += result.totals.cachedTokens;
+      // Real provider-reported usage for this cycle (as opposed to the pre-call estimate logged above).
+      this.log(`cycle ${s.cycle} usage ${JSON.stringify({ cycle: s.cycle, source: "provider", modelCalls: result.totals.modelCalls, failedModelCalls: result.totals.failedModelCalls, modelRetryAttempts: result.totals.modelRetryAttempts, inputTokens: result.totals.inputTokens, outputTokens: result.totals.outputTokens, cachedTokens: result.totals.cachedTokens, estimatedCostUsd: Math.round(result.totals.estimatedCostUsd * 1e6) / 1e6 })}`);
       if (sink.latest) s.plan = sink.latest;
 
       let waitedProgress = false;

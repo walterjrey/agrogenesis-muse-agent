@@ -66,6 +66,9 @@ export interface RunOptions {
   signal?: AbortSignal;
   /** Asked when the model is about to give its final answer; a non-null message is sent back once instead (e.g. to ask for a missing plan). */
   beforeFinal?: () => string | null;
+  /** Autonomy cycle this run belongs to, if any; included in model.request/model.response/model.error trace entries so
+   * per-call token usage (logged by the provider) can be correlated back to a cycle without parsing the run id. */
+  cycle?: number;
 }
 
 const MAX_TOOL_RESULT_CHARS = 60_000;
@@ -118,7 +121,7 @@ export async function runAgent(options: RunOptions): Promise<RunResult & { trace
 
     let response: ModelResponse;
     try {
-      trace.record("model.request", { step, messageCount: messages.length, toolsOffered: toolsEnabled ? tools.length : 0 });
+      trace.record("model.request", { step, cycle: options.cycle ?? null, messageCount: messages.length, toolsOffered: toolsEnabled ? tools.length : 0 });
       response = await options.provider.complete({ messages: compactHistory(messages, callMeta), ...(toolsEnabled ? { tools } : {}), maxOutputTokens: limits.maxOutputTokens, ...(options.signal ? { signal: options.signal } : {}), ...(options.deadlineMs !== undefined ? { deadlineMs: options.deadlineMs } : {}) });
     } catch (caught) {
       stopReason = caught instanceof SpendLimitError ? "cost_limit" : "model_error";
@@ -128,7 +131,7 @@ export async function runAgent(options: RunOptions): Promise<RunResult & { trace
         totals.failedModelCalls += 1;
         totals.modelRetryAttempts += Math.max(0, (caught instanceof ModelApiError ? Math.max(1, caught.attempts.length) : 1) - 1);
       }
-      trace.record("model.error", { step, kind: caught instanceof ModelApiError ? caught.kind : caught instanceof SpendLimitError ? caught.limit : "unknown", message: error, ...(caught instanceof ModelApiError ? { status: caught.status ?? null, code: caught.code, requestId: caught.requestId, attempts: caught.attempts } : {}) });
+      trace.record("model.error", { step, cycle: options.cycle ?? null, kind: caught instanceof ModelApiError ? caught.kind : caught instanceof SpendLimitError ? caught.limit : "unknown", message: error, ...(caught instanceof ModelApiError ? { status: caught.status ?? null, code: caught.code, requestId: caught.requestId, attempts: caught.attempts } : {}) });
       break;
     }
 
@@ -141,6 +144,7 @@ export async function runAgent(options: RunOptions): Promise<RunResult & { trace
     totals.modelRetryAttempts += Math.max(0, (response.attempts?.length ?? 1) - 1);
     trace.record("model.response", {
       step,
+      cycle: options.cycle ?? null,
       model: response.model,
       finishReason: response.finishReason,
       requestId: response.requestId,

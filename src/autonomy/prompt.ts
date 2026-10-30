@@ -36,7 +36,49 @@ export interface CycleBriefInput {
   economics?: EconomicSummary | null;
 }
 
-export function cycleBrief({ state, snapshot, events, progress, economics }: CycleBriefInput): string {
+/**
+ * Prompt-facing view of the operational record. Drops fields already present elsewhere in this same brief:
+ * knownCrop/knownGrowthStage per field (sensor-reported, duplicated under snapshot.fields), objective (duplicated
+ * at the top level of the brief) and simTimeS (duplicated at the top of snapshot: state.lastSimTimeS is always
+ * set to snapshot.simTimeS before the brief is built). The full ProgressRecord (used for persistence, resume and
+ * reporting) is never mutated or shortened.
+ */
+export function promptOperationalRecord(progress: ProgressRecord) {
+  const { objective: _objective, simTimeS: _simTimeS, ...rest } = progress;
+  void _objective;
+  void _simTimeS;
+  return { ...rest, fields: progress.fields.map(({ knownCrop: _knownCrop, knownGrowthStage: _knownGrowthStage, ...fieldRest }) => { void _knownCrop; void _knownGrowthStage; return fieldRest; }) };
+}
+
+/**
+ * Prompt-facing view of compacted field observations: drops revision/simTimeS, since this is always embedded next
+ * to a sibling snapshot.revision/snapshot.simTimeS in this same brief. compactFields() itself is unchanged and
+ * keeps both (it is also returned standalone, as the self-contained observe_snapshot tool result).
+ */
+function promptFields(fields: Snapshot["fields"]) {
+  const { revision: _revision, simTimeS: _simTimeS, ...rest } = compactFields(fields);
+  void _revision;
+  void _simTimeS;
+  return rest;
+}
+
+/**
+ * Prompt-facing view of the economic summary: drops asOfSimTimeS and credits, since this is always embedded next
+ * to the same cycle's snapshot.simTimeS and snapshot.overview.finance.credits. buildEconomics()/EconomicSummary
+ * itself is unchanged (used only here, but keeping its full documented shape avoids coupling the economics module
+ * to this one call site).
+ */
+function promptEconomy(economics: EconomicSummary | null | undefined) {
+  if (!economics) return null;
+  const { asOfSimTimeS: _asOfSimTimeS, credits: _credits, ...rest } = economics;
+  void _asOfSimTimeS;
+  void _credits;
+  return rest;
+}
+
+/** Builds the structured per-cycle brief (before stringification). Exported so prompt-size instrumentation can
+ * measure each section's serialized size without duplicating the assembly logic or re-stringifying the whole brief. */
+export function buildBriefSections({ state, snapshot, events, progress, economics }: CycleBriefInput) {
   const { budgets, config } = state;
   const l = config.limits;
   const remaining = {
@@ -50,18 +92,22 @@ export function cycleBrief({ state, snapshot, events, progress, economics }: Cyc
     cyclesIncludingThis: Math.max(0, l.maxCycles - state.cycle + 1),
   };
   const recent = state.decisions.slice(-3).map((d) => ({ cycle: d.cycle, simTimeS: d.simTimeS, summary: d.summary, nextStep: d.plannedStep, accepted: d.actionsAccepted, advancedSeconds: d.advancedSeconds }));
-  const brief = {
+  return {
     objective: config.objective,
     mode: config.mutationsEnabled ? "mutations enabled on a dedicated test game" : "OBSERVE ONLY: state-changing tools are disabled",
     cycle: state.cycle,
     remainingBudgets: remaining,
     previousPlan: state.plan,
     recentDecisions: recent,
-    operationalRecord: progress,
-    economy: economics ?? null,
-    planning: buildPlanningContext(state, snapshot, events),
+    operationalRecord: promptOperationalRecord(progress),
+    economy: promptEconomy(economics),
+    planning: buildPlanningContext(state, snapshot, events, progress),
     eventsSinceLastCycle: events.map((e) => ({ id: e.eventId, simTimeS: e.simTimeS, kind: e.kind, actionId: e.actionId, summary: e.summary })),
-    snapshot: { revision: snapshot.revision, simTimeS: snapshot.simTimeS, overview: snapshot.overview, fields: compactFields(snapshot.fields), actions: terseCatalog(snapshot.actions) },
+    snapshot: { revision: snapshot.revision, simTimeS: snapshot.simTimeS, overview: snapshot.overview, fields: promptFields(snapshot.fields), actions: terseCatalog(snapshot.actions) },
   };
-  return `Decision cycle ${state.cycle}. Crop-option comparison and planning estimates are factual where labeled known; unknown values are not estimates. Select any action independently; no crop or action is preferred by the runtime. Work toward the objective with the evidence below, then give a short decision summary.\n${JSON.stringify(brief)}`;
+}
+
+export function cycleBrief(input: CycleBriefInput): string {
+  const brief = buildBriefSections(input);
+  return `Decision cycle ${input.state.cycle}. Crop-option comparison and planning estimates are factual where labeled known; unknown values are not estimates. Select any action independently; no crop or action is preferred by the runtime. Work toward the objective with the evidence below, then give a short decision summary.\n${JSON.stringify(brief)}`;
 }

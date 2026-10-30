@@ -92,7 +92,58 @@ validates every request.
 Real per-call input is still large (≈ 8.9k tokens/call in session `live-2`: 124,593 input tokens over
 14 calls) because the brief embeds the overview and field state and `observe_snapshot` repeats it.
 
-## Live results (real Meta API, real simulator, isolated PostgreSQL)
+## Token cost: per-cycle brief deduplication
+
+`observe_snapshot` does **not**, in fact, repeat an unchanged snapshot: it already returns a short
+`{unchanged: true}` marker when the revision/simTime match what the controller last delivered in the
+brief (`SnapshotProvider.delivered`, checked in `tools.ts`). The remaining per-call cost comes from
+**cross-section duplication inside a single cycle's own JSON brief**, not from history accumulating
+across cycles (each cycle starts a fresh two-message `[system, user]` array; see `controller.ts`/`runtime.ts`)
+and not from `observe_snapshot` repeating data the model already has.
+
+Removed, with before/after values coming from the SAME authorized snapshot already present elsewhere in
+the same brief (verified in `tests/autonomy/prompt.test.ts`):
+
+| Duplicate | Where it was repeated | Already available at |
+|---|---|---|
+| `resourceInventory`, `currentCashCredits`, `marketPricesPerKg`, `economicLedger`, `pendingOperations` | `planning` block | `snapshot.overview.{resources,finance}`, `economy`, `operationalRecord.pendingOperations` |
+| `knownCrop`/`knownGrowthStage` per field | `operationalRecord.fields[]` | `snapshot.fields.fields[]` |
+| `objective`, `simTimeS` | `operationalRecord` | top-level `objective`, `snapshot.simTimeS` |
+| `revision`, `simTimeS` | nested inside `snapshot.fields` (from `compactFields`) | sibling `snapshot.revision`/`snapshot.simTimeS` |
+| `asOfSimTimeS`, `credits` | `economy` | `snapshot.simTimeS`, `snapshot.overview.finance.credits` |
+| always-null agronomic fields, `asOf`, per-preview `note` | `planning.cropOptions` (auto-embedded copy only) | stated once in `cropOptions.unknowns`; full detail stays on the on-demand `compare_crop_options` tool, unaffected |
+| `source`/`note` prose, `durationEstimateSource`, a 2-sentence `uncertainty` block | `planning.genericCropWindow`/`knownCropCommitments` | the system prompt already states these are generic, non-crop-specific estimates |
+| double computation of `buildProgress()`/`buildEconomics()` | `buildPlanningContext()` internals | the controller already builds both once per cycle; `buildPlanningContext()` now accepts the precomputed `progress` |
+
+`buildCropEconomics()` itself (used by the `compare_crop_options` tool) and `compactFields()`/`terseCatalog()`
+(used standalone by `observe_snapshot`/`list_available_actions`) are **unchanged**; only the copies
+auto-embedded in the per-cycle brief were trimmed, via small wrapper functions (`compactCropOptions`,
+`promptOperationalRecord`, `promptFields`, `promptEconomy` in `prompt.ts`/`planning.ts`).
+
+**Prompt caching** (Meta Muse Spark 1.3): already active, not newly implemented. `MODEL_PRICING["muse-spark-1.3"]`
+prices `cachedInput` at 0.15 vs. 1.25 USD/1M tokens (an 88% discount) and `MetaModelProvider.complete()` already
+captures `usage.prompt_tokens_details.cached_tokens`; session `live-2` above already shows 20,435 cached tokens
+out of its real request. The byte-identical `AUTONOMOUS_SYSTEM_PROMPT` prefix is already served from cache after
+the first cycle — left unchanged, since no code change can improve on provider-side caching that is already active.
+
+**Instrumentation** (`promptMetrics.ts`): `measureCycleBrief()` reports a per-section character/estimated-token
+breakdown (clearly labeled `estimated`, chars/4 heuristic, never sent to the model) before each model call, and
+the controller logs real provider `usage` (input/output/cached tokens, cost, modelCalls/failedModelCalls/
+modelRetryAttempts) after it, both keyed by cycle number, so an estimated per-cycle prompt size can always be
+cross-checked against the real Meta-reported token count for that same cycle.
+
+**Benchmark** (`tests/autonomy/prompt.test.ts` + an ad-hoc fixture matching the real 4-field catalog size noted
+above — 4 fields × 6 action types = 24 actions, 3 planted fields, one pending planting): reconstructing the
+pre-dedup brief shape and comparing it to the current one on the identical fixture gives **13,916 → 10,568
+chars (≈3,479 → 2,642 estimated tokens, −24.1%)**. The largest remaining contributors are `snapshot.overview`
+(raw `FarmOverview`, left untouched — equipment/weather fields were judged higher-risk to compact without
+real-traffic evidence of which sub-fields are safe to drop) and `snapshot.fields`/`snapshot.actions`
+(already compacted elsewhere at −70%/−82%). This falls short of a 30% target; closing the remaining gap would
+require compacting `overview` itself (e.g. dropping `label` fields that are a pure reformatting of `id`) or
+shortening the static `cropOptions.unknowns` prose, both deferred pending confirmation that no decision context
+would be lost.
+
+
 
 Local simulator, isolated DB, Muse-mode game, rotated key, `muse-spark-1.3`.
 
