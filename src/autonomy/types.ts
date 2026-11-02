@@ -40,6 +40,11 @@ export const SessionLimits = z.strictObject({
   maxFarmSpendCredits: z.number().nonnegative().default(1_000),
   /** Largest single advance a supervised wait requests (simulated seconds; one simulated day is 60 s). */
   maxWaitChunkSeconds: z.number().positive().default(600),
+  /**
+   * Explicit opt-in to uncapped external model API spending. Only honoured for continuous sessions; defaults to false
+   * so every persisted (legacy) session keeps enforcing its maxCostUsd. maxCostPerRequestUsd always applies.
+   */
+  unlimitedSpending: z.boolean().default(false),
 });
 export type SessionLimits = z.infer<typeof SessionLimits>;
 
@@ -65,6 +70,7 @@ export const DEFAULT_SESSION_LIMITS: Readonly<SessionLimits> = {
   maxConflicts: 5,
   maxFarmSpendCredits: 1_000,
   maxWaitChunkSeconds: 600,
+  unlimitedSpending: false,
 };
 
 export const PLANNING_POLICY_VERSION = "phase5c-v1";

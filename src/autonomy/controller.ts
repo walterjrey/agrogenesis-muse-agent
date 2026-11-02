@@ -57,7 +57,7 @@ export function describeInactivity(state: SessionState): string {
 }
 
 /** Why no_progress fired: names what failed to advance over the stagnant cycles so the stop is actionable. */
-export function describeNoProgress(state: SessionState): string {
+export function describeNoProgress(state: SessionState, backoffSeconds?: number): string {
   const n = state.budgets.consecutiveNoProgress;
   const recent = state.decisions.slice(-n);
   const failedModel = recent.filter((d) => d.stopReason === "model_error" || d.stopReason === "empty_response").length;
@@ -69,6 +69,7 @@ export function describeNoProgress(state: SessionState): string {
     waited === 0 ? "no server time was granted (simulated time did not advance)" : null,
     "no action or inspection was accepted, no operation completed or failed, no new observation or field warning arrived, and the set of eligible actions did not change",
   ].filter((c) => c !== null);
+  if (backoffSeconds !== undefined) return `${n} consecutive cycles without progress: ${causes.join("; ")}. Autonomy stays enabled: waiting ${backoffSeconds}s and for the next simulation checkpoint before asking the model again; a new event, an accepted action or a change in eligible actions resets this.`;
   return `${n} consecutive cycles without progress: ${causes.join("; ")}. Continuing would spend model calls without changing the farm or the simulation clock; review the plan, then resume.`;
 }
 
@@ -142,7 +143,16 @@ const settledAdvance = (response: Awaited<ReturnType<SimulatorClient["advance"]>
 
 const isDefinitiveRefusal = (error: unknown): boolean => error instanceof SimulatorError && error.kind === "http" && (error.status ?? 0) >= 400 && (error.status ?? 0) < 500 && !isAuthFailure(error);
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-const remainingSimFor = (state: SessionState): number => Math.max(0, state.config.limits.maxSimSeconds - state.budgets.advancedSimSeconds);
+const remainingSimFor = (state: SessionState): number =>
+  state.config.autonomyMode === "continuous" ? Number.MAX_SAFE_INTEGER : Math.max(0, state.config.limits.maxSimSeconds - state.budgets.advancedSimSeconds);
+
+/** Continuous sessions have no lifetime quotas; waits are bounded per call, not per lifetime. */
+const advanceRequestsLeftFor = (state: SessionState): number => {
+  const { limits: l } = state.config;
+  const b = state.budgets;
+  if (state.config.autonomyMode === "continuous") return Math.max(0, l.maxAdvanceRequests);
+  return Math.max(0, l.maxAdvanceRequests - b.advanceRequests);
+};
 
 export class AutonomousController {
   private lock!: SessionLease;
@@ -207,7 +217,7 @@ export class AutonomousController {
     else if (status === "failed") this.setLifecycle("failed");
     else if (reason === "waiting_for_simulation") this.setLifecycle("waiting_for_simulation");
     else if (this.isBudgetReason(reason)) this.setLifecycle("awaiting_budget");
-    else if (reason === "consecutive_errors" || reason === "controller_error" || reason === "no_progress" || reason === "simulation_wait_interrupted") this.setLifecycle("recovering");
+    else if (reason === "consecutive_errors" || reason === "controller_error" || reason === "no_progress" || reason === "repeated_rejections" || reason === "simulation_wait_interrupted") this.setLifecycle("recovering");
     else if (reason === "authentication_failure" || reason === "inconsistent_observation" || reason === "recovery_attempts_exhausted") this.setLifecycle("failed");
     else if (reason === "paused_by_operator" || reason === "cancelled_by_operator") this.setLifecycle("paused_by_user");
     else if (reason === "slice_complete" || reason === "allocation_complete") this.setLifecycle("running");
@@ -215,6 +225,37 @@ export class AutonomousController {
     this.log(`session ${status}: ${reason}${detail ? ` (${detail})` : ""}`);
     await this.save();
     return this.state;
+  }
+
+  /** Continuous sessions answer a zero-time-advance loop with bounded, backed-off recovery slices, then an actionable failure. */
+  private async zeroTimeRecovery(detail: string): Promise<SessionState> {
+    const s = this.state;
+    s.budgets.consecutiveAdvances = 0;
+    s.recoveryAttempts += 1;
+    s.retryAfter = new Date(Date.now() + Math.min(60_000, 5_000 * 2 ** (s.recoveryAttempts - 1))).toISOString();
+    if (s.recoveryAttempts >= 3) return this.end("failed", "recovery_attempts_exhausted", `${detail} Automatic recovery stopped after three backed-off retries.`);
+    return this.end("paused", "consecutive_errors", detail);
+  }
+
+  /**
+   * Continuous sessions never stop for a lack of mutations. Ineffective decisions are answered with an exponentially
+   * backed-off real-time delay (honored by the worker claim query, so no tight loop and no model call during it) and,
+   * when the farm allows it, a server-authoritative simulation checkpoint to wait for a meaningful change. Progress,
+   * a new event, or a change in eligible actions resets the streak.
+   */
+  private async noProgressBackoff(): Promise<SessionState> {
+    const s = this.state;
+    const over = Math.max(0, s.budgets.consecutiveNoProgress - s.config.limits.maxConsecutiveNoProgress);
+    const delaySeconds = Math.min(600, 10 * 2 ** Math.min(over, 6));
+    s.retryAfter = new Date(Date.now() + delaySeconds * 1000).toISOString();
+    const inFlight = s.actions.some((a) => !TERMINAL_ACTION_STATUSES.has(a.status));
+    const detail = `${describeNoProgress(s, delaySeconds)}`;
+    if (this.mutationsEnabled && !inFlight && s.lastSimTimeS !== null) {
+      s.waitingUntilSimTimeS = s.lastSimTimeS + s.config.limits.maxWaitChunkSeconds;
+      await this.save();
+      return this.end("paused", "waiting_for_simulation", detail);
+    }
+    return this.end("paused", "slice_complete", detail);
   }
 
   private isBudgetReason(reason: string): boolean {
@@ -331,13 +372,22 @@ export class AutonomousController {
     const { budgets: b, config, cycle } = this.state;
     const l = config.limits;
     const wall = this.wallBase + (Date.now() - this.startedAt);
+    if (config.autonomyMode === "continuous") {
+      // Continuous autonomy has no lifetime execution quotas (cycles, model/tool/advance calls, worker time,
+      // mutations, inspections, simulated time, cumulative farm spending): those counters are observability only.
+      // The in-game economy itself (cash, costs, inventory) is validated by the server per transaction. Only the
+      // optional, explicit API spending cap, conflicts and the zero-time-advance loop guard end a slice.
+      if (!forWait && !l.unlimitedSpending && b.costUsd >= l.maxCostUsd) return { reason: "cost_budget_exhausted", detail: `$${b.costUsd.toFixed(4)} of $${l.maxCostUsd}` };
+      if (b.conflicts >= l.maxConflicts) return { reason: "database_conflict_limit", detail: `${b.conflicts}/${l.maxConflicts} stale-revision conflicts` };
+      if (this.mutationsEnabled && b.consecutiveAdvances >= l.maxConsecutiveAdvances) return { reason: "zero_time_advance_limit", detail: `${b.consecutiveAdvances} consecutive advance requests granted no simulation time.` };
+      return null;
+    }
     if (!forWait && b.costUsd >= l.maxCostUsd) return { reason: "cost_budget_exhausted", detail: `$${b.costUsd.toFixed(4)} of $${l.maxCostUsd}` };
     const logicalModelCalls = b.modelCalls + b.failedModelCalls;
     if (!forWait && logicalModelCalls >= l.maxModelCalls) return { reason: "model_call_budget_exhausted", detail: `${logicalModelCalls}/${l.maxModelCalls} logical calls (successful or failed)` };
     if (!forWait && b.toolCalls >= l.maxToolCalls) return { reason: "tool_call_budget_exhausted", detail: `${b.toolCalls}/${l.maxToolCalls}` };
     if (wall >= l.maxWallClockMs) return { reason: "wall_clock_exhausted", detail: `${Math.round(wall / 1000)}s of ${Math.round(l.maxWallClockMs / 1000)}s` };
-    if (!forWait && config.autonomyMode === "continuous" && this.state.allocationCycles >= l.maxCycles) return { reason: "allocation_complete", detail: `${this.state.allocationCycles}/${l.maxCycles} decision cycles in this authorized allocation` };
-    if (!forWait && config.autonomyMode === "legacy" && cycle >= l.maxCycles) return { reason: "cycle_budget_exhausted", detail: `${cycle}/${l.maxCycles}` };
+    if (!forWait && cycle >= l.maxCycles) return { reason: "cycle_budget_exhausted", detail: `${cycle}/${l.maxCycles}` };
     if (b.conflicts >= l.maxConflicts) return { reason: "database_conflict_limit", detail: `${b.conflicts}/${l.maxConflicts} stale-revision conflicts` };
     if (this.mutationsEnabled) {
       if (b.advancedSimSeconds >= l.maxSimSeconds) return { reason: "sim_time_limit_reached", detail: `${b.advancedSimSeconds}/${l.maxSimSeconds} s` };
@@ -462,7 +512,7 @@ export class AutonomousController {
         retryDelayMs: this.options.retryDelayMs ?? 400,
         maxMutationRetries: 2,
         budget: {
-          requestsLeft: Math.max(0, l.maxAdvanceRequests - b.advanceRequests),
+          requestsLeft: advanceRequestsLeftFor(s),
           simSecondsLeft: remainingSimFor(s),
           maxChunkSeconds: l.maxWaitChunkSeconds,
           maxCallSeconds: l.maxAdvanceSecondsPerCall,
@@ -472,7 +522,7 @@ export class AutonomousController {
         setCursor: (cursor) => { s.modelEventCursor = Math.max(s.modelEventCursor, cursor); },
         onAdvanced: () => undefined,
         shouldStop: () => {
-          if (this.wallBase + (Date.now() - this.startedAt) >= l.maxWallClockMs) return "wall clock budget";
+          if (s.config.autonomyMode !== "continuous" && this.wallBase + (Date.now() - this.startedAt) >= l.maxWallClockMs) return "wall clock budget";
           if (this.farmSpendExceeded()) return "farm spending limit";
           return null;
         },
@@ -481,7 +531,8 @@ export class AutonomousController {
       { maxSeconds: requested, checkpointSeconds: Math.min(l.maxWaitChunkSeconds, l.maxAdvanceSecondsPerCall, requested) },
     );
     if (result.simTimeEndS !== null) s.lastSimTimeS = result.simTimeEndS;
-    if (result.advancedSeconds > 0) s.budgets.consecutiveNoProgress = 0;
+    // Continuous sessions keep the ineffective-decision streak across supervised waits so its backoff keeps escalating.
+    if (result.advancedSeconds > 0 && s.config.autonomyMode !== "continuous") s.budgets.consecutiveNoProgress = 0;
     s.waits.push({ cycle: s.cycle, actionId: "planned-review", trigger: "controller", outcome: result.outcome, actionStatus: null, advanceRequests: result.advanceRequests, advancedSeconds: result.advancedSeconds, simTimeStartS: result.simTimeStartS, simTimeEndS: result.simTimeEndS, events: result.events, detail: result.detail });
     await this.save();
 
@@ -545,8 +596,8 @@ export class AutonomousController {
         retryDelayMs: this.options.retryDelayMs ?? 400,
         maxMutationRetries: 2,
         budget: {
-          requestsLeft: Math.max(0, Math.min(l.maxAdvanceRequests - b.advanceRequests, l.maxConsecutiveAdvances - b.consecutiveAdvances)),
-          simSecondsLeft: Math.max(0, l.maxSimSeconds - b.advancedSimSeconds),
+          requestsLeft: s.config.autonomyMode === "continuous" ? advanceRequestsLeftFor(s) : Math.max(0, Math.min(l.maxAdvanceRequests - b.advanceRequests, l.maxConsecutiveAdvances - b.consecutiveAdvances)),
+          simSecondsLeft: remainingSimFor(s),
           maxChunkSeconds: l.maxWaitChunkSeconds,
           maxCallSeconds: l.maxAdvanceSecondsPerCall,
           conflictsLeft: Math.max(0, l.maxConflicts - b.conflicts),
@@ -556,7 +607,7 @@ export class AutonomousController {
           s.modelEventCursor = Math.max(s.modelEventCursor, cursor);
         },
         onAdvanced: () => undefined,
-        shouldStop: () => (this.wallBase + (Date.now() - this.startedAt) >= l.maxWallClockMs ? "wall clock budget" : this.farmSpendExceeded() ? "farm spending limit" : null),
+        shouldStop: () => (s.config.autonomyMode !== "continuous" && this.wallBase + (Date.now() - this.startedAt) >= l.maxWallClockMs ? "wall clock budget" : this.farmSpendExceeded() ? "farm spending limit" : null),
         record: (event, data) => this.log(`${event} ${JSON.stringify(data).slice(0, 160)}`),
       },
       { actionId: target.actionId },
@@ -567,6 +618,8 @@ export class AutonomousController {
   }
 
   private farmSpendExceeded(): boolean {
+    // Cumulative farm spending is only a quota for legacy sessions; continuous sessions rely on server-side affordability checks.
+    if (this.state.config.autonomyMode === "continuous") return false;
     const spent = this.farmSpend();
     return spent !== null && spent >= this.state.config.limits.maxFarmSpendCredits;
   }
@@ -635,6 +688,7 @@ export class AutonomousController {
       }
       const stop = this.budgetStop();
       if (stop) {
+        if (stop.reason === "zero_time_advance_limit" && s.config.autonomyMode === "continuous") return await this.zeroTimeRecovery(stop.detail);
         if (stop.reason === "allocation_complete") return await this.end("paused", "allocation_complete", stop.detail);
         return await this.end(this.isBudgetReason(stop.reason) ? "paused" : "stopped", stop.reason, stop.detail);
       }
@@ -684,17 +738,21 @@ export class AutonomousController {
 
         const l = s.config.limits;
         const b = s.budgets;
-        const remainingMutations = this.mutationsEnabled ? Math.max(0, l.maxMutations - b.acceptedMutations) : 0;
-        const remainingInspections = this.mutationsEnabled ? Math.max(0, l.maxInspections - b.acceptedInspections) : 0;
-        const remainingSim = Math.max(0, l.maxSimSeconds - b.advancedSimSeconds);
-        const deadlineMs = this.startedAt + (l.maxWallClockMs - this.wallBase);
+        const cont = s.config.autonomyMode === "continuous";
+        // Continuous sessions bound each cycle (not the session's lifetime); cumulative counters are observability only.
+        const perCycleActions = l.maxToolCallsPerCycle;
+        const remainingMutations = this.mutationsEnabled ? (cont ? perCycleActions : Math.max(0, l.maxMutations - b.acceptedMutations)) : 0;
+        const remainingInspections = this.mutationsEnabled ? (cont ? perCycleActions : Math.max(0, l.maxInspections - b.acceptedInspections)) : 0;
+        const remainingSim = cont ? l.maxAdvanceSecondsPerCall * l.maxToolCallsPerCycle : Math.max(0, l.maxSimSeconds - b.advancedSimSeconds);
+        const deadlineMs = cont ? Date.now() + l.maxWallClockMs : this.startedAt + (l.maxWallClockMs - this.wallBase);
+        const costLeftUsd = cont && l.unlimitedSpending ? Number.MAX_SAFE_INTEGER : Math.max(0, l.maxCostUsd - b.costUsd);
         const tools = createAutonomousTools(this.provider, sink, this.mutationsEnabled ? {
           maxChunkSeconds: l.maxWaitChunkSeconds,
           conflictsLeft: () => Math.max(0, l.maxConflicts - s.budgets.conflicts),
           onConflict: () => undefined,
           finished: (wait) => this.recordWait(wait, "model_tool"),
           finishedInterval: (r) => this.recordInterval(r),
-          intervalRequestsLeft: () => Math.max(0, l.maxAdvanceRequests - s.budgets.advanceRequests),
+          intervalRequestsLeft: () => advanceRequestsLeftFor(s),
         } : undefined, { state: s, recentEvents: events });
 
         // The brief carries this exact snapshot, so observe_snapshot must not resend it until something changes.
@@ -722,16 +780,16 @@ export class AutonomousController {
           retryDelayMs: this.options.retryDelayMs ?? 400,
           ...(this.options.newMutationId ? { newMutationId: this.options.newMutationId } : {}),
           limits: {
-            maxModelCalls: Math.max(1, Math.min(l.maxModelCallsPerCycle, l.maxModelCalls - b.modelCalls - b.failedModelCalls)),
-            maxTotalToolCalls: Math.max(1, Math.min(l.maxToolCallsPerCycle, l.maxToolCalls - b.toolCalls)),
+            maxModelCalls: cont ? l.maxModelCallsPerCycle : Math.max(1, Math.min(l.maxModelCallsPerCycle, l.maxModelCalls - b.modelCalls - b.failedModelCalls)),
+            maxTotalToolCalls: cont ? l.maxToolCallsPerCycle : Math.max(1, Math.min(l.maxToolCallsPerCycle, l.maxToolCalls - b.toolCalls)),
             maxToolCallsPerStep: 4,
             maxOutputTokens: l.maxOutputTokens,
             maxCostPerRequestUsd: l.maxCostPerRequestUsd,
-            maxCostUsd: Math.max(0, l.maxCostUsd - b.costUsd),
+            maxCostUsd: costLeftUsd,
             maxAdvanceSecondsPerCall: Math.min(l.maxAdvanceSecondsPerCall, remainingSim),
             maxTotalAdvanceSeconds: remainingSim,
             maxMutations: remainingMutations,
-            maxAdvanceRequests: Math.max(0, Math.min(l.maxAdvanceRequests - b.advanceRequests, l.maxConsecutiveAdvances - b.consecutiveAdvances)),
+            maxAdvanceRequests: cont ? Math.max(0, Math.min(perCycleActions, l.maxConsecutiveAdvances - b.consecutiveAdvances)) : Math.max(0, Math.min(l.maxAdvanceRequests - b.advanceRequests, l.maxConsecutiveAdvances - b.consecutiveAdvances)),
             maxWaitChunkSeconds: l.maxWaitChunkSeconds,
             maxMutationAttempts: remainingMutations + Math.max(0, l.maxConsecutiveRejections - b.consecutiveRejections),
             maxInspections: remainingInspections,
@@ -798,7 +856,7 @@ export class AutonomousController {
 
       const hadUnknown = s.pendingMutation !== null;
       b.consecutiveErrors = failedRun || hadUnknown ? b.consecutiveErrors + 1 : 0;
-      if (!failedRun && !hadUnknown) {
+      if (!failedRun && !hadUnknown && b.consecutiveAdvances === 0 && b.consecutiveRejections === 0) {
         s.recoveryAttempts = 0;
         s.retryAfter = null;
       }
@@ -807,7 +865,10 @@ export class AutonomousController {
 
       if (result.error && /HTTP (401|403)/.test(result.error)) return this.end("paused", "authentication_failure", "The model API rejected the credentials (401/403).");
       if (s.pendingMutation) continue; // reconcile first; never act on top of an unknown outcome
-      if (result.stopReason === "wall_clock_limit") return this.end("paused", "wall_clock_exhausted", "The authorized cumulative wall-clock budget is exhausted; explicitly authorize more time to continue.");
+      if (result.stopReason === "wall_clock_limit") {
+        if (s.config.autonomyMode === "continuous") return this.end("paused", "slice_complete", "The per-cycle time bound was reached; the next slice continues the same session.");
+        return this.end("paused", "wall_clock_exhausted", "The authorized cumulative wall-clock budget is exhausted; explicitly authorize more time to continue.");
+      }
       if (sink.latest?.nextStep === "stop") return this.end("completed", "model_declared_done", sink.latest.stopReason);
       // A cycle whose model request failed produced no observation; it must not read as a finished observe-only session.
       if (!this.mutationsEnabled && (result.stopReason === "model_error" || result.stopReason === "empty_response")) return this.end("failed", "model_error", result.error ? result.error.slice(0, 300) : `The model produced no decision (${result.stopReason}).`);
@@ -819,8 +880,15 @@ export class AutonomousController {
         if (s.recoveryAttempts >= 3) return this.end("failed", "recovery_attempts_exhausted", modelFailure && result.error ? result.error.slice(0, 300) : "Automatic recovery stopped after three bounded retry slices.");
         return this.end("paused", "consecutive_errors", modelFailure && result.error ? result.error.slice(0, 300) : undefined);
       }
-      if (b.consecutiveRejections >= s.config.limits.maxConsecutiveRejections) return this.end("stopped", "repeated_rejections");
-      if (b.consecutiveNoProgress >= s.config.limits.maxConsecutiveNoProgress) return this.end(s.config.autonomyMode === "continuous" ? "paused" : "stopped", "no_progress", describeNoProgress(s));
+      if (b.consecutiveRejections >= s.config.limits.maxConsecutiveRejections) {
+        if (s.config.autonomyMode !== "continuous") return this.end("stopped", "repeated_rejections");
+        // Domain rejections (unaffordable, unavailable, unmet preconditions) are ordinary agricultural feedback, not
+        // technical failures: they never consume recoveryAttempts and can never end the session. The model sees each
+        // structured rejection and re-observes; the rejection-only cycles make no progress, so the no-progress backoff
+        // below paces further model calls. Infrastructure failures use the separate bounded-recovery path above.
+        b.consecutiveRejections = 0;
+      }
+      if (s.config.autonomyMode !== "continuous" && b.consecutiveNoProgress >= s.config.limits.maxConsecutiveNoProgress) return this.end("stopped", "no_progress", describeNoProgress(s));
       if (
         s.config.autonomyMode === "continuous" &&
         this.mutationsEnabled &&
@@ -832,12 +900,16 @@ export class AutonomousController {
       ) {
         s.waitingUntilSimTimeS = Math.min(s.plan.nextReviewSimSeconds, s.lastSimTimeS + remainingSimFor(s));
         if (s.waitingUntilSimTimeS > s.lastSimTimeS) {
+          // A deliberate, plan-justified wait is the intended decision cadence, not an ineffective decision.
+          b.consecutiveNoProgress = 0;
           await this.save();
           return this.end("paused", "waiting_for_simulation", "The next review is scheduled at the planned simulation checkpoint; no model calls are made before then unless a material event interrupts it.");
         }
       }
+      if (s.config.autonomyMode === "continuous" && b.consecutiveNoProgress >= s.config.limits.maxConsecutiveNoProgress) return this.noProgressBackoff();
       const budget = this.budgetStop();
       if (budget) {
+        if (budget.reason === "zero_time_advance_limit" && s.config.autonomyMode === "continuous") return this.zeroTimeRecovery(budget.detail);
         if (budget.reason === "allocation_complete") return this.end("paused", "allocation_complete", budget.detail);
         return this.end(this.isBudgetReason(budget.reason) ? "paused" : "stopped", budget.reason, budget.detail);
       }

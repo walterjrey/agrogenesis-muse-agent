@@ -85,9 +85,10 @@ export async function runWorkerOnce(options: WorkerOptions): Promise<number> {
         stopReason === "slice_complete" ||
         stopReason === "allocation_complete" ||
         stopReason === "waiting_for_simulation" ||
-        stopReason === "consecutive_errors"
+        stopReason === "consecutive_errors" ||
+        stopReason === "repeated_rejections"
       );
-      const recovering = stopReason === "consecutive_errors";
+      const recovering = stopReason === "consecutive_errors" || stopReason === "repeated_rejections";
       const cause = `${status}: ${stopReason ?? "unknown"}${stopDetail ? ` — ${stopDetail}` : ""}`;
       await backend.settleControl(sessionId, { stopRunning: !resumable, lastError: recovering ? truncate(cause) : resumable || status === "completed" ? null : truncate(cause) });
       emit({ type: "slice_finished", sessionId, status, stopReason, finished: result.finished });

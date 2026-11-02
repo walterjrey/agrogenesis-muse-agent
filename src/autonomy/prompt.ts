@@ -81,16 +81,31 @@ function promptEconomy(economics: EconomicSummary | null | undefined) {
 export function buildBriefSections({ state, snapshot, events, progress, economics }: CycleBriefInput) {
   const { budgets, config } = state;
   const l = config.limits;
-  const remaining = {
-    costUsd: round(Math.max(0, l.maxCostUsd - budgets.costUsd)),
+  const continuous = config.autonomyMode === "continuous";
+  // Continuous sessions have no lifetime quotas: show per-cycle allowances and (only when explicit) the spending cap.
+  const remaining = continuous
+    ? {
+        costUsd: l.unlimitedSpending ? null : round(Math.max(0, l.maxCostUsd - budgets.costUsd)),
+        modelCalls: l.maxModelCallsPerCycle,
+        toolCalls: l.maxToolCallsPerCycle,
+        advanceRequests: config.mutationsEnabled ? Math.max(0, Math.min(l.maxToolCallsPerCycle, l.maxConsecutiveAdvances - budgets.consecutiveAdvances)) : 0,
+        // No cumulative farm-spending quota: affordability is the economy's own cash check.
+        farmSpendCredits: null as number | null,
+        mutations: config.mutationsEnabled ? l.maxToolCallsPerCycle : 0,
+        inspections: config.mutationsEnabled ? l.maxToolCallsPerCycle : 0,
+        simSeconds: config.mutationsEnabled ? l.maxAdvanceSecondsPerCall * l.maxToolCallsPerCycle : 0,
+        cyclesIncludingThis: null as number | null,
+      }
+    : {
+    costUsd: round(Math.max(0, l.maxCostUsd - budgets.costUsd)) as number | null,
     modelCalls: Math.max(0, l.maxModelCalls - budgets.modelCalls - budgets.failedModelCalls),
     toolCalls: Math.max(0, l.maxToolCalls - budgets.toolCalls),
     advanceRequests: config.mutationsEnabled ? Math.max(0, Math.min(l.maxAdvanceRequests - budgets.advanceRequests, l.maxConsecutiveAdvances - budgets.consecutiveAdvances)) : 0,
-    farmSpendCredits: config.mutationsEnabled ? l.maxFarmSpendCredits : 0,
+    farmSpendCredits: (config.mutationsEnabled ? l.maxFarmSpendCredits : 0) as number | null,
     mutations: config.mutationsEnabled ? Math.max(0, l.maxMutations - budgets.acceptedMutations) : 0,
     inspections: config.mutationsEnabled ? Math.max(0, l.maxInspections - budgets.acceptedInspections) : 0,
     simSeconds: config.mutationsEnabled ? Math.max(0, l.maxSimSeconds - budgets.advancedSimSeconds) : 0,
-    cyclesIncludingThis: Math.max(0, l.maxCycles - (state.config.autonomyMode === "continuous" ? state.allocationCycles : state.cycle) + 1),
+    cyclesIncludingThis: Math.max(0, l.maxCycles - state.cycle + 1) as number | null,
   };
   const recent = state.decisions.slice(-3).map((d) => ({ cycle: d.cycle, simTimeS: d.simTimeS, summary: d.summary, nextStep: d.plannedStep, accepted: d.actionsAccepted, advancedSeconds: d.advancedSeconds }));
   return {

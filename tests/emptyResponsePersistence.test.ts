@@ -160,7 +160,7 @@ describe("MOCKED worker: unusable responses persist across slices, pause, resume
 
     await runWorkerOnce({ deps, sliceCycles: 1, mutationsAllowed: true });
     const first = await backend.load("allocation-handoff");
-    expect(first).toMatchObject({ cycle: 1, allocationCycles: 1, status: "paused", stopReason: "allocation_complete" });
+    expect(first).toMatchObject({ cycle: 1, allocationCycles: 1, status: "paused", stopReason: "slice_complete" });
     expect((await backend.getControl("allocation-handoff"))?.control).toBe("run");
 
     await backend.requestControl("allocation-handoff", "pause");
@@ -170,7 +170,7 @@ describe("MOCKED worker: unusable responses persist across slices, pause, resume
     await runWorkerOnce({ deps, sliceCycles: 1, mutationsAllowed: true });
 
     const resumed = await backend.load("allocation-handoff");
-    expect(resumed).toMatchObject({ cycle: 2, allocationCycles: 1, status: "completed", budgets: { modelCalls: 4 } });
+    expect(resumed).toMatchObject({ cycle: 2, allocationCycles: 2, status: "completed", budgets: { modelCalls: 4 } });
     expect(model.requests).toHaveLength(4);
   });
 

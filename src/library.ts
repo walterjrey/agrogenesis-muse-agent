@@ -113,7 +113,7 @@ function modelProvider(deps: AgentDependencies, limits: SessionLimits, alreadySp
     reasoningEffort: model.reasoningEffort ?? DEFAULT_REASONING_EFFORT,
     spendGuard: new SpendGuard({
       maxCostPerRequestUsd: Math.min(perRequest, limits.maxCostPerRequestUsd),
-      maxSessionCostUsd: Math.min(session, Math.max(0.0001, limits.maxCostUsd - alreadySpentUsd)),
+      maxSessionCostUsd: limits.unlimitedSpending ? Number.MAX_SAFE_INTEGER : Math.min(session, Math.max(0.0001, limits.maxCostUsd - alreadySpentUsd)),
     }),
     ...(deps.logger ? { logger: deps.logger } : {}),
   });
@@ -138,10 +138,11 @@ async function assertAuthorized(client: SimulatorClient, gameId: string, mutatio
 export function buildSessionRecord(options: StartSessionOptions, modelId: string): SessionState {
   const mutations = options.mutationsEnabled === true;
   if (!options.gameId.trim()) throw new Error("gameId is required.");
-  if (mutations) {
+  if (mutations && options.autonomyMode !== "continuous") {
     for (const field of REQUIRED_MUTATION_BUDGETS) if (options.limits?.[field] === undefined) throw new Error(`Mutations require an explicit budget: limits.${field}.`);
     if ((options.limits?.maxMutations ?? 0) < 1) throw new Error("limits.maxMutations must be at least 1 when mutations are enabled.");
   }
+  if (options.limits?.unlimitedSpending && options.autonomyMode !== "continuous") throw new Error("limits.unlimitedSpending is only available to continuous sessions.");
   if (options.planningHorizonDays !== undefined && !(options.planningHorizonDays > 0)) throw new Error("planningHorizonDays must be greater than 0.");
   const limits: SessionLimits = { ...DEFAULT_SESSION_LIMITS, ...options.limits };
   return newSessionState({

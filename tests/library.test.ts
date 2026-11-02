@@ -47,6 +47,15 @@ describe("MOCKED library: startSession", () => {
     await expect(startSession(readOnly.d, { gameId: GAME_ID })).resolves.toMatchObject({ config: { mutationsEnabled: false } });
   });
 
+  it("allows unlimited API spending only for continuous sessions that opt in, never by default", async () => {
+    const { d } = await deps("muse_ai", SCOPES);
+    await expect(startSession(d, { gameId: GAME_ID, mutationsEnabled: true, limits: { ...LIMITS, unlimitedSpending: true } })).rejects.toThrow(/only available to continuous/);
+    const implicit = await startSession(d, { gameId: GAME_ID, sessionId: "c1", mutationsEnabled: true, autonomyMode: "continuous" });
+    expect(implicit.config.limits.unlimitedSpending).toBe(false);
+    const explicit = await startSession(d, { gameId: GAME_ID, sessionId: "c2", mutationsEnabled: true, autonomyMode: "continuous", limits: { unlimitedSpending: true } });
+    expect(explicit.config.limits.unlimitedSpending).toBe(true);
+  });
+
   it("refuses to create the same session twice", async () => {
     const { d } = await deps();
     await startSession(d, { gameId: GAME_ID, sessionId: "dup" });

@@ -46,7 +46,7 @@ export function buildProgress(state: SessionState): ProgressRecord {
   for (const a of done.slice(-MAX_COMPLETED)) if (a.status === "failed" || a.status === "rejected") blockers.push(`${a.type} ${a.actionId} ${a.status}${a.failure ? `: ${a.failure}` : ""}`);
   const l = config.limits;
   if (budgets.consecutiveRejections > 0) blockers.push(`${budgets.consecutiveRejections} consecutive rejected action(s)`);
-  if (config.mutationsEnabled) {
+  if (config.mutationsEnabled && config.autonomyMode !== "continuous") {
     if (budgets.acceptedMutations >= l.maxMutations) blockers.push("mutation budget exhausted");
     if (budgets.advancedSimSeconds >= l.maxSimSeconds) blockers.push("simulated-time budget exhausted");
   }
