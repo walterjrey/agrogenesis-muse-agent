@@ -78,6 +78,11 @@ export interface SupervisorDeps {
   onConflict?(): void;
   /** Returns a reason when the wait must stop immediately (wall clock, budgets owned by the caller). */
   shouldStop?(): string | null;
+  /**
+   * Called after each applied checkpoint that raised no decision event. Returns a reason to hand control to the model
+   * (for example a persistent Level-1 alert); it must be cheap, read-only and must never call the model.
+   */
+  checkpointReview?(): Promise<string | null>;
   record?(event: string, data: Record<string, unknown>): void;
 }
 
@@ -302,5 +307,10 @@ export async function superviseInterval(deps: SupervisorDeps, params: { maxSecon
     }
     // Granted less than asked without an event means the server limit was reached; do not spin on it.
     if (step.response.grantedSeconds < requested - TICK_SECONDS / 2 && step.response.stoppedBecause === "granted_limit_reached") return finish("wait_limit", "server granted less than requested");
+    const review = await deps.checkpointReview?.().catch(() => null);
+    if (review) {
+      interrupt = review;
+      return finish("event_interrupt");
+    }
   }
 }

@@ -157,14 +157,14 @@ describe("MOCKED autonomy: single session owner", () => {
 describe("MOCKED autonomy: consistent observations", () => {
   it("detects a mixed-revision read, discards it and retries until the parts agree", async () => {
     let fieldReads = 0;
-    sim = await fakeSimulator((req) => (req.url.endsWith("/fields") && ++fieldReads === 1 ? { status: 200, body: { ...fieldObservations, revision: 9 } } : undefined));
+    sim = await fakeSimulator((req) => (/\/fields(\?|$)/.test(req.url) && ++fieldReads === 1 ? { status: 200, body: { ...fieldObservations, revision: 9 } } : undefined));
     const snapshot = await collectSnapshot(sim.client, GAME_ID, { retryDelayMs: 1 });
     expect(snapshot).toMatchObject({ revision: 4, rounds: 2, mixedRevisionsDetected: 1 });
     expect(snapshot.fields.revision).toBe(snapshot.overview.revision);
   });
 
   it("reports uncertainty instead of merging when no consistent snapshot can be read, and pauses without asking the model", async () => {
-    sim = await fakeSimulator((req) => (req.url.endsWith("/fields") ? { status: 200, body: { ...fieldObservations, revision: 9 } } : undefined));
+    sim = await fakeSimulator((req) => (/\/fields(\?|$)/.test(req.url) ? { status: 200, body: { ...fieldObservations, revision: 9 } } : undefined));
     await expect(collectSnapshot(sim.client, GAME_ID, { retryDelayMs: 1 })).rejects.toBeInstanceOf(InconsistentObservationError);
     const { store } = setup();
     const model = scriptedModel([TEXT]);
@@ -193,7 +193,7 @@ describe("MOCKED autonomy: consistent observations", () => {
     const model = scriptedModel([{ calls: [{ name: "observe_snapshot" }, { name: "observe_snapshot" }] }, PLAN("stop"), TEXT]);
     const final = await controller(store, sim, model).run();
     expect(final.metrics.snapshotCacheHits).toBeGreaterThanOrEqual(2);
-    const fieldReads = sim.server.requests.filter((r) => r.url.endsWith("/fields")).length;
+    const fieldReads = sim.server.requests.filter((r) => /\/fields(\?|$)/.test(r.url)).length;
     expect(fieldReads).toBe(final.metrics.snapshotRefreshes);
   });
 });

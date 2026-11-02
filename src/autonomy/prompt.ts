@@ -5,6 +5,7 @@ import type { EconomicSummary } from "./economics.js";
 import type { ProgressRecord, SessionState } from "./types.js";
 import type { GameEvent } from "../contracts/time.js";
 import { buildPlanningContext } from "./planning.js";
+import { attentionQueue } from "./riskLedger.js";
 
 export const DEFAULT_OBJECTIVE =
   "Maximize long-term farm viability and profitability while respecting water, money, equipment, crop cycles and uncertainty.";
@@ -13,6 +14,8 @@ export const AUTONOMOUS_SYSTEM_PROMPT = `You manage a simulated farm (AgroGenesi
 
 Information:
 - You see only what farm management has observed. Each measurement carries value, uncertainty, age, freshness and confidence. Missing, stale or expired quantities are unknown: say so, do not assume them. Measurements expire within a few simulated days, so a long wait leaves planted crops unobserved and any earlier reading says nothing about their present state. A field's warn entry (category, level, since) is a coarse warning that conditions there may be worsening; it carries no measurements. It is not an instruction: weigh an inspection, the cost and expected effect of an intervention, or waiting, and state your reason for whichever you choose. Do not repeat an inspection without a reason.
+- Field warnings and follow-up: attentionQueue (when present) ranks fields by need: untreated persistent warnings first, then treated fields whose outcome has not been checked. Its alert entry is the simulator's CURRENT status; lastKnown values are old authorized readings (see daysAgo, sensor, trend), not the present state. A completed treatment is not proof the outbreak is over: check the outcome with a fresh observation before deciding anything else, and do not repeat a treatment without new evidence, cost and affordability reasoning. Irreversible damage already done does not heal when a warning clears. Spread attention across fields; do not keep inspecting the one you looked at last while others deteriorate.
+- Robots (listed in overview.equipment with battery and status; discover ids there) are optional observation tools, never required. Scout drone: surveyField(robotId, fieldId) senses crop health and vegetation coverage over a field from the air (noisy, lower confidence, weather limited, cannot measure pest pressure, soil moisture or fertility); good for comparing several fields; it can also run inspectLocation(robotId, x, z) with the same visual sensor, and in strong wind or rain its missions are held and may fail without data. Ground rover: inspectPestPressure(robotId, x, z) reads pest pressure and crop health, sampleSoil(robotId, x, z) reads soil moisture and fertility, inspectLocation for general readings; each covers only a small patch around the point (the measurement's cov is below 1), is slow, and fits localized follow-up (e.g. checking a treated area; field centres and sizes are in fields[].geo as x,z,w,d metres). inspectField costs credits and returns whole-field readings quickly. Robot missions cost battery and time instead of credits, run asynchronously and deliver observations after a downlink delay; call describe_action for duration and energy and compare coverage, delay, cost and availability. Robot readings arrive only as normal authorized measurements (sensor field); a failed or not-yet-delivered mission gives no data.
 - Each cycle starts with a CONSISTENT snapshot (one game revision and simulated instant). After any change (your action, advancing time) it is stale; call observe_snapshot again before the next mutation. Never combine numbers from different revisions.
 - The action catalog lists eligible action types and targets only. Use describe_action for the exact parameter schema before execute_action, but only once per action type: if you already hold that type's schema from earlier in this session, reuse it and call describe_action again only when a submission was rejected for its parameters or you need eligibility details you lack. Use compare_crop_options for the compact, authorized crop/market comparison; it labels unknown yields, duration and crop-specific input requirements rather than estimating them. Only the simulator validates actions and may reject them.
 
@@ -107,6 +110,7 @@ export function buildBriefSections({ state, snapshot, events, progress, economic
     simSeconds: config.mutationsEnabled ? Math.max(0, l.maxSimSeconds - budgets.advancedSimSeconds) : 0,
     cyclesIncludingThis: Math.max(0, l.maxCycles - state.cycle + 1) as number | null,
   };
+  const queue = attentionQueue(state, snapshot.simTimeS);
   const recent = state.decisions.slice(-3).map((d) => ({ cycle: d.cycle, simTimeS: d.simTimeS, summary: d.summary, nextStep: d.plannedStep, accepted: d.actionsAccepted, advancedSeconds: d.advancedSeconds }));
   return {
     objective: config.objective,
@@ -118,6 +122,7 @@ export function buildBriefSections({ state, snapshot, events, progress, economic
     operationalRecord: promptOperationalRecord(progress),
     economy: promptEconomy(economics),
     planning: buildPlanningContext(state, snapshot, events, progress),
+    ...(queue.length > 0 ? { attentionQueue: queue } : {}),
     eventsSinceLastCycle: events.map((e) => ({ id: e.eventId, simTimeS: e.simTimeS, kind: e.kind, actionId: e.actionId, summary: e.summary })),
     snapshot: { revision: snapshot.revision, simTimeS: snapshot.simTimeS, overview: snapshot.overview, fields: promptFields(snapshot.fields), actions: terseCatalog(snapshot.actions) },
   };

@@ -61,8 +61,9 @@ export class SimulatorClient {
     return this.request("GET", this.game(gameId, "overview"), FarmOverview);
   }
 
-  getFieldObservations(gameId: string) {
-    return this.request("GET", this.game(gameId, "fields"), FieldObservations);
+  /** `geometry` asks for each parcel's centre and size so location missions can be targeted; older servers ignore it. */
+  getFieldObservations(gameId: string, options: { geometry?: boolean } = {}) {
+    return this.request("GET", this.game(gameId, options.geometry ? "fields?include=geometry" : "fields"), FieldObservations);
   }
 
   getAvailableActions(gameId: string) {

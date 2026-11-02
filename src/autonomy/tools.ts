@@ -6,6 +6,7 @@ import { compactFields } from "./compactObservation.js";
 import { collectSnapshot, InconsistentObservationError, type Snapshot } from "./observation.js";
 import { adaptReviewWindow, buildCropEconomics } from "./planning.js";
 import { superviseInterval, superviseOperation, type IntervalResult, type WaitResult } from "./supervisor.js";
+import { reviewAtCheckpoint } from "./riskLedger.js";
 import type { GameEvent } from "../contracts/time.js";
 import type { Plan, SessionState } from "./types.js";
 
@@ -297,6 +298,7 @@ export function createAutonomousTools(
                     context.policy.advanceRequests += 1;
                   },
                   onConflict: wait.onConflict,
+                  ...(planning ? { checkpointReview: () => reviewAtCheckpoint(context.client, context.gameId, planning.state) } : {}),
                   record: (event, data) => context.trace.record(event, data),
                 },
                 {

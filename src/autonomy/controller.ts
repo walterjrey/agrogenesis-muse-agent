@@ -15,6 +15,7 @@ import type { SessionBackend, SessionLease } from "./storage.js";
 import { isInspectionActionType } from "./actionClassification.js";
 import { buildProgress } from "./progress.js";
 import { superviseInterval, superviseOperation, type IntervalResult, type WaitResult } from "./supervisor.js";
+import { reviewAtCheckpoint, refreshLedger } from "./riskLedger.js";
 import { createAutonomousTools, SnapshotProvider, type PlanSink } from "./tools.js";
 import { DEFAULT_SESSION_LIMITS, PLANNING_POLICY_VERSION, TERMINAL_ACTION_STATUSES, transitionLifecycle, type ObservationSummary, type PlanningConfig, type ScenarioManifest, type SessionLimits, type SessionState, type SessionLifecycle, type WaitRecord } from "./types.js";
 
@@ -124,6 +125,7 @@ export function newSessionState(options: NewSessionOptions): SessionState {
     operations: [],
     waits: [],
     progress: null,
+    riskLedger: {},
     pendingMutation: null,
     lastRevision: null,
     lastSimTimeS: null,
@@ -560,6 +562,7 @@ export class AutonomousController {
         getCursor: () => s.modelEventCursor,
         setCursor: (cursor) => { s.modelEventCursor = Math.max(s.modelEventCursor, cursor); },
         onAdvanced: () => { advancedAny = true; },
+        checkpointReview: () => reviewAtCheckpoint(this.options.client, s.gameId, s),
         shouldStop: () => {
           if (s.config.autonomyMode !== "continuous" && this.wallBase + (Date.now() - this.startedAt) >= l.maxWallClockMs) return "wall clock budget";
           if (this.farmSpendExceeded()) return "farm spending limit";
@@ -810,6 +813,7 @@ export class AutonomousController {
 
         // The brief carries this exact snapshot, so observe_snapshot must not resend it until something changes.
         this.provider.delivered = { revision: snapshot.revision, simTimeS: snapshot.simTimeS };
+        refreshLedger(s, snapshot.fields);
         const briefInput = { state: s, snapshot, events, progress: buildProgress(s), economics: buildEconomics(s) };
         const briefSizeEstimate = measureCycleBrief(briefInput);
         this.log(`cycle ${s.cycle} prompt estimate ${JSON.stringify({ cycle: s.cycle, source: "estimated", charsPerTokenHeuristic: 4, totalEstimatedTokens: briefSizeEstimate.totalEstimatedTokens, systemPromptEstimatedTokens: briefSizeEstimate.systemPromptEstimatedTokens, sections: Object.fromEntries(briefSizeEstimate.sections.map((sec) => [sec.section, sec.estimatedTokens])) })}`);

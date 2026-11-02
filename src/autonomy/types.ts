@@ -1,5 +1,5 @@
 import { z } from "zod";
-
+import { RiskLedger } from "./riskLedger.js";
 /**
  * Session-wide budgets. They are cumulative across cycles and across resumes and are never raised automatically:
  * a session that exhausts one stops, and resuming it does not reset the counters.
@@ -322,6 +322,8 @@ export const SessionState = z.strictObject({
   pendingMutation: PendingMutation.nullable(),
   waits: z.array(WaitRecord).default([]),
   progress: ProgressRecord.nullable().default(null),
+  /** Per-field alert age, treatment history and last-known authorized readings. Defaulted so older sessions load. */
+  riskLedger: RiskLedger.default({}),
   lastRevision: z.number().int().nullable(),
   lastSimTimeS: z.number().nullable(),
   /** Event cursor the model's tools use. */

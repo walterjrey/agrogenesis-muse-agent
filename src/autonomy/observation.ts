@@ -44,7 +44,7 @@ export async function collectSnapshot(client: SimulatorClient, gameId: string, o
   let mixed = 0;
   for (let round = 1; round <= maxRounds; round += 1) {
     const overview = round === 1 && options.firstOverview ? options.firstOverview : await client.getFarmOverview(gameId);
-    const fields = await client.getFieldObservations(gameId);
+    const fields = await client.getFieldObservations(gameId, { geometry: true });
     const actions = await client.getAvailableActions(gameId);
     observed = [
       { part: "overview", revision: overview.revision, simTimeS: overview.clock.simTimeS },

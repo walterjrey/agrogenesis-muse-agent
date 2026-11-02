@@ -38,6 +38,15 @@ export const FieldAttention = z.strictObject({
 });
 export type FieldAttention = z.infer<typeof FieldAttention>;
 
+/** Static parcel layout (metres), visible in the 3D farm view; carries no crop or sensor state. Only returned when requested. */
+export const FieldGeometry = z.strictObject({
+  centerX: z.number(),
+  centerZ: z.number(),
+  widthM: z.number().positive(),
+  depthM: z.number().positive(),
+});
+export type FieldGeometry = z.infer<typeof FieldGeometry>;
+
 export const FieldObservation = z.strictObject({
   fieldId: Id,
   label: z.string(),
@@ -52,6 +61,8 @@ export const FieldObservation = z.strictObject({
   activeOperationActionId: z.string().nullable(),
   /** Absent on servers that predate redacted alerts. */
   attention: z.array(FieldAttention).optional(),
+  /** Absent unless requested with `include=geometry` (and on servers that predate it). */
+  geometry: FieldGeometry.optional(),
 });
 export type FieldObservation = z.infer<typeof FieldObservation>;
 
