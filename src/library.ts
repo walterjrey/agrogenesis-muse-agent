@@ -58,6 +58,8 @@ export interface StartSessionOptions {
   /** Evaluation horizon in simulated days; persisted with the session and not changeable afterwards. */
   planningHorizonDays?: number;
   scenario?: Partial<ScenarioManifest>;
+  /** New AgroGenesis autonomous sessions use per-allocation cycle limits; omitted retains legacy lifetime semantics. */
+  autonomyMode?: "legacy" | "continuous";
 }
 
 export interface RunSliceOptions {
@@ -147,6 +149,7 @@ export function buildSessionRecord(options: StartSessionOptions, modelId: string
     gameId: options.gameId,
     modelId,
     mutationsEnabled: mutations,
+    autonomyMode: options.autonomyMode ?? "legacy",
     autoWait: options.autoWait ?? true,
     ...(options.objective ? { objective: options.objective } : {}),
     limits,

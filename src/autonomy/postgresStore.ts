@@ -143,6 +143,7 @@ export class PostgresSessionStore implements ControllableBackend {
     const result = await this.db.query(
       `SELECT session_id FROM ${this.table}
        WHERE control = 'run' AND status IN ('paused','running') AND (lock_owner IS NULL OR lock_heartbeat < now() - make_interval(secs => $2))
+         AND COALESCE(NULLIF(state->>'retryAfter', '')::timestamptz, now()) <= now()
        ORDER BY last_slice_at NULLS FIRST, updated_at LIMIT $1`,
       [limit, this.leaseTtlMs / 1000],
     );
@@ -162,7 +163,12 @@ export class PostgresSessionStore implements ControllableBackend {
   async settleControl(sessionId: string, outcome: { stopRunning: boolean; lastError: string | null }): Promise<void> {
     await this.db.query(
       `UPDATE ${this.table} SET last_slice_at = now(), last_error = $3,
-         control = CASE WHEN control = 'run' AND $2::boolean THEN 'pause' ELSE control END
+         control = CASE WHEN control = 'run' AND $2::boolean THEN 'pause' ELSE control END,
+         state = CASE
+           WHEN $2::boolean AND control = 'pause' AND state->>'lifecycle' NOT IN ('awaiting_budget','completed','failed')
+             THEN jsonb_set(state, '{lifecycle}', '"paused_by_user"'::jsonb, true)
+           ELSE state
+         END
        WHERE session_id = $1`,
       [sessionId, outcome.stopRunning, outcome.lastError],
     );

@@ -83,14 +83,14 @@ export function buildBriefSections({ state, snapshot, events, progress, economic
   const l = config.limits;
   const remaining = {
     costUsd: round(Math.max(0, l.maxCostUsd - budgets.costUsd)),
-    modelCalls: Math.max(0, l.maxModelCalls - budgets.modelCalls),
+    modelCalls: Math.max(0, l.maxModelCalls - budgets.modelCalls - budgets.failedModelCalls),
     toolCalls: Math.max(0, l.maxToolCalls - budgets.toolCalls),
     advanceRequests: config.mutationsEnabled ? Math.max(0, Math.min(l.maxAdvanceRequests - budgets.advanceRequests, l.maxConsecutiveAdvances - budgets.consecutiveAdvances)) : 0,
     farmSpendCredits: config.mutationsEnabled ? l.maxFarmSpendCredits : 0,
     mutations: config.mutationsEnabled ? Math.max(0, l.maxMutations - budgets.acceptedMutations) : 0,
     inspections: config.mutationsEnabled ? Math.max(0, l.maxInspections - budgets.acceptedInspections) : 0,
     simSeconds: config.mutationsEnabled ? Math.max(0, l.maxSimSeconds - budgets.advancedSimSeconds) : 0,
-    cyclesIncludingThis: Math.max(0, l.maxCycles - state.cycle + 1),
+    cyclesIncludingThis: Math.max(0, l.maxCycles - (state.config.autonomyMode === "continuous" ? state.allocationCycles : state.cycle) + 1),
   };
   const recent = state.decisions.slice(-3).map((d) => ({ cycle: d.cycle, simTimeS: d.simTimeS, summary: d.summary, nextStep: d.plannedStep, accepted: d.actionsAccepted, advancedSeconds: d.advancedSeconds }));
   return {

@@ -36,11 +36,11 @@ const PLAN = (nextStep: "continue" | "wait_for_actions" | "stop", summary = `pla
 });
 const TEXT: ScriptedStep = { content: "ok" };
 
-function setup(limits: Partial<SessionLimits> = {}, mutationsEnabled = true, planning: { horizonDays?: number | null } = {}) {
+function setup(limits: Partial<SessionLimits> = {}, mutationsEnabled = true, planning: { horizonDays?: number | null } = {}, autonomyMode: "legacy" | "continuous" = "legacy") {
   const dir = mkdtempSync(join(tmpdir(), "autonomy-"));
   dirs.push(dir);
   const store = new SessionStore(dir, 5_000);
-  const state = newSessionState({ sessionId: "t1", gameId: GAME_ID, modelId: "muse-spark-1.3", mutationsEnabled, limits, planning, autoWait: false });
+  const state = newSessionState({ sessionId: "t1", gameId: GAME_ID, modelId: "muse-spark-1.3", mutationsEnabled, limits, planning, autoWait: false, autonomyMode });
   const lock = store.acquire("t1");
   lock.save(state);
   lock.release();
@@ -123,9 +123,9 @@ describe("MOCKED autonomy: multi-cycle control and persistence", () => {
     expect(brief).toContain('"configuredHorizonDays":200');
   });
 
-  it("refuses to resume a stopped session", async () => {
+  it("refuses to resume a legacy session stopped by a non-budget safety guard", async () => {
     sim = await fakeSimulator();
-    const { store } = setup({ maxModelCalls: 3 });
+    const { store } = setup({ maxConsecutiveNoProgress: 1 });
     const stopped = await controller(store, sim, scriptedModel([PLAN("continue"), TEXT])).run();
     expect(stopped.status).toBe("stopped");
     await expect(controller(store, sim, scriptedModel([TEXT])).run()).rejects.toThrow(/cannot be resumed/);
@@ -210,15 +210,26 @@ describe("MOCKED autonomy: budgets and loop prevention", () => {
     sim = await fakeSimulator();
     const { store } = setup(limits);
     const final = await controller(store, sim, scriptedModel(steps), { retryDelayMs: 1 }).run();
-    expect(final).toMatchObject({ status: "stopped", stopReason: reason });
-    await expect(controller(store, sim, scriptedModel([TEXT])).run()).rejects.toThrow(/cannot be resumed/);
+    expect(final).toMatchObject({ status: "paused", lifecycle: "awaiting_budget", stopReason: reason });
+    const next = await controller(store, sim, scriptedModel([TEXT])).run();
+    expect(next).toMatchObject({ lifecycle: "awaiting_budget", stopReason: reason });
+  });
+
+  it("counts failed logical model calls against authorization without charging retries as extra logical calls", async () => {
+    sim = await fakeSimulator();
+    const { store } = setup({ maxModelCalls: 1, maxConsecutiveErrors: 10 });
+    const model = scriptedModel([{ throws: new ModelApiError("Model API error (HTTP 503).", "server", 503) }]);
+    const final = await controller(store, sim, model).run();
+    expect(final).toMatchObject({ lifecycle: "awaiting_budget", stopReason: "model_call_budget_exhausted", budgets: { modelCalls: 0, failedModelCalls: 1 } });
+    expect(model.requests).toHaveLength(1);
+    expect(final.stopDetail).toContain("1/1 logical calls");
   });
 
   it("stops on the mutation budget once the action has finished", async () => {
     sim = await fakeSimulator((req) => (req.url.endsWith("/actions/act-1") ? { status: 200, body: { gameId: GAME_ID, action: { ...executeAccepted.action, status: "completed", progress: 1, finishedAtS: 1 } } } : completedEvents(req)));
     const { store } = setup({ maxMutations: 1 });
     const final = await controller(store, sim, scriptedModel([INSPECT, PLAN("continue"), TEXT])).run();
-    expect(final).toMatchObject({ status: "stopped", stopReason: "mutation_budget_exhausted", budgets: { acceptedMutations: 1 } });
+    expect(final).toMatchObject({ status: "paused", lifecycle: "awaiting_budget", stopReason: "mutation_budget_exhausted", budgets: { acceptedMutations: 1 } });
     expect(sim.state.accepted).toBe(1);
   });
 
@@ -258,12 +269,13 @@ describe("MOCKED autonomy: budgets and loop prevention", () => {
     expect(final.budgets.acceptedMutations).toBe(0);
   });
 
-  it("still enforces the consecutive-advance limit on endless waiting", async () => {
+  it("does not penalize positive-time crop waiting with the zero-time advance safeguard", async () => {
     sim = await fakeSimulator();
     const { store } = setup({ maxConsecutiveNoProgress: 3, maxCycles: 20, maxSimSeconds: 100_000, maxAdvanceRequests: 20, maxConsecutiveAdvances: 3 });
     const wait = [ADVANCE(600), PLAN("continue"), TEXT];
     const final = await controller(store, sim, scriptedModel([...wait, ...wait, ...wait, ...wait])).run();
-    expect(final.stopReason).toBe("consecutive_advance_limit");
+    expect(final.stopReason).not.toBe("zero_time_advance_limit");
+    expect(final.budgets.advancedSimSeconds).toBeGreaterThan(0);
   });
 
   it("counts an accepted inspection and a field-attention warning as progress without any mutation", async () => {
@@ -310,7 +322,7 @@ describe("MOCKED autonomy: budgets and loop prevention", () => {
         if (req.method !== "GET" || !req.url.split("?")[0]!.endsWith("/actions")) return undefined;
         const first = availableActions.actions.find((a) => a.eligibility.eligible)!;
         const spare = { ...first, type: "spareAction" }; // keeps one action eligible so the session is not completed
-        return { status: 200, body: { ...availableActions, revision: state.revision, actions: [spare, ...availableActions.actions].map((a) => (state.revision > 4 && a.type === first.type ? { ...a, eligibility: { eligible: false, issues: [{ code: "not_ready", detail: "x" }] } } : a)) } };
+        return { status: 200, body: { ...availableActions, revision: state.revision, simTimeS: state.simTimeS, actions: [spare, ...availableActions.actions].map((a) => (state.revision > 4 && a.type === first.type ? { ...a, eligibility: { eligible: false, issues: [{ code: "not_ready", detail: "x" }] } } : a)) } };
       });
 
     it("counts a genuine change in eligible actions as progress", async () => {
@@ -539,6 +551,101 @@ describe("MOCKED autonomy: crash and timeout recovery for mutations", () => {
     expect(sim.posts[0]!.body.idempotencyKey).toBe(final.pendingMutation!.idempotencyKey);
     expect(resumed.pendingMutation).toBeNull();
     expect(sim.state.accepted).toBe(1);
+  });
+});
+
+describe("MOCKED continuous autonomous lifecycle", () => {
+  const planReviewAt = (simTimeS: number): ScriptedStep => ({
+    calls: [{ name: "update_plan", args: { summary: "Wait for crop review", nextStep: "continue", priorities: ["review growth"], nextReviewSimSeconds: simTimeS } }],
+  });
+
+  it("continues beyond 24 lifetime cycles through a new allocation with explicit cumulative authorization", async () => {
+    sim = await fakeSimulator();
+    const steps = [...Array.from({ length: 25 }, () => [PLAN("continue"), TEXT]).flat(), PLAN("stop", "Harvest and sale objective complete."), TEXT];
+    const model = scriptedModel(steps);
+    const { store } = setup({ maxCycles: 24, maxModelCalls: 100, maxCostUsd: 1, maxConsecutiveNoProgress: 100 }, true, {}, "continuous");
+
+    const firstAllocation = await controller(store, sim, model).run();
+    expect(firstAllocation).toMatchObject({ status: "paused", lifecycle: "running", stopReason: "allocation_complete", cycle: 24, allocationCycles: 24 });
+    const completed = await controller(store, sim, model).run();
+    expect(completed).toMatchObject({ status: "completed", lifecycle: "completed", cycle: 26, stopReason: "model_declared_done" });
+    expect(completed.budgets.modelCalls).toBe(52);
+  });
+
+  it("preserves monotonic lifetime cycles and does not repeat model calls across bounded worker restarts", async () => {
+    sim = await fakeSimulator();
+    const model = scriptedModel([...Array.from({ length: 26 }, () => [PLAN("continue"), TEXT]).flat()]);
+    const { store } = setup({ maxCycles: 24, maxModelCalls: 100, maxCostUsd: 1, maxConsecutiveNoProgress: 100 }, true, {}, "continuous");
+    for (let n = 0; n < 26; n += 1) {
+      await controller(store, sim, model, { sliceCycles: 1 }).run();
+    }
+    const state = store.load("t1");
+    expect(state).toMatchObject({ cycle: 26, allocationCycles: 2, budgets: { modelCalls: 52 } });
+    expect(model.requests).toHaveLength(52);
+    expect(sim.posts).toHaveLength(0);
+  });
+
+  it("refuses to replay an uncertain model request after restart", async () => {
+    sim = await fakeSimulator();
+    const { store, state } = setup({ maxCycles: 8 });
+    const lease = store.acquire("t1");
+    lease.save({ ...state, cycle: 1, pendingModelCycle: 1 });
+    lease.release();
+    const model = scriptedModel([TEXT]);
+
+    const resumed = await controller(store, sim, model).run();
+    expect(resumed).toMatchObject({ status: "failed", lifecycle: "failed", stopReason: "model_request_outcome_unknown", pendingModelCycle: 1 });
+    expect(resumed.stopDetail).toMatch(/was not replayed/);
+    expect(model.requests).toHaveLength(0);
+  });
+
+  it("persists a write-ahead model-cycle marker before requests and clears it after accounting", async () => {
+    sim = await fakeSimulator();
+    const { store } = setup({ maxCycles: 8 });
+    const model = scriptedModel([PLAN("stop", "Done."), TEXT]);
+    const complete = model.complete.bind(model);
+    let sawPendingMarker = 0;
+    model.complete = async (request) => {
+      expect(store.load("t1").pendingModelCycle).toBe(1);
+      sawPendingMarker += 1;
+      return complete(request);
+    };
+
+    const final = await controller(store, sim, model).run();
+    expect(sawPendingMarker).toBe(2);
+    expect(final.pendingModelCycle).toBeNull();
+  });
+
+  it("advances long maturation checkpoints without repeated model calls and wakes at the planned review", async () => {
+    sim = await fakeSimulator();
+    const model = scriptedModel([planReviewAt(clock.simTimeS + 1_200), TEXT, PLAN("stop", "Review completed."), TEXT]);
+    const { store } = setup({ maxCycles: 8, maxModelCalls: 20, maxCostUsd: 1, maxSimSeconds: 100_000, maxAdvanceRequests: 20, maxWaitChunkSeconds: 600 }, true, {}, "continuous");
+    const waiting = await controller(store, sim, model, { sliceCycles: 1 }).run();
+    expect(waiting).toMatchObject({ status: "paused", lifecycle: "waiting_for_simulation", stopReason: "waiting_for_simulation", cycle: 1, waitingUntilSimTimeS: clock.simTimeS + 1_200 });
+    const callsBeforeWait = model.requests.length;
+    const checkpoint = await controller(store, sim, model, { sliceCycles: 1 }).run();
+    expect(checkpoint.lifecycle).toBe("waiting_for_simulation");
+    expect(model.requests).toHaveLength(callsBeforeWait);
+    expect(checkpoint.budgets.advancedSimSeconds).toBe(600);
+    const reviewed = await controller(store, sim, model, { sliceCycles: 1 }).run();
+    expect(reviewed).toMatchObject({ lifecycle: "completed", cycle: 2, stopReason: "model_declared_done" });
+    expect(model.requests).toHaveLength(callsBeforeWait + 2);
+    expect(reviewed.budgets.advancedSimSeconds).toBe(1_200);
+  });
+
+  it("does not allow zero-time advances to bypass the no-progress safeguards", async () => {
+    sim = await fakeSimulator((req) => {
+      if (req.method === "POST") {
+        const body = JSON.parse(req.body) as { requestedSeconds: number };
+        return { status: 200, body: { gameId: GAME_ID, clockBefore: clock, clockAfter: clock, requestedSeconds: body.requestedSeconds, grantedSeconds: 0, stoppedBecause: "granted_limit_reached", events: [], nextCursor: 0 } };
+      }
+      return undefined;
+    });
+    const { store } = setup({ maxCycles: 8, maxModelCalls: 40, maxCostUsd: 1, maxConsecutiveNoProgress: 8, maxConsecutiveAdvances: 2 }, true, {}, "continuous");
+    const wait = [ADVANCE(600), PLAN("continue"), TEXT];
+    const final = await controller(store, sim, scriptedModel([...wait, ...wait, ...wait])).run();
+    expect(final).toMatchObject({ status: "paused", lifecycle: "awaiting_budget", stopReason: "zero_time_advance_limit" });
+    expect(final.budgets).toMatchObject({ advanceRequests: 2, advancedSimSeconds: 0, consecutiveAdvances: 2 });
   });
 });
 

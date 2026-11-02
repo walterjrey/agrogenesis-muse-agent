@@ -1,5 +1,6 @@
 import { runSessionSlice, DEFAULT_SLICE_CYCLES, type AgentDependencies } from "./library.js";
 import { SessionLockedError, type ControllableBackend } from "./autonomy/storage.js";
+import { transitionLifecycle } from "./autonomy/types.js";
 
 export interface WorkerOptions {
   deps: Omit<AgentDependencies, "backend"> & { backend: ControllableBackend };
@@ -34,7 +35,7 @@ async function finalizeCancelled(backend: ControllableBackend, sessionId: string
   try {
     const state = await backend.load(sessionId);
     if (state.status === "paused" || state.status === "running") {
-      await lease.save({ ...state, status: "stopped", stopReason: "cancelled_by_operator" });
+      await lease.save({ ...state, status: "stopped", lifecycle: transitionLifecycle(state.lifecycle, "completed"), stopReason: "cancelled_by_operator", waitingUntilSimTimeS: null });
     }
   } finally {
     await lease.release();
@@ -80,9 +81,15 @@ export async function runWorkerOnce(options: WorkerOptions): Promise<number> {
       });
       slices += 1;
       const { status, stopReason, stopDetail } = result.state;
-      const resumable = status === "paused" && stopReason === "slice_complete";
+      const resumable = status === "paused" && (
+        stopReason === "slice_complete" ||
+        stopReason === "allocation_complete" ||
+        stopReason === "waiting_for_simulation" ||
+        stopReason === "consecutive_errors"
+      );
+      const recovering = stopReason === "consecutive_errors";
       const cause = `${status}: ${stopReason ?? "unknown"}${stopDetail ? ` — ${stopDetail}` : ""}`;
-      await backend.settleControl(sessionId, { stopRunning: !resumable, lastError: resumable || status === "completed" ? null : truncate(cause) });
+      await backend.settleControl(sessionId, { stopRunning: !resumable, lastError: recovering ? truncate(cause) : resumable || status === "completed" ? null : truncate(cause) });
       emit({ type: "slice_finished", sessionId, status, stopReason, finished: result.finished });
     } catch (error) {
       if (error instanceof SessionLockedError) {
@@ -112,13 +119,12 @@ const sleep = (ms: number, signal?: AbortSignal) =>
 export async function runWorker(options: WorkerOptions): Promise<void> {
   const interval = options.pollIntervalMs ?? 5_000;
   while (!options.signal?.aborted) {
-    let slices = 0;
     try {
-      slices = await runWorkerOnce(options);
+      await runWorkerOnce(options);
     } catch (error) {
       options.onEvent?.({ type: "slice_failed", sessionId: "-", error: truncate(String(error instanceof Error ? error.message : error)) });
     }
-    if (slices === 0) await sleep(interval, options.signal);
+    await sleep(interval, options.signal);
   }
   options.onEvent?.({ type: "stopped" });
 }

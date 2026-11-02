@@ -14,7 +14,8 @@ export type { PgQueryable, PostgresSessionStoreOptions } from "./autonomy/postgr
 export { runWorker, runWorkerOnce } from "./worker.js";
 export type { WorkerOptions, WorkerEvent } from "./worker.js";
 
-export { SessionState, SessionLimits, DEFAULT_SESSION_LIMITS, PLANNING_POLICY_VERSION } from "./autonomy/types.js";
+export { SessionState, SessionLimits, SessionLifecycle as SessionLifecycleSchema, transitionLifecycle, DEFAULT_SESSION_LIMITS, PLANNING_POLICY_VERSION } from "./autonomy/types.js";
+export type { SessionLifecycle } from "./autonomy/types.js";
 export { buildReport } from "./autonomy/report.js";
 
 export { AutonomousController, newSessionState } from "./autonomy/controller.js";

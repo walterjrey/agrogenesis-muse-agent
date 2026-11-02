@@ -63,4 +63,27 @@ describe("sessions persisted before the inspection budget existed", () => {
     expect(parsed.config.limits.maxInspections).toBe(3);
     expect(parsed.budgets).toMatchObject({ acceptedInspections: 0, inspectionAttempts: 0, rejectedInspections: 0 });
   });
+
+  it("defaults migrated sessions to legacy cycle semantics and preserves stopped state", () => {
+    const state = newSessionState({ sessionId: "stopped-legacy", gameId: "game-1", modelId: "muse-spark-1.3", mutationsEnabled: true });
+    const old = JSON.parse(JSON.stringify(state)) as Record<string, unknown> & { config: Record<string, unknown> };
+    delete old.config.autonomyMode;
+    delete old.lifecycle;
+    delete old.allocationCycles;
+    delete old.pendingModelCycle;
+    delete old.waitingUntilSimTimeS;
+    delete old.recoveryAttempts;
+    delete old.retryAfter;
+    old.status = "stopped";
+    old.stopReason = "cycle_budget_exhausted";
+    const migrated = SessionState.parse(old);
+    expect(migrated).toMatchObject({
+      status: "stopped",
+      stopReason: "cycle_budget_exhausted",
+      lifecycle: "paused_by_user",
+      config: { autonomyMode: "legacy" },
+      allocationCycles: 0,
+      pendingModelCycle: null,
+    });
+  });
 });

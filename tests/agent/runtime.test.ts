@@ -45,8 +45,8 @@ describe("MOCKED runtime: unusable (HTTP 200) model responses", () => {
     const provider = scriptedModel([{ content: null }, { content: "Final plan." }]);
     const result = await runAgent({ ...base(sim), provider, mode: "observe_only" });
     expect(result).toMatchObject({ status: "completed", stopReason: "final_answer", finalSummary: "Final plan." });
-    // modelCalls counts each physical request once; failedModelCalls only the unusable one; one retry.
-    expect(result.totals).toMatchObject({ modelCalls: 2, failedModelCalls: 1, modelRetryAttempts: 1 });
+    // One usable and one failed logical call; the retry is accounted separately.
+    expect(result.totals).toMatchObject({ modelCalls: 1, failedModelCalls: 1, modelRetryAttempts: 1 });
     expect(result.totals.estimatedCostUsd).toBeCloseTo(0.002, 6);
     // The empty assistant message is not replayed to the model.
     expect(provider.requests[1]!.messages.filter((m) => m.role === "assistant")).toHaveLength(0);
@@ -59,7 +59,7 @@ describe("MOCKED runtime: unusable (HTTP 200) model responses", () => {
     const result = await runAgent({ ...base(sim), provider, mode: "observe_only" });
     expect(provider.requests).toHaveLength(2); // never more than one retry
     expect(result).toMatchObject({ status: "limited", stopReason: "empty_response" });
-    expect(result.totals).toMatchObject({ modelCalls: 2, failedModelCalls: 2, modelRetryAttempts: 1 });
+    expect(result.totals).toMatchObject({ modelCalls: 0, failedModelCalls: 2, modelRetryAttempts: 1 });
     expect(result.error).toMatch(/^empty_response: reasoning_only \(HTTP 200, finish_reason=stop, choices=1, content=no, tool_calls=0, tokens in=100 out=20 reasoning=900, request=req-2\)$/);
   });
 
@@ -70,7 +70,7 @@ describe("MOCKED runtime: unusable (HTTP 200) model responses", () => {
     expect(truncated.requests).toHaveLength(1);
     expect(t.stopReason).toBe("empty_response");
     expect(t.error).toContain("truncated");
-    expect(t.totals).toMatchObject({ modelCalls: 1, failedModelCalls: 1, modelRetryAttempts: 0 });
+    expect(t.totals).toMatchObject({ modelCalls: 0, failedModelCalls: 1, modelRetryAttempts: 0 });
 
     const dropped = scriptedModel([{ content: null, rawToolCallCount: 1 }, { content: "never reached" }]);
     const d = await runAgent({ ...base(sim), provider: dropped, mode: "observe_only" });
@@ -88,7 +88,7 @@ describe("MOCKED runtime: unusable (HTTP 200) model responses", () => {
     const result = await runAgent({ ...base(sim), provider, mode: "observe_only", limits: { maxModelCalls: 1 } });
     expect(provider.requests).toHaveLength(1);
     expect(result.stopReason).toBe("empty_response");
-    expect(result.totals).toMatchObject({ modelCalls: 1, failedModelCalls: 1, modelRetryAttempts: 0 });
+    expect(result.totals).toMatchObject({ modelCalls: 0, failedModelCalls: 1, modelRetryAttempts: 0 });
   });
 
   it("does not retry when the cost limit is already reached", async () => {

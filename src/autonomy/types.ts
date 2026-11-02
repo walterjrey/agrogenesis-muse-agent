@@ -32,7 +32,7 @@ export const SessionLimits = z.strictObject({
   maxCostPerRequestUsd: z.number().positive(),
   /** HTTP advance requests (agent-requested or supervised) in total. */
   maxAdvanceRequests: z.number().int().positive().default(60),
-  /** Advance requests in a row without an accepted farm action in between. */
+  /** Consecutive advance requests that grant zero simulated seconds; positive server time resets this safeguard. */
   maxConsecutiveAdvances: z.number().int().positive().default(12),
   /** HTTP 409 stale-revision conflicts tolerated in total. */
   maxConflicts: z.number().int().positive().default(5),
@@ -249,6 +249,30 @@ export type ScenarioManifest = z.infer<typeof ScenarioManifest>;
 
 export const SessionStatus = z.enum(["running", "paused", "stopped", "completed", "failed"]);
 export type SessionStatus = z.infer<typeof SessionStatus>;
+export const SessionLifecycle = z.enum([
+  "running",
+  "waiting_for_simulation",
+  "awaiting_budget",
+  "paused_by_user",
+  "recovering",
+  "completed",
+  "failed",
+]);
+export type SessionLifecycle = z.infer<typeof SessionLifecycle>;
+const LIFECYCLE_TRANSITIONS: Record<SessionLifecycle, ReadonlySet<SessionLifecycle>> = {
+  running: new Set(["running", "waiting_for_simulation", "awaiting_budget", "paused_by_user", "recovering", "completed", "failed"]),
+  waiting_for_simulation: new Set(["waiting_for_simulation", "running", "awaiting_budget", "paused_by_user", "recovering", "completed", "failed"]),
+  awaiting_budget: new Set(["awaiting_budget", "running", "paused_by_user", "failed"]),
+  paused_by_user: new Set(["paused_by_user", "running", "waiting_for_simulation", "awaiting_budget", "recovering", "completed", "failed"]),
+  recovering: new Set(["recovering", "running", "waiting_for_simulation", "awaiting_budget", "paused_by_user", "failed"]),
+  completed: new Set(["completed"]),
+  failed: new Set(["failed"]),
+};
+
+export function transitionLifecycle(current: SessionLifecycle, next: SessionLifecycle): SessionLifecycle {
+  if (!LIFECYCLE_TRANSITIONS[current].has(next)) throw new Error(`Invalid session lifecycle transition: ${current} -> ${next}.`);
+  return next;
+}
 
 export const SessionState = z.strictObject({
   version: z.literal(1),
@@ -257,11 +281,15 @@ export const SessionState = z.strictObject({
   createdAt: z.string(),
   updatedAt: z.string(),
   status: SessionStatus,
+  /** Explicit lifecycle is separate from the legacy execution status for backward-compatible persistence. */
+  lifecycle: SessionLifecycle.default("paused_by_user"),
   stopReason: z.string().nullable(),
   stopDetail: z.string().nullable(),
   config: z.strictObject({
     modelId: z.string(),
     mutationsEnabled: z.boolean(),
+    /** Legacy sessions retain lifetime maxCycles semantics; only explicitly created continuous sessions use allocations. */
+    autonomyMode: z.enum(["legacy", "continuous"]).default("legacy"),
     objective: z.string(),
     limits: SessionLimits,
     /** After a model turn, wait mechanically (no model calls) for operations still in flight. */
@@ -272,6 +300,15 @@ export const SessionState = z.strictObject({
     scenario: ScenarioManifest.default({ name: null, seed: null, startSnapshotSha256: null, worldConfigSha256: null, startObservationSha256: null, startRevision: null, startSimTimeS: null, notes: [] }),
   }),
   cycle: z.number().int(),
+  /** Decision cycles in the current worker allocation; lifetime `cycle` remains monotonic. */
+  allocationCycles: z.number().int().nonnegative().default(0),
+  /** Write-ahead marker: a process restart during this model cycle must not replay a possibly billed request. */
+  pendingModelCycle: z.number().int().positive().nullable().default(null),
+  /** Absolute server simulation time for the next planned review, when waiting without model calls. */
+  waitingUntilSimTimeS: z.number().nullable().default(null),
+  /** Bounded provider-recovery slices; never an authorization counter. */
+  recoveryAttempts: z.number().int().nonnegative().default(0),
+  retryAfter: z.string().nullable().default(null),
   plan: Plan.nullable(),
   decisions: z.array(DecisionSummary),
   actions: z.array(TrackedAction),
@@ -306,7 +343,7 @@ export const SessionState = z.strictObject({
     advanceRequests: z.number().int().default(0),
     consecutiveAdvances: z.number().int().default(0),
     conflicts: z.number().int().default(0),
-    /** Logical model calls that never produced a usable response (retries exhausted); never counted against maxModelCalls. Defaulted for sessions persisted before this field existed. */
+    /** Logical model calls that never produced a usable response; included in aggregate maxModelCalls authorization. Defaulted for older persisted sessions. */
     failedModelCalls: z.number().int().default(0),
     /** Physical HTTP retry attempts beyond the first, summed across every logical model call, successful or failed. */
     modelRetryAttempts: z.number().int().default(0),

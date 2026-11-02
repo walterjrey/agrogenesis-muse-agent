@@ -24,7 +24,10 @@ class ControlledMemoryStore extends MemorySessionStore implements ControllableBa
     return Promise.resolve(entry ? { ...entry, leased: false } : null);
   }
   listRunnable(): Promise<string[]> {
-    return Promise.resolve([...this.controls].filter(([, c]) => c.control === "run").map(([id]) => id));
+    return Promise.resolve([...this.controls].filter(([id, c]) => {
+      const state = this.load(id);
+      return c.control === "run" && ["paused", "running"].includes(state.status) && Date.parse(state.retryAfter ?? new Date(0).toISOString()) <= Date.now();
+    }).map(([id]) => id));
   }
   listCancelRequested(): Promise<string[]> {
     return Promise.resolve([]);
@@ -33,6 +36,14 @@ class ControlledMemoryStore extends MemorySessionStore implements ControllableBa
     const entry = this.controls.get(id)!;
     this.controls.set(id, { control: outcome.stopRunning ? "pause" : entry.control, lastError: outcome.lastError });
     return Promise.resolve();
+  }
+  async elapseRetryAfter(id: string): Promise<void> {
+    const lease = this.acquire(id);
+    try {
+      lease.save({ ...this.load(id), retryAfter: null });
+    } finally {
+      lease.release();
+    }
   }
 }
 
@@ -71,23 +82,23 @@ describe("MOCKED worker: unusable responses persist across slices, pause, resume
       await runWorkerOnce({ deps: depsFor([EMPTY]), sliceCycles: 1, mutationsAllowed: true });
       const state = await backend.load("e-1");
       expect(state).toMatchObject({ status: "paused", stopReason: "slice_complete" });
-      expect(state.budgets).toMatchObject({ consecutiveErrors: expected, failedModelCalls: expected * 2, modelRetryAttempts: expected });
+      expect(state.budgets).toMatchObject({ consecutiveErrors: expected, modelCalls: 0, failedModelCalls: expected * 2, modelRetryAttempts: expected });
       expect(backend.controls.get("e-1")).toMatchObject({ control: "run", lastError: null });
     }
 
     await runWorkerOnce({ deps: depsFor([EMPTY]), sliceCycles: 1, mutationsAllowed: true });
     const paused = await backend.load("e-1");
     expect(paused).toMatchObject({ status: "paused", stopReason: "consecutive_errors" });
-    expect(paused.budgets).toMatchObject({ consecutiveErrors: 3, failedModelCalls: 6, modelRetryAttempts: 3, modelCalls: 6 });
+    expect(paused.budgets).toMatchObject({ consecutiveErrors: 3, modelCalls: 0, failedModelCalls: 6, modelRetryAttempts: 3 });
     expect(paused.stopDetail).toMatch(/^empty_response: empty_content \(HTTP 200, finish_reason=stop, choices=1, content=no, tool_calls=0/);
 
     // The cause is persisted beside the session and survives a restart (reloaded from the backend only).
     const control = await backend.getControl("e-1");
-    expect(control?.control).toBe("pause");
+    expect(control?.control).toBe("run");
     expect(control?.lastError).toMatch(/^paused: consecutive_errors — empty_response: empty_content \(HTTP 200/);
     expect(JSON.stringify([paused, control])).not.toMatch(/SECRET|sk-/);
 
-    // A paused session is not rescheduled until an operator resumes it.
+    // Automatic recovery is bounded by the persisted backoff, even across a worker restart.
     expect(await runWorkerOnce({ deps: depsFor([EMPTY]), sliceCycles: 1, mutationsAllowed: true })).toBe(0);
   });
 
@@ -99,6 +110,7 @@ describe("MOCKED worker: unusable responses persist across slices, pause, resume
     expect(await backend.load("e-2")).toMatchObject({ status: "paused", stopReason: "consecutive_errors" });
 
     await backend.requestControl("e-2", "run");
+    await backend.elapseRetryAfter("e-2");
     // First physical request is empty; the single bounded retry returns a usable plan and a final answer.
     const model = scriptedModel([EMPTY, PLAN_STOP, TEXT]);
     const deps = { ...depsFor([]), model: { provider: model } };
@@ -109,7 +121,7 @@ describe("MOCKED worker: unusable responses persist across slices, pause, resume
     expect(state).toMatchObject({ status: "completed", stopReason: "model_declared_done" });
     expect(state.budgets.consecutiveErrors).toBe(0);
     // Prior history is preserved and the recovered cycle adds exactly one failed physical attempt and one retry.
-    expect(state.budgets).toMatchObject({ failedModelCalls: 7, modelRetryAttempts: 4, modelCalls: 9 });
+    expect(state.budgets).toMatchObject({ failedModelCalls: 7, modelRetryAttempts: 4, modelCalls: 2 });
     expect(state.decisions.at(-1)).toMatchObject({ stopReason: "final_answer" });
     expect((await backend.getControl("e-2"))?.lastError).toBeNull();
   });
@@ -126,5 +138,62 @@ describe("MOCKED worker: unusable responses persist across slices, pause, resume
     expect(state.status).toBe("completed");
     expect(state.stopReason).not.toBe("consecutive_errors");
     expect(state.budgets).toMatchObject({ consecutiveErrors: 0, failedModelCalls: 5, modelRetryAttempts: 3 });
+  });
+
+  it("hands continuous sessions to a fresh worker allocation without resetting lifetime cycles or budgets", async () => {
+    const { backend, depsFor } = await harness();
+    const model = scriptedModel([
+      { calls: [{ name: "update_plan", args: { summary: "Continue monitoring", nextStep: "continue", priorities: ["review"] } }] },
+      TEXT,
+      PLAN_STOP,
+      TEXT,
+    ]);
+    const deps = { ...depsFor([]), model: { provider: model } };
+    await startSession(deps, {
+      gameId: GAME_ID,
+      sessionId: "allocation-handoff",
+      autonomyMode: "continuous",
+      mutationsEnabled: true,
+      limits: { maxCycles: 1, maxModelCalls: 10, maxCostUsd: 1, maxMutations: 3, maxSimSeconds: 600, maxWallClockMs: 60_000 },
+    });
+    backend.start("allocation-handoff");
+
+    await runWorkerOnce({ deps, sliceCycles: 1, mutationsAllowed: true });
+    const first = await backend.load("allocation-handoff");
+    expect(first).toMatchObject({ cycle: 1, allocationCycles: 1, status: "paused", stopReason: "allocation_complete" });
+    expect((await backend.getControl("allocation-handoff"))?.control).toBe("run");
+
+    await backend.requestControl("allocation-handoff", "pause");
+    expect(await runWorkerOnce({ deps, sliceCycles: 1, mutationsAllowed: true })).toBe(0);
+    expect((await backend.load("allocation-handoff")).cycle).toBe(1);
+    await backend.requestControl("allocation-handoff", "run");
+    await runWorkerOnce({ deps, sliceCycles: 1, mutationsAllowed: true });
+
+    const resumed = await backend.load("allocation-handoff");
+    expect(resumed).toMatchObject({ cycle: 2, allocationCycles: 1, status: "completed", budgets: { modelCalls: 4 } });
+    expect(model.requests).toHaveLength(4);
+  });
+
+  it("does not automatically restart a stopped legacy session after loading its migrated state", async () => {
+    const { backend, depsFor } = await harness();
+    const model = scriptedModel([TEXT]);
+    await startSession(depsFor([]), { gameId: GAME_ID, sessionId: "legacy-stopped", mutationsEnabled: false, limits: LIMITS });
+    backend.start("legacy-stopped");
+    const lease = backend.acquire("legacy-stopped");
+    try {
+      lease.save({
+        ...backend.load("legacy-stopped"),
+        status: "stopped",
+        stopReason: "cycle_budget_exhausted",
+        cycle: 24,
+        config: { ...backend.load("legacy-stopped").config, autonomyMode: "legacy" },
+      });
+    } finally {
+      lease.release();
+    }
+
+    expect(await runWorkerOnce({ deps: { ...depsFor([]), model: { provider: model } }, sliceCycles: 1, mutationsAllowed: true })).toBe(0);
+    expect((await backend.load("legacy-stopped"))).toMatchObject({ status: "stopped", cycle: 24, stopReason: "cycle_budget_exhausted" });
+    expect(model.requests).toHaveLength(0);
   });
 });

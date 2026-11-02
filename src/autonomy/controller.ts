@@ -14,9 +14,9 @@ import { SessionLockLostError } from "./store.js";
 import type { SessionBackend, SessionLease } from "./storage.js";
 import { isInspectionActionType } from "./actionClassification.js";
 import { buildProgress } from "./progress.js";
-import { superviseOperation, type IntervalResult, type WaitResult } from "./supervisor.js";
+import { superviseInterval, superviseOperation, type IntervalResult, type WaitResult } from "./supervisor.js";
 import { createAutonomousTools, SnapshotProvider, type PlanSink } from "./tools.js";
-import { DEFAULT_SESSION_LIMITS, PLANNING_POLICY_VERSION, TERMINAL_ACTION_STATUSES, type ObservationSummary, type PlanningConfig, type ScenarioManifest, type SessionLimits, type SessionState, type WaitRecord } from "./types.js";
+import { DEFAULT_SESSION_LIMITS, PLANNING_POLICY_VERSION, TERMINAL_ACTION_STATUSES, transitionLifecycle, type ObservationSummary, type PlanningConfig, type ScenarioManifest, type SessionLimits, type SessionState, type SessionLifecycle, type WaitRecord } from "./types.js";
 
 export interface NewSessionOptions {
   sessionId?: string;
@@ -31,6 +31,7 @@ export interface NewSessionOptions {
   scenario?: Partial<ScenarioManifest>;
   /** Versioned planning context. Horizon is explicit and independent of the session's time-advance budget. */
   planning?: Partial<PlanningConfig>;
+  autonomyMode?: "legacy" | "continuous";
 }
 
 const EMPTY_SCENARIO: ScenarioManifest = { name: null, seed: null, startSnapshotSha256: null, worldConfigSha256: null, startObservationSha256: null, startRevision: null, startSimTimeS: null, notes: [] };
@@ -80,10 +81,16 @@ export function newSessionState(options: NewSessionOptions): SessionState {
     createdAt: now,
     updatedAt: now,
     status: "paused",
+    lifecycle: "paused_by_user",
     stopReason: "not_started",
     stopDetail: null,
-    config: { modelId: options.modelId, mutationsEnabled: options.mutationsEnabled, objective: options.objective ?? DEFAULT_OBJECTIVE, limits: { ...DEFAULT_SESSION_LIMITS, ...options.limits }, autoWait: options.autoWait ?? true, planning: { policyVersion: PLANNING_POLICY_VERSION, horizonDays: null, ...options.planning }, scenario: { ...EMPTY_SCENARIO, ...options.scenario } },
+    config: { modelId: options.modelId, mutationsEnabled: options.mutationsEnabled, autonomyMode: options.autonomyMode ?? "legacy", objective: options.objective ?? DEFAULT_OBJECTIVE, limits: { ...DEFAULT_SESSION_LIMITS, ...options.limits }, autoWait: options.autoWait ?? true, planning: { policyVersion: PLANNING_POLICY_VERSION, horizonDays: null, ...options.planning }, scenario: { ...EMPTY_SCENARIO, ...options.scenario } },
     cycle: 0,
+    allocationCycles: 0,
+    pendingModelCycle: null,
+    waitingUntilSimTimeS: null,
+    recoveryAttempts: 0,
+    retryAfter: null,
     plan: null,
     decisions: [],
     actions: [],
@@ -135,6 +142,7 @@ const settledAdvance = (response: Awaited<ReturnType<SimulatorClient["advance"]>
 
 const isDefinitiveRefusal = (error: unknown): boolean => error instanceof SimulatorError && error.kind === "http" && (error.status ?? 0) >= 400 && (error.status ?? 0) < 500 && !isAuthFailure(error);
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+const remainingSimFor = (state: SessionState): number => Math.max(0, state.config.limits.maxSimSeconds - state.budgets.advancedSimSeconds);
 
 export class AutonomousController {
   private lock!: SessionLease;
@@ -162,6 +170,12 @@ export class AutonomousController {
       await this.lock.release();
       throw new Error(`Session ${sessionId} is ${this.state.status} (${this.state.stopReason}) and cannot be resumed. Budgets are never raised automatically; start a new session.`);
     }
+    if (this.state.config.autonomyMode === "continuous" && this.state.stopReason === "allocation_complete") {
+      this.state.allocationCycles = 0;
+    }
+    if (this.state.lifecycle === "paused_by_user" && this.state.waitingUntilSimTimeS !== null) {
+      this.setLifecycle("waiting_for_simulation");
+    }
     this.mutationsEnabled = this.state.config.mutationsEnabled && this.options.mutationsEnabled;
     this.provider = new SnapshotProvider(this.options.client, this.state.gameId, { retryDelayMs: this.options.retryDelayMs ?? 250 });
     this.wallBase = this.state.budgets.wallClockMs;
@@ -169,6 +183,10 @@ export class AutonomousController {
 
   private log(message: string): void {
     this.options.onEvent?.(message);
+  }
+
+  private setLifecycle(next: SessionLifecycle): void {
+    this.state.lifecycle = transitionLifecycle(this.state.lifecycle, next);
   }
 
   private async save(): Promise<void> {
@@ -185,9 +203,27 @@ export class AutonomousController {
     this.state.status = status;
     this.state.stopReason = reason;
     this.state.stopDetail = detail;
+    if (status === "completed") this.setLifecycle("completed");
+    else if (status === "failed") this.setLifecycle("failed");
+    else if (reason === "waiting_for_simulation") this.setLifecycle("waiting_for_simulation");
+    else if (this.isBudgetReason(reason)) this.setLifecycle("awaiting_budget");
+    else if (reason === "consecutive_errors" || reason === "controller_error" || reason === "no_progress" || reason === "simulation_wait_interrupted") this.setLifecycle("recovering");
+    else if (reason === "authentication_failure" || reason === "inconsistent_observation" || reason === "recovery_attempts_exhausted") this.setLifecycle("failed");
+    else if (reason === "paused_by_operator" || reason === "cancelled_by_operator") this.setLifecycle("paused_by_user");
+    else if (reason === "slice_complete" || reason === "allocation_complete") this.setLifecycle("running");
+    else if (status === "stopped") this.setLifecycle("failed");
     this.log(`session ${status}: ${reason}${detail ? ` (${detail})` : ""}`);
     await this.save();
     return this.state;
+  }
+
+  private isBudgetReason(reason: string): boolean {
+    return new Set([
+      "awaiting_budget", "cost_budget_exhausted", "model_call_budget_exhausted", "tool_call_budget_exhausted",
+      "wall_clock_exhausted", "cycle_budget_exhausted", "sim_time_limit_reached",
+      "advance_request_budget_exhausted", "mutation_budget_exhausted", "inspection_budget_exhausted",
+      "farm_spend_limit_reached", "zero_time_advance_limit",
+    ]).has(reason);
   }
 
   /** Records a settled mutation exactly once, updates counters and clears the pending record. */
@@ -239,9 +275,10 @@ export class AutonomousController {
         b.consecutiveRejections += 1;
       }
     } else if (settlement.status === "applied") {
-      b.advancedSimSeconds += Number(settlement.summary.grantedSeconds ?? 0);
+      const granted = Number(settlement.summary.grantedSeconds ?? 0);
+      b.advancedSimSeconds += granted;
       b.advanceRequests += 1;
-      b.consecutiveAdvances += 1;
+      b.consecutiveAdvances = granted > 0 ? 0 : b.consecutiveAdvances + 1;
       if (typeof settlement.summary.simTimeAfterS === "number") s.lastSimTimeS = settlement.summary.simTimeAfterS;
     }
     if (settlement.status === "not_applied" && settlement.summary.code === "stale_revision") b.conflicts += 1;
@@ -295,15 +332,17 @@ export class AutonomousController {
     const l = config.limits;
     const wall = this.wallBase + (Date.now() - this.startedAt);
     if (!forWait && b.costUsd >= l.maxCostUsd) return { reason: "cost_budget_exhausted", detail: `$${b.costUsd.toFixed(4)} of $${l.maxCostUsd}` };
-    if (!forWait && b.modelCalls >= l.maxModelCalls) return { reason: "model_call_budget_exhausted", detail: `${b.modelCalls}/${l.maxModelCalls}` };
+    const logicalModelCalls = b.modelCalls + b.failedModelCalls;
+    if (!forWait && logicalModelCalls >= l.maxModelCalls) return { reason: "model_call_budget_exhausted", detail: `${logicalModelCalls}/${l.maxModelCalls} logical calls (successful or failed)` };
     if (!forWait && b.toolCalls >= l.maxToolCalls) return { reason: "tool_call_budget_exhausted", detail: `${b.toolCalls}/${l.maxToolCalls}` };
     if (wall >= l.maxWallClockMs) return { reason: "wall_clock_exhausted", detail: `${Math.round(wall / 1000)}s of ${Math.round(l.maxWallClockMs / 1000)}s` };
-    if (!forWait && cycle >= l.maxCycles) return { reason: "cycle_budget_exhausted", detail: `${cycle}/${l.maxCycles}` };
+    if (!forWait && config.autonomyMode === "continuous" && this.state.allocationCycles >= l.maxCycles) return { reason: "allocation_complete", detail: `${this.state.allocationCycles}/${l.maxCycles} decision cycles in this authorized allocation` };
+    if (!forWait && config.autonomyMode === "legacy" && cycle >= l.maxCycles) return { reason: "cycle_budget_exhausted", detail: `${cycle}/${l.maxCycles}` };
     if (b.conflicts >= l.maxConflicts) return { reason: "database_conflict_limit", detail: `${b.conflicts}/${l.maxConflicts} stale-revision conflicts` };
     if (this.mutationsEnabled) {
       if (b.advancedSimSeconds >= l.maxSimSeconds) return { reason: "sim_time_limit_reached", detail: `${b.advancedSimSeconds}/${l.maxSimSeconds} s` };
       if (b.advanceRequests >= l.maxAdvanceRequests) return { reason: "advance_request_budget_exhausted", detail: `${b.advanceRequests}/${l.maxAdvanceRequests}` };
-      if (b.consecutiveAdvances >= l.maxConsecutiveAdvances) return { reason: "consecutive_advance_limit", detail: this.inactivityDetail() };
+      if (b.consecutiveAdvances >= l.maxConsecutiveAdvances) return { reason: "zero_time_advance_limit", detail: `${b.consecutiveAdvances} consecutive advance requests granted no simulation time.` };
       const spent = this.farmSpend();
       if (spent !== null && spent >= l.maxFarmSpendCredits) return { reason: "farm_spend_limit_reached", detail: `${spent} of ${l.maxFarmSpendCredits} credits` };
       const inFlight = this.state.actions.some((a) => !TERMINAL_ACTION_STATUSES.has(a.status));
@@ -378,10 +417,99 @@ export class AutonomousController {
    * simulated-time budget still bound the real number of server advances.
    */
   private async recordInterval(r: IntervalResult): Promise<void> {
-    const b = this.state.budgets;
-    b.consecutiveAdvances = Math.max(0, b.consecutiveAdvances - Math.max(0, r.advanceRequests - 1));
     this.state.waits.push({ cycle: this.state.cycle, actionId: "checkpoint-interval", trigger: "model_tool", outcome: r.outcome, actionStatus: null, advanceRequests: r.advanceRequests, advancedSeconds: r.advancedSeconds, simTimeStartS: r.simTimeStartS, simTimeEndS: r.simTimeEndS, events: r.events, detail: r.detail });
     await this.save();
+  }
+
+  /** Advances one bounded server-authoritative checkpoint without a model call while waiting for the planned review. */
+  private async advanceWaitingCheckpoint(): Promise<boolean> {
+    const s = this.state;
+    const l = s.config.limits;
+    const b = s.budgets;
+    const target = s.waitingUntilSimTimeS;
+    if (target === null) {
+      this.setLifecycle("running");
+      await this.save();
+      return true;
+    }
+
+    const { clock } = await this.options.client.getFarmOverview(s.gameId);
+    s.lastSimTimeS = clock.simTimeS;
+    if (clock.simTimeS >= target) {
+      s.waitingUntilSimTimeS = null;
+      this.setLifecycle("running");
+      await this.save();
+      return true;
+    }
+
+    const stop = this.budgetStop(true);
+    if (stop) {
+      await this.end("paused", stop.reason, stop.detail);
+      return false;
+    }
+    const requested = Math.min(target - clock.simTimeS, l.maxWaitChunkSeconds, remainingSimFor(s));
+    if (requested <= 0) {
+      const exhausted = this.budgetStop(true);
+      await this.end("paused", exhausted?.reason ?? "sim_time_limit_reached", exhausted?.detail ?? "No simulated-time authorization remains.");
+      return false;
+    }
+    const result = await superviseInterval(
+      {
+        client: this.options.client,
+        gameId: s.gameId,
+        journal: this.journal,
+        newMutationId: this.options.newMutationId ?? (() => randomUUID()),
+        retryDelayMs: this.options.retryDelayMs ?? 400,
+        maxMutationRetries: 2,
+        budget: {
+          requestsLeft: Math.max(0, l.maxAdvanceRequests - b.advanceRequests),
+          simSecondsLeft: remainingSimFor(s),
+          maxChunkSeconds: l.maxWaitChunkSeconds,
+          maxCallSeconds: l.maxAdvanceSecondsPerCall,
+          conflictsLeft: Math.max(0, l.maxConflicts - b.conflicts),
+        },
+        getCursor: () => s.modelEventCursor,
+        setCursor: (cursor) => { s.modelEventCursor = Math.max(s.modelEventCursor, cursor); },
+        onAdvanced: () => undefined,
+        shouldStop: () => {
+          if (this.wallBase + (Date.now() - this.startedAt) >= l.maxWallClockMs) return "wall clock budget";
+          if (this.farmSpendExceeded()) return "farm spending limit";
+          return null;
+        },
+        record: (event, data) => this.log(`${event} ${JSON.stringify(data).slice(0, 160)}`),
+      },
+      { maxSeconds: requested, checkpointSeconds: Math.min(l.maxWaitChunkSeconds, l.maxAdvanceSecondsPerCall, requested) },
+    );
+    if (result.simTimeEndS !== null) s.lastSimTimeS = result.simTimeEndS;
+    if (result.advancedSeconds > 0) s.budgets.consecutiveNoProgress = 0;
+    s.waits.push({ cycle: s.cycle, actionId: "planned-review", trigger: "controller", outcome: result.outcome, actionStatus: null, advanceRequests: result.advanceRequests, advancedSeconds: result.advancedSeconds, simTimeStartS: result.simTimeStartS, simTimeEndS: result.simTimeEndS, events: result.events, detail: result.detail });
+    await this.save();
+
+    const reachedTarget = s.lastSimTimeS !== null && s.lastSimTimeS >= target;
+    if (result.outcome === "event_interrupt" || reachedTarget) {
+      s.waitingUntilSimTimeS = null;
+      this.setLifecycle("running");
+      await this.save();
+      return true;
+    }
+    const budget = this.budgetStop(true);
+    if (budget) {
+      await this.end("paused", budget.reason, budget.detail);
+      return false;
+    }
+    if (result.outcome !== "horizon_reached") {
+      s.recoveryAttempts += 1;
+      s.retryAfter = new Date(Date.now() + Math.min(60_000, 5_000 * 2 ** (s.recoveryAttempts - 1))).toISOString();
+      if (s.recoveryAttempts >= 3) {
+        await this.end("failed", "recovery_attempts_exhausted", result.detail ?? result.outcome);
+        return false;
+      }
+      await this.end("paused", "simulation_wait_interrupted", result.detail ?? result.outcome);
+      return false;
+    }
+    this.setLifecycle("waiting_for_simulation");
+    await this.end("paused", "waiting_for_simulation", `Advanced ${result.advancedSeconds}s of server time toward the planned review; no model call was needed.`);
+    return false;
   }
 
   private async recordWait(wait: WaitResult, trigger: WaitRecord["trigger"]): Promise<void> {
@@ -490,6 +618,7 @@ export class AutonomousController {
   private async loop(): Promise<SessionState> {
     const s = this.state;
     s.status = "running";
+    if (s.lifecycle !== "waiting_for_simulation") this.setLifecycle("running");
     s.stopReason = null;
     s.stopDetail = null;
     await this.save();
@@ -497,11 +626,26 @@ export class AutonomousController {
 
     for (;;) {
       if (!(await this.reconcile())) return await this.end("paused", "unresolved_mutation", "The outcome of a state-changing request could not be confirmed; resume to retry the same idempotency key.");
-      await this.refreshActions();
+      if (s.pendingModelCycle !== null) {
+        return await this.end(
+          "failed",
+          "model_request_outcome_unknown",
+          `The worker restarted during model cycle ${s.pendingModelCycle}. The request may have been billed, so it was not replayed. Review provider usage and start a new authorized session if needed.`,
+        );
+      }
       const stop = this.budgetStop();
-      if (stop) return await this.end("stopped", stop.reason, stop.detail);
+      if (stop) {
+        if (stop.reason === "allocation_complete") return await this.end("paused", "allocation_complete", stop.detail);
+        return await this.end(this.isBudgetReason(stop.reason) ? "paused" : "stopped", stop.reason, stop.detail);
+      }
+      if (s.lifecycle === "waiting_for_simulation" && s.waitingUntilSimTimeS !== null) {
+        const finishedWaiting = await this.advanceWaitingCheckpoint();
+        if (!finishedWaiting) return s;
+      }
+      await this.refreshActions();
 
       s.cycle += 1;
+      s.allocationCycles += 1;
       cyclesThisRun += 1;
       this.log(`cycle ${s.cycle}`);
       const sink: PlanSink = { latest: null, updates: 0 };
@@ -529,7 +673,14 @@ export class AutonomousController {
         eligibilityChanged = this.lastEligibility !== null && this.lastEligibility !== signature;
         this.lastEligibility = signature;
         const inFlight = s.actions.some((a) => !TERMINAL_ACTION_STATUSES.has(a.status)) || snapshot.overview.status.activeActionCount > 0;
-        if (!eligible && !inFlight) return await this.end("completed", "no_eligible_actions", "The simulator offers no eligible action and no operation is in flight.");
+        if (!eligible && !inFlight) {
+          if (s.config.autonomyMode === "continuous" && this.mutationsEnabled && remainingSimFor(this.state) > 0) {
+            s.waitingUntilSimTimeS = snapshot.simTimeS + Math.min(s.config.limits.maxWaitChunkSeconds, remainingSimFor(this.state));
+            await this.save();
+            return await this.end("paused", "waiting_for_simulation", "No action is currently eligible; advancing one bounded server-authoritative checkpoint before reviewing again.");
+          }
+          if (s.config.autonomyMode === "legacy") return await this.end("completed", "no_eligible_actions", "The simulator offers no eligible action and no operation is in flight.");
+        }
 
         const l = s.config.limits;
         const b = s.budgets;
@@ -551,6 +702,8 @@ export class AutonomousController {
         const briefInput = { state: s, snapshot, events, progress: buildProgress(s), economics: buildEconomics(s) };
         const briefSizeEstimate = measureCycleBrief(briefInput);
         this.log(`cycle ${s.cycle} prompt estimate ${JSON.stringify({ cycle: s.cycle, source: "estimated", charsPerTokenHeuristic: 4, totalEstimatedTokens: briefSizeEstimate.totalEstimatedTokens, systemPromptEstimatedTokens: briefSizeEstimate.systemPromptEstimatedTokens, sections: Object.fromEntries(briefSizeEstimate.sections.map((sec) => [sec.section, sec.estimatedTokens])) })}`);
+        s.pendingModelCycle = s.cycle;
+        await this.save();
         result = await runAgent({
           provider: this.options.provider,
           client: this.options.client,
@@ -569,7 +722,7 @@ export class AutonomousController {
           retryDelayMs: this.options.retryDelayMs ?? 400,
           ...(this.options.newMutationId ? { newMutationId: this.options.newMutationId } : {}),
           limits: {
-            maxModelCalls: Math.max(1, Math.min(l.maxModelCallsPerCycle, l.maxModelCalls - b.modelCalls)),
+            maxModelCalls: Math.max(1, Math.min(l.maxModelCallsPerCycle, l.maxModelCalls - b.modelCalls - b.failedModelCalls)),
             maxTotalToolCalls: Math.max(1, Math.min(l.maxToolCallsPerCycle, l.maxToolCalls - b.toolCalls)),
             maxToolCallsPerStep: 4,
             maxOutputTokens: l.maxOutputTokens,
@@ -588,6 +741,9 @@ export class AutonomousController {
         s.modelEventCursor = Math.max(eventsResponse.nextCursor, result.state.eventCursor);
       } catch (error) {
         if (error instanceof SessionLockLostError) throw error;
+        if (s.pendingModelCycle !== null) {
+          return await this.end("failed", "model_request_outcome_unknown", `The worker lost the outcome of model cycle ${s.pendingModelCycle}; it will not replay a potentially billed request.`);
+        }
         if (isAuthFailure(error)) return await this.end("paused", "authentication_failure", "The simulator rejected the agent credentials (401/403).");
         if (error instanceof InconsistentObservationError) return await this.end("paused", "inconsistent_observation", error.message);
         s.budgets.consecutiveErrors += 1;
@@ -606,6 +762,8 @@ export class AutonomousController {
       s.usage.inputTokens += result.totals.inputTokens;
       s.usage.outputTokens += result.totals.outputTokens;
       s.usage.cachedTokens += result.totals.cachedTokens;
+      s.pendingModelCycle = null;
+      await this.save();
       // Real provider-reported usage for this cycle (as opposed to the pre-call estimate logged above).
       this.log(`cycle ${s.cycle} usage ${JSON.stringify({ cycle: s.cycle, source: "provider", modelCalls: result.totals.modelCalls, failedModelCalls: result.totals.failedModelCalls, modelRetryAttempts: result.totals.modelRetryAttempts, inputTokens: result.totals.inputTokens, outputTokens: result.totals.outputTokens, cachedTokens: result.totals.cachedTokens, estimatedCostUsd: Math.round(result.totals.estimatedCostUsd * 1e6) / 1e6 })}`);
       if (sink.latest) s.plan = sink.latest;
@@ -640,24 +798,49 @@ export class AutonomousController {
 
       const hadUnknown = s.pendingMutation !== null;
       b.consecutiveErrors = failedRun || hadUnknown ? b.consecutiveErrors + 1 : 0;
+      if (!failedRun && !hadUnknown) {
+        s.recoveryAttempts = 0;
+        s.retryAfter = null;
+      }
       b.consecutiveNoProgress = progress ? 0 : b.consecutiveNoProgress + 1;
       await this.save();
 
       if (result.error && /HTTP (401|403)/.test(result.error)) return this.end("paused", "authentication_failure", "The model API rejected the credentials (401/403).");
       if (s.pendingMutation) continue; // reconcile first; never act on top of an unknown outcome
-      if (result.stopReason === "wall_clock_limit") return this.end("stopped", "wall_clock_exhausted");
+      if (result.stopReason === "wall_clock_limit") return this.end("paused", "wall_clock_exhausted", "The authorized cumulative wall-clock budget is exhausted; explicitly authorize more time to continue.");
       if (sink.latest?.nextStep === "stop") return this.end("completed", "model_declared_done", sink.latest.stopReason);
       // A cycle whose model request failed produced no observation; it must not read as a finished observe-only session.
       if (!this.mutationsEnabled && (result.stopReason === "model_error" || result.stopReason === "empty_response")) return this.end("failed", "model_error", result.error ? result.error.slice(0, 300) : `The model produced no decision (${result.stopReason}).`);
       if (!this.mutationsEnabled) return this.end("completed", "observe_only_complete", "Mutations are disabled; one observation-and-planning cycle was run.");
       if (b.consecutiveErrors >= s.config.limits.maxConsecutiveErrors) {
         const modelFailure = result.stopReason === "model_error" || result.stopReason === "empty_response";
+        s.recoveryAttempts += 1;
+        s.retryAfter = new Date(Date.now() + Math.min(60_000, 5_000 * 2 ** (s.recoveryAttempts - 1))).toISOString();
+        if (s.recoveryAttempts >= 3) return this.end("failed", "recovery_attempts_exhausted", modelFailure && result.error ? result.error.slice(0, 300) : "Automatic recovery stopped after three bounded retry slices.");
         return this.end("paused", "consecutive_errors", modelFailure && result.error ? result.error.slice(0, 300) : undefined);
       }
       if (b.consecutiveRejections >= s.config.limits.maxConsecutiveRejections) return this.end("stopped", "repeated_rejections");
-      if (b.consecutiveNoProgress >= s.config.limits.maxConsecutiveNoProgress) return this.end("stopped", "no_progress", describeNoProgress(s));
+      if (b.consecutiveNoProgress >= s.config.limits.maxConsecutiveNoProgress) return this.end(s.config.autonomyMode === "continuous" ? "paused" : "stopped", "no_progress", describeNoProgress(s));
+      if (
+        s.config.autonomyMode === "continuous" &&
+        this.mutationsEnabled &&
+        !s.actions.some((a) => !TERMINAL_ACTION_STATUSES.has(a.status)) &&
+        s.plan?.nextReviewSimSeconds !== null &&
+        s.plan?.nextReviewSimSeconds !== undefined &&
+        s.lastSimTimeS !== null &&
+        s.plan.nextReviewSimSeconds > s.lastSimTimeS
+      ) {
+        s.waitingUntilSimTimeS = Math.min(s.plan.nextReviewSimSeconds, s.lastSimTimeS + remainingSimFor(s));
+        if (s.waitingUntilSimTimeS > s.lastSimTimeS) {
+          await this.save();
+          return this.end("paused", "waiting_for_simulation", "The next review is scheduled at the planned simulation checkpoint; no model calls are made before then unless a material event interrupts it.");
+        }
+      }
       const budget = this.budgetStop();
-      if (budget) return this.end("stopped", budget.reason, budget.detail);
+      if (budget) {
+        if (budget.reason === "allocation_complete") return this.end("paused", "allocation_complete", budget.detail);
+        return this.end(this.isBudgetReason(budget.reason) ? "paused" : "stopped", budget.reason, budget.detail);
+      }
       if (this.options.sliceCycles !== undefined && cyclesThisRun >= this.options.sliceCycles) return this.end("paused", "slice_complete", `${cyclesThisRun} cycle(s) run in this process; resume continues the same budgets.`);
     }
   }

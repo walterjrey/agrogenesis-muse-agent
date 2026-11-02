@@ -13,7 +13,7 @@ import { RunTrace } from "./trace.js";
 export type StopReason = "final_answer" | "model_call_limit" | "cost_limit" | "model_error" | "empty_response" | "wall_clock_limit";
 
 export interface RunTotals {
-  /** Successful logical model calls only (each may have taken several physical HTTP attempts; see modelRetryAttempts). */
+  /** Logical model calls that produced a usable response; failed logical calls are tracked separately. */
   modelCalls: number;
   toolCalls: number;
   inputTokens: number;
@@ -26,7 +26,7 @@ export interface RunTotals {
   acceptedInspections: number;
   inspectionAttempts: number;
   advancedSimSeconds: number;
-  /** Logical model calls that never produced a usable response, after the provider's retry policy was exhausted. Excludes local spend-guard refusals, which never reach the network. */
+  /** Logical calls that did not produce a usable response; includes failed output retries, but not local spend-guard refusals. */
   failedModelCalls: number;
   /** Physical HTTP retry attempts beyond the first, summed across every logical call (successful or failed) in this run. */
   modelRetryAttempts: number;
@@ -99,6 +99,7 @@ export async function runAgent(options: RunOptions): Promise<RunResult & { trace
   const exposed = registry.filter((tool) => policy.isExposed(tool));
   const tools = toolSpecs(registry, (tool) => policy.isExposed(tool));
   const totals = { inputTokens: 0, outputTokens: 0, cachedTokens: 0, estimatedCostUsd: 0, failedModelCalls: 0, modelRetryAttempts: 0 };
+  let successfulModelCalls = 0;
 
   trace.record("run.start", { runId, gameId: options.gameId, modelId: options.provider.modelId, mode: options.mode, limits, exposedTools: exposed.map((t) => t.name) });
 
@@ -178,6 +179,7 @@ export async function runAgent(options: RunOptions): Promise<RunResult & { trace
       break;
     }
     retriedUnusable = false;
+    successfulModelCalls += 1;
 
     messages.push(response.assistantMessage);
     for (const call of response.toolCalls) callMeta.set(call.id, { name: call.name, arguments: call.arguments });
@@ -216,7 +218,7 @@ export async function runAgent(options: RunOptions): Promise<RunResult & { trace
     gameId: options.gameId,
     finalSummary,
     totals: {
-      modelCalls: policy.modelCalls,
+      modelCalls: successfulModelCalls,
       toolCalls: policy.toolCalls,
       ...totals,
       acceptedMutations: policy.acceptedMutations,

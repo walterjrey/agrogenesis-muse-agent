@@ -8,7 +8,7 @@ import { SimulatorClient } from "../../src/simulator/client.js";
 
 export interface FakeSim {
   server: MockServer;
-  state: { revision: number; accepted: number; replays: number };
+  state: { revision: number; accepted: number; replays: number; simTimeS: number };
   posts: Array<{ path: string; body: Record<string, unknown> }>;
   client: SimulatorClient;
   close(): Promise<void>;
@@ -22,7 +22,7 @@ const BASE = `/api/agent/v1/games/${GAME_ID}`;
 /** `lostResponses`: the first N POSTs are committed but their responses arrive after the client timeout (simulates response loss). */
 export async function fakeSimulator(override?: Override, clientTimeoutMs = 2000, lostResponses = 0): Promise<FakeSim> {
   let lost = lostResponses;
-  const state = { revision: 4, accepted: 0, replays: 0 };
+  const state = { revision: 4, accepted: 0, replays: 0, simTimeS: clock.simTimeS };
   const posts: FakeSim["posts"] = [];
   const stored = new Map<string, { status: number; body: unknown }>();
 
@@ -32,11 +32,11 @@ export async function fakeSimulator(override?: Override, clientTimeoutMs = 2000,
     const early = override?.(req, state);
     if (early) return early;
     if (req.method === "GET") {
-      if (path === "/overview") return { status: 200, body: { ...overview, revision: state.revision } };
-      if (path === "/fields") return { status: 200, body: { ...fieldObservations, revision: state.revision } };
-      if (path === "/actions") return { status: 200, body: { ...availableActions, revision: state.revision } };
+      if (path === "/overview") return { status: 200, body: { ...overview, revision: state.revision, clock: { ...clock, simTimeS: state.simTimeS, simDay: Math.floor(state.simTimeS / 60) } } };
+      if (path === "/fields") return { status: 200, body: { ...fieldObservations, revision: state.revision, simTimeS: state.simTimeS } };
+      if (path === "/actions") return { status: 200, body: { ...availableActions, revision: state.revision, simTimeS: state.simTimeS } };
       if (path === "/actions/act-1") return { status: 200, body: { gameId: GAME_ID, action: executeAccepted.action } };
-      if (path === "/events") return { status: 200, body: { gameId: GAME_ID, clock, events: [], nextCursor: 0 } };
+      if (path === "/events") return { status: 200, body: { gameId: GAME_ID, clock: { ...clock, simTimeS: state.simTimeS, simDay: Math.floor(state.simTimeS / 60) }, events: [], nextCursor: 0 } };
       return { status: 404, body: { error: "not found", code: "not_found" } };
     }
     const body = JSON.parse(req.body) as Record<string, unknown>;
@@ -53,7 +53,9 @@ export async function fakeSimulator(override?: Override, clientTimeoutMs = 2000,
       response = { status: 201, body: { ...executeAccepted, revision: state.revision } };
     } else {
       const granted = Math.min(Number(body.requestedSeconds), 1800);
-      response = { status: 200, body: { gameId: GAME_ID, clockBefore: clock, clockAfter: { ...clock, simTimeS: clock.simTimeS + granted }, requestedSeconds: body.requestedSeconds, grantedSeconds: granted, stoppedBecause: "requested_time_reached", events: [], nextCursor: 0 } };
+      const before = state.simTimeS;
+      state.simTimeS += granted;
+      response = { status: 200, body: { gameId: GAME_ID, clockBefore: { ...clock, simTimeS: before }, clockAfter: { ...clock, simTimeS: state.simTimeS, simDay: Math.floor(state.simTimeS / 60) }, requestedSeconds: body.requestedSeconds, grantedSeconds: granted, stoppedBecause: "requested_time_reached", events: [], nextCursor: 0 } };
     }
     stored.set(key, response);
     if (lost > 0) { lost -= 1; return { ...response, delayMs: clientTimeoutMs + 300 }; }

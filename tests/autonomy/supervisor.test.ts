@@ -232,7 +232,7 @@ describe("MOCKED controller: supervised waiting", () => {
     sim = await timedSim({ durationS: 100_000, estimateS: null });
     const { store } = sessionSetup({ maxAdvanceRequests: 2, maxWaitChunkSeconds: 60, maxCycles: 5 });
     const final = await ctl(store, sim, scriptedModel([EXECUTE, TEXT("Started.")])).run();
-    expect(final).toMatchObject({ status: "stopped", stopReason: "advance_request_budget_exhausted" });
+    expect(final).toMatchObject({ status: "paused", lifecycle: "awaiting_budget", stopReason: "advance_request_budget_exhausted" });
     expect(sim.state.advances).toHaveLength(2);
   });
 
@@ -244,19 +244,20 @@ describe("MOCKED controller: supervised waiting", () => {
     const advancesAfterFirst = sim.state.advances.length;
     const simTime = sim.state.simTimeS;
     expect(first.budgets.advancedSimSeconds).toBe(simTime);
-    // A stopped session cannot be resumed (budgets are never raised automatically): nothing is replayed.
-    await expect(ctl(store, sim, scriptedModel([TEXT("x")])).run()).rejects.toThrow(/cannot be resumed/);
+    // An exhausted authorization remains paused and cannot advance or replay anything without explicit extension.
+    const resumed = await ctl(store, sim, scriptedModel([TEXT("x")])).run();
+    expect(resumed).toMatchObject({ status: "paused", lifecycle: "awaiting_budget", stopReason: "sim_time_limit_reached" });
     expect(sim.state.advances).toHaveLength(advancesAfterFirst);
     expect(sim.state.simTimeS).toBe(simTime);
   });
 
-  it("stops after too many consecutive advances without a new action", async () => {
+  it("does not penalize positive-time progress with the zero-time advance safeguard", async () => {
     sim = await timedSim({ durationS: 100_000, estimateS: null });
     const { store } = sessionSetup({ maxConsecutiveAdvances: 3, maxWaitChunkSeconds: 60, maxCycles: 5 });
     const final = await ctl(store, sim, scriptedModel([EXECUTE, TEXT("Started.")])).run();
-    expect(final.stopReason).toBe("consecutive_advance_limit");
-    expect(final.stopDetail).toMatch(/3\/3 consecutive waits without an accepted farm action or inspection/);
-    expect(sim.state.advances).toHaveLength(3);
+    expect(final.stopReason).not.toBe("zero_time_advance_limit");
+    expect(final.budgets.consecutiveAdvances).toBe(0);
+    expect(sim.state.advances.length).toBeGreaterThan(3);
   });
 
   it("counts one review interval as one waiting decision, however many checkpoints it used", async () => {
@@ -266,16 +267,16 @@ describe("MOCKED controller: supervised waiting", () => {
     const final = await ctl(store, sim, scriptedModel([interval, TEXT("Waited."), TEXT("Nothing justified.")])).run();
     expect(sim.state.advances.length).toBeGreaterThan(2);
     expect(final.budgets.advanceRequests).toBe(sim.state.advances.length);
-    expect(final.budgets.consecutiveAdvances).toBe(1);
-    expect(final.stopReason).not.toBe("consecutive_advance_limit");
+    expect(final.budgets.consecutiveAdvances).toBe(0);
+    expect(final.stopReason).not.toBe("zero_time_advance_limit");
   });
 
-  it("cannot bypass the consecutive-wait limit by repeating wait_for_checkpoint across cycles", async () => {
-    sim = await timedSim({ durationS: 30, estimateS: 30 });
-    const { store } = sessionSetup({ maxConsecutiveAdvances: 2, maxCycles: 8 });
+  it("cannot bypass the zero-time advance limit by repeating wait_for_checkpoint across cycles", async () => {
+    sim = await timedSim({ durationS: 30, estimateS: 30, maxGrantS: 0 });
+    const { store } = sessionSetup({ maxConsecutiveAdvances: 2, maxCycles: 8, maxConsecutiveNoProgress: 8 });
     const interval: ScriptedStep = { calls: [{ name: "wait_for_checkpoint", args: { maxDays: 4, checkpointDays: 2, rationale: "Let time pass." } }] };
     const final = await ctl(store, sim, scriptedModel([interval, TEXT("Waited."), interval, TEXT("Waited."), interval, TEXT("Waited."), interval, TEXT("Waited.")])).run();
-    expect(final.stopReason).toBe("consecutive_advance_limit");
+    expect(final.stopReason).toBe("zero_time_advance_limit");
     expect(final.budgets.consecutiveAdvances).toBe(2);
     expect(final.waits.filter((w) => w.actionId === "checkpoint-interval")).toHaveLength(2);
   });
