@@ -86,9 +86,10 @@ export async function runWorkerOnce(options: WorkerOptions): Promise<number> {
         stopReason === "allocation_complete" ||
         stopReason === "waiting_for_simulation" ||
         stopReason === "consecutive_errors" ||
+        stopReason === "simulation_wait_interrupted" ||
         stopReason === "repeated_rejections"
       );
-      const recovering = stopReason === "consecutive_errors" || stopReason === "repeated_rejections";
+      const recovering = stopReason === "consecutive_errors" || stopReason === "simulation_wait_interrupted" || stopReason === "repeated_rejections";
       const cause = `${status}: ${stopReason ?? "unknown"}${stopDetail ? ` — ${stopDetail}` : ""}`;
       await backend.settleControl(sessionId, { stopRunning: !resumable, lastError: recovering ? truncate(cause) : resumable || status === "completed" ? null : truncate(cause) });
       emit({ type: "slice_finished", sessionId, status, stopReason, finished: result.finished });
@@ -120,12 +121,14 @@ const sleep = (ms: number, signal?: AbortSignal) =>
 export async function runWorker(options: WorkerOptions): Promise<void> {
   const interval = options.pollIntervalMs ?? 5_000;
   while (!options.signal?.aborted) {
+    let ran = 0;
     try {
-      await runWorkerOnce(options);
+      ran = await runWorkerOnce(options);
     } catch (error) {
       options.onEvent?.({ type: "slice_failed", sessionId: "-", error: truncate(String(error instanceof Error ? error.message : error)) });
     }
-    await sleep(interval, options.signal);
+    // Work was done: poll again almost immediately so accelerated waits do not idle between slices. Backoff is enforced by retryAfter in the claim query, not by sleeping here.
+    await sleep(ran > 0 ? Math.min(interval, 250) : interval, options.signal);
   }
   options.onEvent?.({ type: "stopped" });
 }

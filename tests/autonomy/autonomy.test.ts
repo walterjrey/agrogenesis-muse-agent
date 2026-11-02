@@ -10,6 +10,7 @@ import { SessionLockLostError, SessionLockedError, SessionStore } from "../../sr
 import type { SessionLimits, SessionState } from "../../src/autonomy/types.js";
 import type { AvailableActions } from "../../src/contracts/actions.js";
 import { ModelApiError } from "../../src/model/meta.js";
+import { SpendLimitError } from "../../src/model/spendGuard.js";
 import { availableActions, clock, executeAccepted, fieldObservations, GAME_ID, overview } from "../fixtures.js";
 import { countingIds, fakeSimulator, scriptedModel, type FakeSim, type ScriptedStep } from "../agent/harness.js";
 
@@ -646,14 +647,38 @@ describe("MOCKED continuous autonomous lifecycle", () => {
     const waiting = await controller(store, sim, model, { sliceCycles: 1 }).run();
     expect(waiting).toMatchObject({ status: "paused", lifecycle: "waiting_for_simulation", stopReason: "waiting_for_simulation", cycle: 1, waitingUntilSimTimeS: clock.simTimeS + 1_200 });
     const callsBeforeWait = model.requests.length;
-    const checkpoint = await controller(store, sim, model, { sliceCycles: 1 }).run();
-    expect(checkpoint.lifecycle).toBe("waiting_for_simulation");
-    expect(model.requests).toHaveLength(callsBeforeWait);
-    expect(checkpoint.budgets.advancedSimSeconds).toBe(600);
+    // One slice chains the whole accelerated wait server-side and wakes the model exactly at the planned review.
     const reviewed = await controller(store, sim, model, { sliceCycles: 1 }).run();
     expect(reviewed).toMatchObject({ lifecycle: "completed", cycle: 2, stopReason: "model_declared_done" });
     expect(model.requests).toHaveLength(callsBeforeWait + 2);
     expect(reviewed.budgets.advancedSimSeconds).toBe(1_200);
+  });
+
+  it("advances a stable farm 40 simulated days in ONE slice with a single model decision, then wakes at the review", async () => {
+    sim = await fakeSimulator();
+    const model = scriptedModel([planReviewAt(clock.simTimeS + 2_400), TEXT, PLAN("stop", "Harvest review."), TEXT]);
+    const { store } = setup({}, true, {}, "continuous");
+    const waiting = await controller(store, sim, model).run();
+    expect(waiting).toMatchObject({ lifecycle: "waiting_for_simulation", stopReason: "waiting_for_simulation" });
+    const final = await controller(store, sim, model).run();
+    expect(final.decisions).toHaveLength(2);
+    expect(final.decisions.length).toBeLessThan(30);
+    // The 40 days were covered by checkpoint requests recorded as waits (simulation progress), not as decisions.
+    expect(final.waits.reduce((sum, w) => sum + w.advancedSeconds, 0)).toBe(2_400);
+    expect(model.requests).toHaveLength(4);
+  });
+
+  it("bounds a single accelerated wait by real time, then continues in the next slice with no model call", async () => {
+    sim = await fakeSimulator();
+    const model = scriptedModel([planReviewAt(clock.simTimeS + 7_200), TEXT, PLAN("stop", "done"), TEXT]);
+    const { store } = setup({}, true, {}, "continuous");
+    let state = await controller(store, sim, model, { sliceCycles: 1, waitSliceMs: 0 }).run();
+    expect(state).toMatchObject({ stopReason: "waiting_for_simulation" });
+    const calls = model.requests.length;
+    for (let n = 0; n < 10 && state.lifecycle === "waiting_for_simulation"; n += 1) state = await controller(store, sim, model, { waitSliceMs: 0 }).run();
+    expect(state.lifecycle).toBe("completed");
+    expect(model.requests).toHaveLength(calls + 2);
+    expect(state.budgets.advancedSimSeconds).toBe(7_200);
   });
 
   it("does not allow zero-time advances to bypass the no-progress safeguards", async () => {
@@ -766,21 +791,51 @@ describe("MOCKED continuous autonomy: no cumulative simulated-time or farm-spend
       expect(state.status).not.toBe("stopped");
       expect(state.stopReason).not.toBe("recovery_attempts_exhausted");
       expect(state.recoveryAttempts).toBe(0);
-      expect(state.retryAfter).not.toBeNull();
     }
     expect(state.budgets.rejectedActions).toBeGreaterThanOrEqual(8);
     expect(state.budgets.acceptedMutations).toBe(0);
     expect(sim.state.accepted).toBe(0);
   });
 
-  it("still uses bounded recovery for transient infrastructure failures (model errors), ending in an actionable failure", async () => {
+  it("never fails a continuous session on transient provider outages: persistent, escalating retryAfter and automatic recovery", async () => {
     sim = await fakeSimulator();
     const { store } = setup({ maxConsecutiveErrors: 1, maxCostUsd: 5 }, true, {}, "continuous");
     const boom = (): ScriptedStep => ({ throws: new ModelApiError("Model API error (HTTP 503).", "server", 503) });
     let state = store.load("t1");
-    for (let round = 0; round < 3; round += 1) state = await controller(store, sim, scriptedModel([boom(), boom(), boom(), boom(), boom(), boom(), boom()])).run();
-    expect(state).toMatchObject({ status: "failed", lifecycle: "failed", stopReason: "recovery_attempts_exhausted" });
+    const delays: number[] = [];
+    for (let round = 0; round < 6; round += 1) {
+      const started = Date.now();
+      state = await controller(store, sim, scriptedModel(Array.from({ length: 8 }, boom))).run();
+      expect(state).toMatchObject({ status: "paused", lifecycle: "recovering", stopReason: "consecutive_errors", recoveryAttempts: round + 1 });
+      delays.push(Date.parse(state.retryAfter!) - started);
+    }
+    expect(delays[1]!).toBeGreaterThan(delays[0]! * 1.5);
+    expect(delays[5]!).toBeLessThanOrEqual(300_500);
+    expect(delays[5]!).toBeGreaterThan(100_000);
+    // The outage ends: the next slice completes a clean cycle, resets recovery and keeps the session alive.
+    const recovered = await controller(store, sim, scriptedModel([PLAN("stop", "done"), TEXT])).run();
+    expect(recovered).toMatchObject({ status: "completed", recoveryAttempts: 0, retryAfter: null });
   });
+
+  it("pauses for explicit intervention on deterministic provider rejections (HTTP 400) instead of retrying forever", async () => {
+    sim = await fakeSimulator();
+    const { store } = setup({ maxConsecutiveErrors: 1, maxCostUsd: 5 }, true, {}, "continuous");
+    const bad = (): ScriptedStep => ({ throws: new ModelApiError("Model API error (HTTP 400): invalid request.", "bad_request", 400) });
+    const state = await controller(store, sim, scriptedModel(Array.from({ length: 8 }, bad))).run();
+    expect(state).toMatchObject({ status: "paused", lifecycle: "failed", stopReason: "model_configuration_error" });
+    expect(state.stopDetail).toMatch(/HTTP 400/);
+  });
+
+  it("treats a pre-flight spend refusal as a spending-cap pause, not a provider failure or a recovery attempt", async () => {
+    sim = await fakeSimulator();
+    const { store } = setup({ maxCostUsd: 1, maxCostPerRequestUsd: 0.1, maxConsecutiveErrors: 1 }, true, {}, "continuous");
+    const model = scriptedModel([{ throws: new SpendLimitError("Worst-case request cost exceeds the remaining session cap.", "session") }]);
+    const state = await controller(store, sim, model).run();
+    expect(state).toMatchObject({ status: "paused", lifecycle: "awaiting_budget", stopReason: "cost_budget_exhausted", recoveryAttempts: 0, retryAfter: null });
+    expect(state.stopDetail).toMatch(/No request was sent/);
+    expect(state.budgets.failedModelCalls).toBe(0);
+  });
+
   it("keeps waiting for hundreds of cycles of healthy waiting without ending or calling the model", async () => {
     sim = await fakeSimulator((req, state) => (req.url.includes("/actions") && !/\/actions\/act-/.test(req.url) && req.method === "GET" ? ineligible(state) : undefined));
     const model = scriptedModel([TEXT]);
@@ -796,25 +851,27 @@ describe("MOCKED continuous autonomy: no cumulative simulated-time or farm-spend
     expect(state.recoveryAttempts).toBe(0);
   });
 
-  it("answers repeated ineffective decisions with escalating backoff, not termination, and few model calls", async () => {
+  it("answers repeated ineffective decisions with escalating server-time waits, not termination, idle delays or extra model calls", async () => {
     sim = await fakeSimulator();
     const { store } = setup({ maxConsecutiveNoProgress: 3, maxCostUsd: 1, maxWaitChunkSeconds: 600 }, true, {}, "continuous");
     const model = scriptedModel(Array.from({ length: 20 }, () => [PLAN("continue"), TEXT]).flat());
-    const delays: number[] = [];
+    const waits: number[] = [];
     let calls = 0;
     for (let slice = 0; slice < 4; slice += 1) {
-      const started = Date.now();
       const state = await controller(store, sim, model).run();
       expect(state).toMatchObject({ status: "paused", lifecycle: "waiting_for_simulation", stopReason: "waiting_for_simulation" });
-      expect(state.stopDetail).toMatch(/Autonomy stays enabled/);
-      delays.push(Math.round((Date.parse(state.retryAfter!) - started) / 1000));
+      // The wait itself paces the model: no real-time retryAfter idling while simulated time can progress.
+      expect(state.retryAfter).toBeNull();
+      waits.push(state.waitingUntilSimTimeS! - state.lastSimTimeS!);
       const added = model.requests.length - calls;
       calls = model.requests.length;
-      // First slice needs the 3 ineffective cycles; each later slice asks the model exactly once before backing off again.
+      // First slice needs the 3 ineffective cycles; each later slice asks the model exactly once before waiting again.
       expect(added).toBe(slice === 0 ? 6 : 2);
     }
-    expect(delays[0]).toBeGreaterThanOrEqual(9);
-    for (let i = 1; i < delays.length; i += 1) expect(delays[i]!).toBeGreaterThan(delays[i - 1]! * 1.5);
+    expect(waits[0]).toBeGreaterThanOrEqual(1_800);
+    expect(waits[1]!).toBeGreaterThan(waits[0]!);
+    expect(waits[2]!).toBeGreaterThan(waits[1]!);
+    expect(waits[3]!).toBeGreaterThanOrEqual(waits[2]!);
     expect(store.load("t1").budgets.acceptedMutations).toBe(0);
   });
 

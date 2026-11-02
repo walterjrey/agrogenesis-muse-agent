@@ -36,6 +36,32 @@ export interface NewSessionOptions {
 
 const EMPTY_SCENARIO: ScenarioManifest = { name: null, seed: null, startSnapshotSha256: null, worldConfigSha256: null, startObservationSha256: null, startRevision: null, startSimTimeS: null, notes: [] };
 
+/** Persistent exponential recovery delay: 5 s doubling per attempt, capped at 5 minutes. */
+export function recoveryDelayMs(attempt: number): number {
+  return Math.min(300_000, 5_000 * 2 ** Math.max(0, Math.min(attempt, 16) - 1));
+}
+
+export type FailureClass = "transient" | "configuration" | "authentication";
+
+/** Classifies a model/provider error string. Only definitive 4xx client errors are deterministic; everything else may recover. */
+export function classifyModelError(message: string | null | undefined): FailureClass {
+  const text = message ?? "";
+  if (/HTTP (401|403)/.test(text)) return "authentication";
+  if (/HTTP (400|404|405|409|410|413|415|422)\b/.test(text)) return "configuration";
+  return "transient";
+}
+
+/** Simulator connectivity and 5xx/timeouts are transient; anything else thrown by the controller is a deterministic fault. */
+export function isTransientControllerError(error: unknown): boolean {
+  if (error instanceof SimulatorError) return error.kind === "network" || error.kind === "timeout" || (error.kind === "http" && (error.status === undefined || error.status >= 500 || error.status === 429));
+  const message = error instanceof Error ? error.message : "";
+  return /fetch failed|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|socket hang up|network|timed? ?out/i.test(message);
+}
+
+/** Real-time bound for one accelerated wait inside a worker slice; the next slice continues without a model call. */
+const ACCELERATED_WAIT_SLICE_MS = 30_000;
+const SLICE_TIME_BOUND = "slice time bound";
+
 /** Primitive request parameters only (crop, volumeM3, kg, ...). */
 function primitiveParams(request: Record<string, unknown>): Record<string, string | number | boolean> {
   const out: Record<string, string | number | boolean> = {};
@@ -125,6 +151,8 @@ export interface ControllerOptions {
   onEvent?: (message: string) => void;
   /** Aborts an in-flight model request or retry backoff (e.g. worker shutdown). */
   signal?: AbortSignal;
+  /** Real-time bound (ms) for one accelerated wait inside a slice. Default 30 s. */
+  waitSliceMs?: number;
 }
 
 const REASONS_RESUMABLE = new Set(["paused", "running"]);
@@ -218,7 +246,7 @@ export class AutonomousController {
     else if (reason === "waiting_for_simulation") this.setLifecycle("waiting_for_simulation");
     else if (this.isBudgetReason(reason)) this.setLifecycle("awaiting_budget");
     else if (reason === "consecutive_errors" || reason === "controller_error" || reason === "no_progress" || reason === "repeated_rejections" || reason === "simulation_wait_interrupted") this.setLifecycle("recovering");
-    else if (reason === "authentication_failure" || reason === "inconsistent_observation" || reason === "recovery_attempts_exhausted") this.setLifecycle("failed");
+    else if (reason === "authentication_failure" || reason === "inconsistent_observation" || reason === "recovery_attempts_exhausted" || reason === "model_configuration_error" || reason === "simulation_wait_refused") this.setLifecycle("failed");
     else if (reason === "paused_by_operator" || reason === "cancelled_by_operator") this.setLifecycle("paused_by_user");
     else if (reason === "slice_complete" || reason === "allocation_complete") this.setLifecycle("running");
     else if (status === "stopped") this.setLifecycle("failed");
@@ -229,12 +257,21 @@ export class AutonomousController {
 
   /** Continuous sessions answer a zero-time-advance loop with bounded, backed-off recovery slices, then an actionable failure. */
   private async zeroTimeRecovery(detail: string): Promise<SessionState> {
+    this.state.budgets.consecutiveAdvances = 0;
+    return this.transientRecovery("consecutive_errors", detail);
+  }
+
+  /**
+   * Transient failures (provider outage, simulator connectivity, interrupted waits, zero-time loops) never end a
+   * continuous session. Each one persists an exponentially growing retryAfter (5 s doubling, capped at 5 min) that the
+   * worker claim query honors across restarts, so recovery is automatic, cheap and never a tight loop.
+   */
+  private async transientRecovery(reason: "consecutive_errors" | "simulation_wait_interrupted", detail: string | null): Promise<SessionState> {
     const s = this.state;
-    s.budgets.consecutiveAdvances = 0;
     s.recoveryAttempts += 1;
-    s.retryAfter = new Date(Date.now() + Math.min(60_000, 5_000 * 2 ** (s.recoveryAttempts - 1))).toISOString();
-    if (s.recoveryAttempts >= 3) return this.end("failed", "recovery_attempts_exhausted", `${detail} Automatic recovery stopped after three backed-off retries.`);
-    return this.end("paused", "consecutive_errors", detail);
+    s.retryAfter = new Date(Date.now() + recoveryDelayMs(s.recoveryAttempts)).toISOString();
+    const note = `Automatic recovery attempt ${s.recoveryAttempts}; next retry after ${s.retryAfter}.`;
+    return this.end("paused", reason, detail ? `${detail.slice(0, 300)} ${note}` : note);
   }
 
   /**
@@ -246,16 +283,18 @@ export class AutonomousController {
   private async noProgressBackoff(): Promise<SessionState> {
     const s = this.state;
     const over = Math.max(0, s.budgets.consecutiveNoProgress - s.config.limits.maxConsecutiveNoProgress);
+    const inFlight = s.actions.some((a) => !TERMINAL_ACTION_STATUSES.has(a.status));
+    if (this.mutationsEnabled && !inFlight && s.lastSimTimeS !== null) {
+      // The wait itself is the backoff: simulated time advances on the server with no model call and no real-time idling.
+      // Each further ineffective decision doubles the wait (up to 8x the per-call cap); any event interrupts it.
+      const waitSeconds = s.config.limits.maxAdvanceSecondsPerCall * 2 ** Math.min(over, 3);
+      s.waitingUntilSimTimeS = s.lastSimTimeS + waitSeconds;
+      await this.save();
+      return this.end("paused", "waiting_for_simulation", describeNoProgress(s));
+    }
     const delaySeconds = Math.min(600, 10 * 2 ** Math.min(over, 6));
     s.retryAfter = new Date(Date.now() + delaySeconds * 1000).toISOString();
-    const inFlight = s.actions.some((a) => !TERMINAL_ACTION_STATUSES.has(a.status));
-    const detail = `${describeNoProgress(s, delaySeconds)}`;
-    if (this.mutationsEnabled && !inFlight && s.lastSimTimeS !== null) {
-      s.waitingUntilSimTimeS = s.lastSimTimeS + s.config.limits.maxWaitChunkSeconds;
-      await this.save();
-      return this.end("paused", "waiting_for_simulation", detail);
-    }
-    return this.end("paused", "slice_complete", detail);
+    return this.end("paused", "slice_complete", describeNoProgress(s, delaySeconds));
   }
 
   private isBudgetReason(reason: string): boolean {
@@ -492,17 +531,17 @@ export class AutonomousController {
       return true;
     }
 
-    const stop = this.budgetStop(true);
-    if (stop) {
-      await this.end("paused", stop.reason, stop.detail);
-      return false;
-    }
-    const requested = Math.min(target - clock.simTimeS, l.maxWaitChunkSeconds, remainingSimFor(s));
-    if (requested <= 0) {
+    const horizon = Math.min(target - clock.simTimeS, remainingSimFor(s));
+    if (horizon <= 0) {
       const exhausted = this.budgetStop(true);
       await this.end("paused", exhausted?.reason ?? "sim_time_limit_reached", exhausted?.detail ?? "No simulated-time authorization remains.");
       return false;
     }
+    // Accelerated, server-authoritative wait: every tick is still simulated by the server (in per-call-capped requests), so
+    // pests, weather, costs and operations are fully preserved. Many checkpoints run inside ONE slice with no model call;
+    // the loop stops on any simulator event, the target, a real-time slice bound, or a failure.
+    const waitStartedAt = Date.now();
+    let advancedAny = false;
     const result = await superviseInterval(
       {
         client: this.options.client,
@@ -512,33 +551,39 @@ export class AutonomousController {
         retryDelayMs: this.options.retryDelayMs ?? 400,
         maxMutationRetries: 2,
         budget: {
-          requestsLeft: advanceRequestsLeftFor(s),
+          requestsLeft: s.config.autonomyMode === "continuous" ? Number.MAX_SAFE_INTEGER : advanceRequestsLeftFor(s),
           simSecondsLeft: remainingSimFor(s),
-          maxChunkSeconds: l.maxWaitChunkSeconds,
+          maxChunkSeconds: l.maxAdvanceSecondsPerCall,
           maxCallSeconds: l.maxAdvanceSecondsPerCall,
           conflictsLeft: Math.max(0, l.maxConflicts - b.conflicts),
         },
         getCursor: () => s.modelEventCursor,
         setCursor: (cursor) => { s.modelEventCursor = Math.max(s.modelEventCursor, cursor); },
-        onAdvanced: () => undefined,
+        onAdvanced: () => { advancedAny = true; },
         shouldStop: () => {
           if (s.config.autonomyMode !== "continuous" && this.wallBase + (Date.now() - this.startedAt) >= l.maxWallClockMs) return "wall clock budget";
           if (this.farmSpendExceeded()) return "farm spending limit";
+          if (this.options.signal?.aborted) return "worker stopping";
+          // Always complete at least one checkpoint per slice so a slice can never spin without advancing time.
+          if (advancedAny && Date.now() - waitStartedAt >= (this.options.waitSliceMs ?? ACCELERATED_WAIT_SLICE_MS)) return SLICE_TIME_BOUND;
           return null;
         },
         record: (event, data) => this.log(`${event} ${JSON.stringify(data).slice(0, 160)}`),
       },
-      { maxSeconds: requested, checkpointSeconds: Math.min(l.maxWaitChunkSeconds, l.maxAdvanceSecondsPerCall, requested) },
+      { maxSeconds: horizon, checkpointSeconds: Math.min(l.maxAdvanceSecondsPerCall, horizon) },
     );
     if (result.simTimeEndS !== null) s.lastSimTimeS = result.simTimeEndS;
     // Continuous sessions keep the ineffective-decision streak across supervised waits so its backoff keeps escalating.
     if (result.advancedSeconds > 0 && s.config.autonomyMode !== "continuous") s.budgets.consecutiveNoProgress = 0;
     s.waits.push({ cycle: s.cycle, actionId: "planned-review", trigger: "controller", outcome: result.outcome, actionStatus: null, advanceRequests: result.advanceRequests, advancedSeconds: result.advancedSeconds, simTimeStartS: result.simTimeStartS, simTimeEndS: result.simTimeEndS, events: result.events, detail: result.detail });
+    if (s.waits.length > 200) s.waits.splice(0, s.waits.length - 200);
     await this.save();
 
     const reachedTarget = s.lastSimTimeS !== null && s.lastSimTimeS >= target;
     if (result.outcome === "event_interrupt" || reachedTarget) {
       s.waitingUntilSimTimeS = null;
+      s.recoveryAttempts = 0;
+      s.retryAfter = null;
       this.setLifecycle("running");
       await this.save();
       return true;
@@ -548,18 +593,25 @@ export class AutonomousController {
       await this.end("paused", budget.reason, budget.detail);
       return false;
     }
-    if (result.outcome !== "horizon_reached") {
-      s.recoveryAttempts += 1;
-      s.retryAfter = new Date(Date.now() + Math.min(60_000, 5_000 * 2 ** (s.recoveryAttempts - 1))).toISOString();
-      if (s.recoveryAttempts >= 3) {
-        await this.end("failed", "recovery_attempts_exhausted", result.detail ?? result.outcome);
-        return false;
+    const sliceBound = result.outcome === "aborted" && result.detail === SLICE_TIME_BOUND;
+    if (result.outcome === "horizon_reached" || sliceBound) {
+      if (result.advancedSeconds > 0) {
+        s.recoveryAttempts = 0;
+        s.retryAfter = null;
       }
-      await this.end("paused", "simulation_wait_interrupted", result.detail ?? result.outcome);
+      this.setLifecycle("waiting_for_simulation");
+      await this.end("paused", "waiting_for_simulation", `Advanced ${result.advancedSeconds}s of server time in ${result.checkpoints} checkpoint(s) toward the planned review; no model call was needed.`);
       return false;
     }
-    this.setLifecycle("waiting_for_simulation");
-    await this.end("paused", "waiting_for_simulation", `Advanced ${result.advancedSeconds}s of server time toward the planned review; no model call was needed.`);
+    if (result.outcome === "refused") {
+      await this.end("paused", "simulation_wait_refused", `The simulator refused a time advance (${result.detail ?? "refused"}); this is deterministic and needs intervention.`);
+      return false;
+    }
+    if (result.outcome === "aborted" && result.detail === "worker stopping") {
+      await this.end("paused", "slice_complete", "The worker is shutting down; the next slice resumes the wait.");
+      return false;
+    }
+    await this.transientRecovery("simulation_wait_interrupted", result.detail ?? result.outcome);
     return false;
   }
 
@@ -659,6 +711,7 @@ export class AutonomousController {
     } catch (error) {
       if (error instanceof SessionLockLostError) throw error;
       try {
+        if (isTransientControllerError(error)) return await this.transientRecovery("consecutive_errors", error instanceof Error ? error.message : null);
         return await this.end("paused", "controller_error", error instanceof Error ? error.message.slice(0, 300) : "unknown");
       } catch {
         throw error;
@@ -729,9 +782,9 @@ export class AutonomousController {
         const inFlight = s.actions.some((a) => !TERMINAL_ACTION_STATUSES.has(a.status)) || snapshot.overview.status.activeActionCount > 0;
         if (!eligible && !inFlight) {
           if (s.config.autonomyMode === "continuous" && this.mutationsEnabled && remainingSimFor(this.state) > 0) {
-            s.waitingUntilSimTimeS = snapshot.simTimeS + Math.min(s.config.limits.maxWaitChunkSeconds, remainingSimFor(this.state));
+            s.waitingUntilSimTimeS = snapshot.simTimeS + Math.min(s.config.limits.maxAdvanceSecondsPerCall * 2, remainingSimFor(this.state));
             await this.save();
-            return await this.end("paused", "waiting_for_simulation", "No action is currently eligible; advancing one bounded server-authoritative checkpoint before reviewing again.");
+            return await this.end("paused", "waiting_for_simulation", "No action is currently eligible; server time advances in accelerated checkpoints (no model call) until something changes.");
           }
           if (s.config.autonomyMode === "legacy") return await this.end("completed", "no_eligible_actions", "The simulator offers no eligible action and no operation is in flight.");
         }
@@ -806,7 +859,10 @@ export class AutonomousController {
         if (error instanceof InconsistentObservationError) return await this.end("paused", "inconsistent_observation", error.message);
         s.budgets.consecutiveErrors += 1;
         this.log(`cycle error: ${error instanceof Error ? error.message : "unknown"}`);
-        if (s.budgets.consecutiveErrors >= s.config.limits.maxConsecutiveErrors) return await this.end("paused", "consecutive_errors", error instanceof Error ? error.message.slice(0, 300) : null);
+        if (!isTransientControllerError(error) && s.budgets.consecutiveErrors >= s.config.limits.maxConsecutiveErrors) {
+          return await this.end("paused", "controller_error", `${error instanceof Error ? error.message.slice(0, 300) : "unknown"} (deterministic controller fault; intervention required)`);
+        }
+        if (s.budgets.consecutiveErrors >= s.config.limits.maxConsecutiveErrors) return await this.transientRecovery("consecutive_errors", error instanceof Error ? error.message : null);
         await this.save();
         continue;
       }
@@ -830,7 +886,8 @@ export class AutonomousController {
       if (!s.pendingMutation) waitedProgress = await this.autoWait();
       await this.refreshActions();
       s.progress = buildProgress(s);
-      const failedRun = result.stopReason === "model_error" || result.stopReason === "empty_response" || (result.stopReason === "cost_limit" && b.costUsd < s.config.limits.maxCostUsd);
+      const spendRefused = result.stopReason === "cost_limit" && result.totals.modelCalls === 0 && result.totals.failedModelCalls === 0;
+      const failedRun = result.stopReason === "model_error" || result.stopReason === "empty_response";
       const { progress: eventProgress, reasons } = await this.evaluateProgress(before, failedRun, eligibilityChanged);
       const progress = eventProgress || waitedProgress;
       if (waitedProgress && !eventProgress) reasons.push("supervised_operation_finished");
@@ -864,6 +921,17 @@ export class AutonomousController {
       await this.save();
 
       if (result.error && /HTTP (401|403)/.test(result.error)) return this.end("paused", "authentication_failure", "The model API rejected the credentials (401/403).");
+      if (spendRefused) {
+        // The pre-flight guard refused to send a request whose worst-case cost could breach a spending limit. No request was
+        // made, so this is neither a provider failure nor retryable: retrying cannot succeed until the cap changes.
+        const capped = !(s.config.limits.unlimitedSpending);
+        const remaining = Math.max(0, s.config.limits.maxCostUsd - b.costUsd);
+        if (capped) return this.end("paused", "cost_budget_exhausted", `The optional API spending cap leaves $${remaining.toFixed(4)}, below the worst-case cost of the next model request (up to $${s.config.limits.maxCostPerRequestUsd.toFixed(4)} per request). No request was sent; raise the cap explicitly to continue.`);
+        return this.end("paused", "model_configuration_error", `The per-request model cost limit refused the next request (limit $${s.config.limits.maxCostPerRequestUsd.toFixed(4)}); check MODEL_MAX_COST_PER_REQUEST_USD / MODEL_MAX_SESSION_COST_USD. No request was sent.`);
+      }
+      if (failedRun && classifyModelError(result.error) === "configuration" && b.consecutiveErrors >= s.config.limits.maxConsecutiveErrors) {
+        return this.end("paused", "model_configuration_error", `${result.error?.slice(0, 300) ?? "The model rejected the request"} (deterministic; intervention required)`);
+      }
       if (s.pendingMutation) continue; // reconcile first; never act on top of an unknown outcome
       if (result.stopReason === "wall_clock_limit") {
         if (s.config.autonomyMode === "continuous") return this.end("paused", "slice_complete", "The per-cycle time bound was reached; the next slice continues the same session.");
@@ -875,10 +943,7 @@ export class AutonomousController {
       if (!this.mutationsEnabled) return this.end("completed", "observe_only_complete", "Mutations are disabled; one observation-and-planning cycle was run.");
       if (b.consecutiveErrors >= s.config.limits.maxConsecutiveErrors) {
         const modelFailure = result.stopReason === "model_error" || result.stopReason === "empty_response";
-        s.recoveryAttempts += 1;
-        s.retryAfter = new Date(Date.now() + Math.min(60_000, 5_000 * 2 ** (s.recoveryAttempts - 1))).toISOString();
-        if (s.recoveryAttempts >= 3) return this.end("failed", "recovery_attempts_exhausted", modelFailure && result.error ? result.error.slice(0, 300) : "Automatic recovery stopped after three bounded retry slices.");
-        return this.end("paused", "consecutive_errors", modelFailure && result.error ? result.error.slice(0, 300) : undefined);
+        return this.transientRecovery("consecutive_errors", modelFailure && result.error ? result.error : null);
       }
       if (b.consecutiveRejections >= s.config.limits.maxConsecutiveRejections) {
         if (s.config.autonomyMode !== "continuous") return this.end("stopped", "repeated_rejections");

@@ -1,7 +1,8 @@
 import type { MutationIntent, MutationJournal } from "../agent/tools.js";
 import { failureFromError, isDefinitiveRefusal, sendIdempotent } from "../agent/tools.js";
 import type { ActionRecordView } from "../contracts/execute.js";
-import type { AdvanceResponse, GameEvent } from "../contracts/time.js";
+import type { AdvanceRequest, AdvanceResponse, GameEvent } from "../contracts/time.js";
+import { requiresDecision } from "./eventClassification.js";
 import type { SimulatorClient } from "../simulator/client.js";
 import { TERMINAL_ACTION_STATUSES } from "./types.js";
 
@@ -113,7 +114,7 @@ class Advancer {
   }
 
   /** One idempotent, revision-checked advance. "retry" means a stale revision was absorbed within the conflict budget. */
-  async step(requested: number, stopOn: Array<"action_completion" | "new_observation" | "any_event">, expectedRevision: number, rationale: string, extra: Record<string, unknown>): Promise<{ status: "ok"; response: AdvanceResponse } | { status: "retry" } | { status: "end"; outcome: WaitOutcome; detail: string }> {
+  async step(requested: number, stopOn: NonNullable<AdvanceRequest["stopOn"]>, expectedRevision: number, rationale: string, extra: Record<string, unknown>): Promise<{ status: "ok"; response: AdvanceResponse } | { status: "retry" } | { status: "end"; outcome: WaitOutcome; detail: string }> {
     const { deps } = this;
     const idempotencyKey = deps.newMutationId();
     const request = { requestedSeconds: requested, stopOn, cursor: deps.getCursor(), expectedRevision, idempotencyKey };
@@ -249,9 +250,6 @@ export interface IntervalResult {
   detail: string | null;
 }
 
-/** Events that are information, not a reason to interrupt a deliberate review interval. */
-const ROUTINE_EVENT_KINDS: ReadonlySet<GameEvent["kind"]> = new Set(["observation_delivered", "action_started"]);
-
 /**
  * Advances server time over a horizon the MODEL chose, in bounded checkpoints (for example 5 simulated days), without
  * ever selecting a farm action. After every checkpoint the simulator's events are inspected; any event that is not
@@ -293,11 +291,11 @@ export async function superviseInterval(deps: SupervisorDeps, params: { maxSecon
     const requested = round3(Math.min(roundUpToTick(Math.min(params.checkpointSeconds, horizonLeft)), budget.maxCallSeconds, simLeft));
     if (requested < TICK_SECONDS - 1e-9) return finish("wait_limit", "advance cap");
 
-    const step = await adv.step(requested, ["any_event"], at.revision, "Supervised review interval", { horizonSeconds: params.maxSeconds, checkpoint: checkpoints + 1 });
+    const step = await adv.step(requested, ["any_event", "crop_ready"], at.revision, "Supervised review interval", { horizonSeconds: params.maxSeconds, checkpoint: checkpoints + 1 });
     if (step.status === "retry") continue;
     if (step.status === "end") return finish(step.outcome as IntervalOutcome, step.detail);
     checkpoints += 1;
-    const material = step.response.events.find((e) => !ROUTINE_EVENT_KINDS.has(e.kind) && !(e.kind === "field_attention" && e.data.status === "resolved"));
+    const material = step.response.events.find(requiresDecision);
     if (material) {
       interrupt = describeEvent(material);
       return finish("event_interrupt");

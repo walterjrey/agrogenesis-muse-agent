@@ -16,6 +16,8 @@ export const GameEvent = z.strictObject({
     "field_attention",
     "equipment_status_changed",
     "mode_changed",
+    /** A crop in one field became harvest-eligible during an advance; data carries only fieldId and crop. */
+    "crop_ready",
   ]),
   actionId: z.string().nullable(),
   summary: z.string(),
@@ -38,7 +40,7 @@ export type EventsResponse = z.infer<typeof EventsResponse>;
  */
 export const AdvanceRequest = z.strictObject({
   requestedSeconds: z.number().positive().max(7 * 86_400),
-  stopOn: z.array(z.enum(["action_completion", "new_observation", "any_event"])).default(["any_event"]),
+  stopOn: z.array(z.enum(["action_completion", "new_observation", "any_event", "crop_ready"])).default(["any_event"]),
   cursor: z.number().int().nonnegative().default(0),
   idempotencyKey: z.string().uuid(),
   /** Always required: reject if the game changed since the agent observed it. */
