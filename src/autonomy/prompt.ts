@@ -31,6 +31,17 @@ The cycle brief already contains a consistent snapshot and a factual operational
 
 const round = (n: number): number => Math.round(n * 100) / 100;
 
+/** Appended to the system prompt while the daily scheduler owns simulated time. */
+export const DAILY_REVIEW_PROMPT_ADDENDUM = `
+
+Daily review mode (overrides the Time guidance above):
+- The simulation engine owns simulated time. You have no tool to advance or wait; after your review the engine advances the farm, in full detail, to the next daily review or the next important event. Never ask for short waits.
+- You get one primary review per simulated day and, only when something important happens, a few event-driven reviews (see the "review" block: kind, triggers, carried and unresolved critical items, eventReviewsLeft). A routine tick never wakes you.
+- Doing nothing is a normal, valid decision when the observations do not justify an action: finish with a short decision summary saying why. Do not invent work.
+- In one review you may take several meaningful actions (inspect an unknown field, irrigate a stressed crop, plant a prepared field, harvest a mature crop, sell), each through execute_action and each validated, costed and verified by the simulator. Act on the review's triggers first, critical items before routine ones.
+- Do not repeat an inspection that was done recently with nothing new observed; the runtime refuses it (duplicate_inspection) without submitting it. A completed inspection or robot mission only wakes you again when it delivered meaningfully new information.
+- Unresolved critical items listed in the review block were not forgotten: handle them now.`;
+
 export interface CycleBriefInput {
   state: SessionState;
   snapshot: Snapshot;
@@ -79,6 +90,19 @@ function promptEconomy(economics: EconomicSummary | null | undefined) {
   return rest;
 }
 
+const brief = (t: { kind: string; critical: boolean; field: string | null; summary: string }) => ({ kind: t.kind, critical: t.critical, field: t.field, what: t.summary });
+
+function reviewBlock(state: SessionState) {
+  const c = state.scheduler.state.current!;
+  return {
+    kind: c.kind,
+    day: c.day,
+    triggers: c.triggers.map(brief),
+    ...(c.carried.length > 0 ? { carriedFromEarlierDays: c.carried.map(brief) } : {}),
+    eventReviewsLeftToday: c.eventReviewsLeft,
+  };
+}
+
 /** Builds the structured per-cycle brief (before stringification). Exported so prompt-size instrumentation can
  * measure each section's serialized size without duplicating the assembly logic or re-stringifying the whole brief. */
 export function buildBriefSections({ state, snapshot, events, progress, economics }: CycleBriefInput) {
@@ -123,6 +147,7 @@ export function buildBriefSections({ state, snapshot, events, progress, economic
     economy: promptEconomy(economics),
     planning: buildPlanningContext(state, snapshot, events, progress),
     ...(queue.length > 0 ? { attentionQueue: queue } : {}),
+    ...(state.scheduler.state.current ? { review: reviewBlock(state) } : {}),
     eventsSinceLastCycle: events.map((e) => ({ id: e.eventId, simTimeS: e.simTimeS, kind: e.kind, actionId: e.actionId, summary: e.summary })),
     snapshot: { revision: snapshot.revision, simTimeS: snapshot.simTimeS, overview: snapshot.overview, fields: promptFields(snapshot.fields), actions: terseCatalog(snapshot.actions) },
   };

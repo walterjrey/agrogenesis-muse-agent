@@ -83,6 +83,8 @@ export interface SupervisorDeps {
    * (for example a persistent Level-1 alert); it must be cheap, read-only and must never call the model.
    */
   checkpointReview?(): Promise<string | null>;
+  /** Overrides which events end an interval (default: requiresDecision). Used by the daily scheduler to also wake on delivered observations. */
+  wakes?(event: GameEvent): boolean;
   record?(event: string, data: Record<string, unknown>): void;
 }
 
@@ -300,7 +302,7 @@ export async function superviseInterval(deps: SupervisorDeps, params: { maxSecon
     if (step.status === "retry") continue;
     if (step.status === "end") return finish(step.outcome as IntervalOutcome, step.detail);
     checkpoints += 1;
-    const material = step.response.events.find(requiresDecision);
+    const material = step.response.events.find(deps.wakes ?? requiresDecision);
     if (material) {
       interrupt = describeEvent(material);
       return finish("event_interrupt");

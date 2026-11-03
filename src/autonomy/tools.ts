@@ -7,6 +7,8 @@ import { collectSnapshot, InconsistentObservationError, type Snapshot } from "./
 import { adaptReviewWindow, buildCropEconomics } from "./planning.js";
 import { superviseInterval, superviseOperation, type IntervalResult, type WaitResult } from "./supervisor.js";
 import { reviewAtCheckpoint } from "./riskLedger.js";
+import { isInspectionActionType } from "./actionClassification.js";
+import { duplicateInspection, inspectionKey, recordInspection, type SchedulerConfig, type SchedulerState } from "./dailyScheduler.js";
 import type { GameEvent } from "../contracts/time.js";
 import type { Plan, SessionState } from "./types.js";
 
@@ -90,7 +92,54 @@ const PlanArgs = z.strictObject({
   stopReason: z.string().max(300).optional().describe("Required when nextStep is stop."),
 });
 
+export interface SchedulerToolHooks {
+  state: SchedulerState;
+  config: SchedulerConfig;
+  /** Simulated time of this review; the model cannot advance time while the scheduler owns the clock. */
+  simTimeS: number;
+  /** True when an identical inspection is still in flight. */
+  inFlight(key: string): boolean;
+}
+
+/**
+ * Daily-review mode: the deterministic engine owns simulated time, so the model gets no time tools, and an inspection
+ * identical to a recent one (with no new evidence) is refused locally, before it can reach the simulator or cost anything.
+ */
+function guardedExecuteAction(base: RegisteredTool, hooks: SchedulerToolHooks): RegisteredTool {
+  return {
+    ...base,
+    async run(context, args) {
+      const input = args as { type: string; params: Record<string, unknown> };
+      if (!isInspectionActionType(input.type)) return base.run(context, args);
+      const key = inspectionKey(input.type, input.params ?? {});
+      const reason = duplicateInspection(hooks.state, hooks.config, key, hooks.simTimeS, hooks.inFlight(key));
+      if (reason) {
+        hooks.state.counters.duplicateInspectionsAvoided += 1;
+        context.trace.record("scheduler.duplicate_inspection_refused", { type: input.type, key });
+        return fail("duplicate_inspection", reason, { nothingSubmitted: true });
+      }
+      const outcome = await base.run(context, args);
+      const data = outcome.ok ? (outcome.data as { accepted?: boolean } | null) : null;
+      if (data?.accepted) recordInspection(hooks.state, key, hooks.simTimeS);
+      return outcome;
+    },
+  };
+}
+
 export function createAutonomousTools(
+  provider: SnapshotProvider,
+  sink: PlanSink,
+  wait?: WaitHooks,
+  planning?: { state: SessionState; recentEvents: GameEvent[] },
+  scheduler?: SchedulerToolHooks,
+): RegisteredTool[] {
+  const tools = buildAutonomousTools(provider, sink, wait, planning);
+  if (!scheduler) return tools;
+  const TIME_TOOLS = new Set(["advance_time", "wait_for_operation", "wait_for_checkpoint"]);
+  return tools.filter((t) => !TIME_TOOLS.has(t.name)).map((t) => (t.name === "execute_action" ? guardedExecuteAction(t, scheduler) : t));
+}
+
+function buildAutonomousTools(
   provider: SnapshotProvider,
   sink: PlanSink,
   wait?: WaitHooks,

@@ -165,6 +165,16 @@ No revenue (no crop was planted or harvested). Mixed-revision detections: 0.
 
 Resume across processes worked without replaying completed actions and with cumulative budgets.
 
+## Daily review scheduler (v0.1.14)
+
+Enabled by default (`SessionState.scheduler.config`, `scheduler: { enabled: false }` restores the legacy per-cycle loop).
+One daily review plus up to 3 event-driven reviews per simulated day; each review is bounded (4 model calls, 10 tool
+calls). The engine owns time: `advance_time`, `wait_for_operation` and `wait_for_checkpoint` are not offered to the
+model. Critical events (`action_failed`, `weather_alert`, level>=2 `field_attention`) always get a review or are surfaced
+as unresolved; routine ticks and quiet completions never call the model. Duplicate inspections are refused locally.
+Policy code: `src/autonomy/dailyScheduler.ts`; tests: `tests/autonomy/dailyScheduler.test.ts` (mocked). See
+AgroGenesis `docs/MUSE_DAILY_SCHEDULER.md` for measurements and limitations.
+
 ## Mocked vs live
 
 - **Mocked (71 tests, fake model and fake simulator)**: multi-cycle autonomy, persistence, resume,

@@ -8,14 +8,16 @@ import type { ModelProvider } from "../model/meta.js";
 import { SimulatorError, type SimulatorClient } from "../simulator/client.js";
 import { InconsistentObservationError, summarizeSnapshot, isAuthFailure } from "./observation.js";
 import { buildEconomics, ledgerEntry } from "./economics.js";
-import { AUTONOMOUS_SYSTEM_PROMPT, DEFAULT_OBJECTIVE, cycleBrief } from "./prompt.js";
+import { AUTONOMOUS_SYSTEM_PROMPT, DAILY_REVIEW_PROMPT_ADDENDUM, DEFAULT_OBJECTIVE, cycleBrief } from "./prompt.js";
 import { measureCycleBrief } from "./promptMetrics.js";
 import { SessionLockLostError } from "./store.js";
 import type { SessionBackend, SessionLease } from "./storage.js";
 import { isInspectionActionType } from "./actionClassification.js";
 import { buildProgress } from "./progress.js";
 import { superviseInterval, superviseOperation, type IntervalResult, type WaitResult } from "./supervisor.js";
-import { reviewAtCheckpoint, refreshLedger } from "./riskLedger.js";
+import { reviewAtCheckpoint, refreshLedger, dueReviews } from "./riskLedger.js";
+import { SchedulerConfig, absorbObservations, addTrigger, beginReview, classifyTrigger, decide, dayOf, endReview, inspectionKey, isObservationEvent, newSchedulerState, nextDayBoundary, rollDay } from "./dailyScheduler.js";
+import { requiresDecision } from "./eventClassification.js";
 import { createAutonomousTools, SnapshotProvider, type PlanSink } from "./tools.js";
 import { DEFAULT_SESSION_LIMITS, PLANNING_POLICY_VERSION, TERMINAL_ACTION_STATUSES, transitionLifecycle, type ObservationSummary, type PlanningConfig, type ScenarioManifest, type SessionLimits, type SessionState, type SessionLifecycle, type WaitRecord } from "./types.js";
 
@@ -33,6 +35,8 @@ export interface NewSessionOptions {
   /** Versioned planning context. Horizon is explicit and independent of the session's time-advance budget. */
   planning?: Partial<PlanningConfig>;
   autonomyMode?: "legacy" | "continuous";
+  /** Daily review scheduler overrides (continuous mode). `enabled: false` restores per-cycle behaviour. */
+  scheduler?: Partial<SchedulerConfig>;
 }
 
 const EMPTY_SCENARIO: ScenarioManifest = { name: null, seed: null, startSnapshotSha256: null, worldConfigSha256: null, startObservationSha256: null, startRevision: null, startSimTimeS: null, notes: [] };
@@ -126,6 +130,7 @@ export function newSessionState(options: NewSessionOptions): SessionState {
     waits: [],
     progress: null,
     riskLedger: {},
+    scheduler: { config: SchedulerConfig.parse(options.scheduler ?? {}), state: newSchedulerState() },
     pendingMutation: null,
     lastRevision: null,
     lastSimTimeS: null,
@@ -563,6 +568,7 @@ export class AutonomousController {
         setCursor: (cursor) => { s.modelEventCursor = Math.max(s.modelEventCursor, cursor); },
         onAdvanced: () => { advancedAny = true; },
         checkpointReview: () => reviewAtCheckpoint(this.options.client, s.gameId, s),
+        ...(this.schedulerOn() ? { wakes: (e: GameEvent) => requiresDecision(e) || e.kind === "observation_delivered" } : {}),
         shouldStop: () => {
           if (s.config.autonomyMode !== "continuous" && this.wallBase + (Date.now() - this.startedAt) >= l.maxWallClockMs) return "wall clock budget";
           if (this.farmSpendExceeded()) return "farm spending limit";
@@ -724,6 +730,111 @@ export class AutonomousController {
     }
   }
 
+  /** The daily scheduler applies to continuous sessions that can act; legacy and observe-only sessions are unchanged. */
+  private schedulerOn(): boolean {
+    const s = this.state;
+    return s.config.autonomyMode === "continuous" && this.mutationsEnabled && s.scheduler.config.enabled;
+  }
+
+  /** Picks up ledger-driven wakes that an accelerated wait already consumed, so the gate still sees them. */
+  private noteInterrupt(detail: string | null, simTimeS: number | null): void {
+    const sch = this.state.scheduler.state;
+    const match = detail?.match(/^review_due: (.*)$/);
+    if (!match?.[1] || simTimeS === null) return;
+    const today = dayOf(simTimeS, this.state.scheduler.config);
+    for (const part of match[1].split(", ")) {
+      const [field, reason] = part.split(" ");
+      if (field && reason) addTrigger(sch, { key: `ledger:${field}:${reason}:${today}`, kind: reason, critical: false, field, simTimeS, summary: `${reason.replace(/_/g, " ")} for ${field}`.slice(0, 200) });
+    }
+  }
+
+  private pushTimeline(kind: "review_skipped" | "blocked", summary: string, triggers: string[] = []): void {
+    const s = this.state;
+    s.decisions.push({ cycle: s.cycle, at: new Date().toISOString(), simTimeS: s.lastSimTimeS, revision: s.lastRevision, summary: summary.slice(0, 600), plannedStep: null, tools: {}, actionsSubmitted: 0, actionsAccepted: 0, advancedSeconds: 0, progress: false, progressReasons: [], costUsd: 0, stopReason: kind, kind, day: s.scheduler.state.day, triggers, inspectionsDone: 0 });
+    if (s.decisions.length > 300) s.decisions.splice(0, s.decisions.length - 300);
+  }
+
+  /**
+   * Decides, without any model call, whether this iteration runs a bounded review or advances simulated time. Returns
+   * "wait" after arranging an accelerated wait to the next day boundary (or planned review), which always lies strictly
+   * in the future, so the loop cannot spin. Routine ticks, informational events and in-flight operations never review.
+   */
+  private async scheduleGate(): Promise<"review" | "wait"> {
+    const s = this.state;
+    const sch = s.scheduler.state;
+    const cfg = s.scheduler.config;
+    const snapshot = await this.provider.get();
+    s.lastRevision = snapshot.revision;
+    s.lastSimTimeS = snapshot.simTimeS;
+    if (!sch.initialized) {
+      sch.initialized = true;
+      sch.eventCursor = s.modelEventCursor;
+    }
+    const feed = await this.options.client.getEvents(s.gameId, sch.eventCursor);
+    sch.eventCursor = Math.max(sch.eventCursor, feed.nextCursor);
+    const ctx = { actionType: (id: string) => s.actions.find((a) => a.actionId === id)?.type ?? null };
+    let observed = false;
+    for (const event of feed.events) {
+      const trigger = classifyTrigger(event, ctx);
+      if (trigger) addTrigger(sch, trigger);
+      if (isObservationEvent(event, ctx)) observed = true;
+    }
+    refreshLedger(s, snapshot.fields);
+    const changed = absorbObservations(sch, snapshot.fields);
+    if (observed && changed.length > 0) {
+      addTrigger(sch, { key: `obs:${changed.join(",")}:${Math.floor(snapshot.simTimeS)}`, kind: "new_observation", critical: false, field: changed[0] ?? null, simTimeS: snapshot.simTimeS, summary: `New authorized observation for ${changed.join(", ")}.` });
+    } else if (observed) {
+      this.log("scheduler: observation delivered with no new information; no review");
+    }
+    const today = dayOf(snapshot.simTimeS, cfg);
+    for (const due of dueReviews(s, snapshot.simTimeS)) {
+      addTrigger(sch, { key: `ledger:${due.fieldId}:${due.reason}:${today}`, kind: due.reason, critical: false, field: due.fieldId, simTimeS: snapshot.simTimeS, summary: `${due.reason.replace(/_/g, " ")} for ${due.fieldId}`.slice(0, 200) });
+    }
+
+    const arrange = async (target: number): Promise<"wait"> => {
+      s.waitingUntilSimTimeS = Math.min(target, snapshot.simTimeS + Math.max(remainingSimFor(s), 0));
+      sch.nextReviewSimS = s.waitingUntilSimTimeS;
+      sch.status = "waiting";
+      this.setLifecycle("waiting_for_simulation");
+      await this.save();
+      return "wait";
+    };
+
+    const inFlight = s.actions.some((a) => !TERMINAL_ACTION_STATUSES.has(a.status)) || snapshot.overview.status.activeActionCount > 0;
+    const eligible = snapshot.actions.actions.some((a) => a.eligibility.eligible);
+    const idle = !eligible && !inFlight && sch.pending.length === 0 && sch.unresolvedCritical.length === 0;
+    if (idle) {
+      rollDay(sch, cfg, snapshot.simTimeS);
+      if (sch.lastSkipDay !== today) {
+        sch.lastSkipDay = today;
+        this.pushTimeline("review_skipped", "Review skipped: no action is currently eligible and nothing needs a decision; simulated time advances to the next day.");
+        sch.counters.skippedReviews += 1;
+      }
+      return arrange(nextDayBoundary(snapshot.simTimeS, cfg));
+    }
+
+    const d = decide(sch, cfg, { simTimeS: snapshot.simTimeS, plannedReviewSimS: s.plan?.nextReviewSimSeconds ?? null });
+    if (d.kind === "review") {
+      beginReview(sch, d, snapshot.simTimeS, cfg);
+      return "review";
+    }
+    if (d.kind === "skip") {
+      if (d.waitUntilSimS > sch.skipUntilS) {
+        sch.skipUntilS = d.waitUntilSimS;
+        sch.counters.skippedReviews += 1;
+        sch.lastSkipDay = sch.day;
+        this.pushTimeline("review_skipped", `Review skipped — no action needed: ${d.reason}`);
+      }
+      return arrange(d.waitUntilSimS);
+    }
+    if (d.blocked.length > 0) {
+      const names = d.blocked.map((t) => `${t.kind}${t.field ? ` (${t.field})` : ""}`).join(", ");
+      this.pushTimeline("blocked", `Event-review budget for day ${sch.day} (${cfg.eventReviewsPerDay}) is exhausted. Critical items carried to the next review, not dropped: ${names}.`, d.blocked.map((t) => t.kind));
+      this.log(`scheduler: event-review budget exhausted; critical unresolved: ${names}`);
+    }
+    return arrange(d.waitUntilSimS);
+  }
+
   private async loop(): Promise<SessionState> {
     const s = this.state;
     s.status = "running";
@@ -751,8 +862,25 @@ export class AutonomousController {
       if (s.lifecycle === "waiting_for_simulation" && s.waitingUntilSimTimeS !== null) {
         const finishedWaiting = await this.advanceWaitingCheckpoint();
         if (!finishedWaiting) return s;
+        if (this.schedulerOn()) {
+          const last = s.waits[s.waits.length - 1];
+          if (last?.trigger === "controller" && last.outcome === "event_interrupt") this.noteInterrupt(last.detail, last.simTimeEndS);
+        }
       }
       await this.refreshActions();
+
+      const scheduled = this.schedulerOn();
+      if (scheduled && (await this.scheduleGate()) === "wait") {
+        // Idle days are crossed without a model call, so no cycle or wait bound would ever end this slice on its own.
+        if (Date.now() - this.startedAt >= (this.options.waitSliceMs ?? ACCELERATED_WAIT_SLICE_MS)) {
+          return await this.end("paused", "waiting_for_simulation", "The worker slice time bound was reached while waiting for the next review; the next slice continues with no model call.");
+        }
+        continue;
+      }
+      const schedCfg = s.scheduler.config;
+      const modelCap = scheduled ? Math.min(s.config.limits.maxModelCallsPerCycle, schedCfg.maxModelCallsPerReview) : s.config.limits.maxModelCallsPerCycle;
+      const toolCap = scheduled ? Math.min(s.config.limits.maxToolCallsPerCycle, schedCfg.maxToolCallsPerReview) : s.config.limits.maxToolCallsPerCycle;
+      const reviewMeta = scheduled && s.scheduler.state.current ? { kind: s.scheduler.state.current.kind, day: s.scheduler.state.current.day, triggers: s.scheduler.state.current.triggers.map((t) => t.kind) } : null;
 
       s.cycle += 1;
       s.allocationCycles += 1;
@@ -783,7 +911,7 @@ export class AutonomousController {
         eligibilityChanged = this.lastEligibility !== null && this.lastEligibility !== signature;
         this.lastEligibility = signature;
         const inFlight = s.actions.some((a) => !TERMINAL_ACTION_STATUSES.has(a.status)) || snapshot.overview.status.activeActionCount > 0;
-        if (!eligible && !inFlight) {
+        if (!eligible && !inFlight && !scheduled) {
           if (s.config.autonomyMode === "continuous" && this.mutationsEnabled && remainingSimFor(this.state) > 0) {
             s.waitingUntilSimTimeS = snapshot.simTimeS + Math.min(s.config.limits.maxAdvanceSecondsPerCall * 2, remainingSimFor(this.state));
             await this.save();
@@ -796,10 +924,10 @@ export class AutonomousController {
         const b = s.budgets;
         const cont = s.config.autonomyMode === "continuous";
         // Continuous sessions bound each cycle (not the session's lifetime); cumulative counters are observability only.
-        const perCycleActions = l.maxToolCallsPerCycle;
+        const perCycleActions = toolCap;
         const remainingMutations = this.mutationsEnabled ? (cont ? perCycleActions : Math.max(0, l.maxMutations - b.acceptedMutations)) : 0;
         const remainingInspections = this.mutationsEnabled ? (cont ? perCycleActions : Math.max(0, l.maxInspections - b.acceptedInspections)) : 0;
-        const remainingSim = cont ? l.maxAdvanceSecondsPerCall * l.maxToolCallsPerCycle : Math.max(0, l.maxSimSeconds - b.advancedSimSeconds);
+        const remainingSim = cont ? l.maxAdvanceSecondsPerCall * toolCap : Math.max(0, l.maxSimSeconds - b.advancedSimSeconds);
         const deadlineMs = cont ? Date.now() + l.maxWallClockMs : this.startedAt + (l.maxWallClockMs - this.wallBase);
         const costLeftUsd = cont && l.unlimitedSpending ? Number.MAX_SAFE_INTEGER : Math.max(0, l.maxCostUsd - b.costUsd);
         const tools = createAutonomousTools(this.provider, sink, this.mutationsEnabled ? {
@@ -809,7 +937,7 @@ export class AutonomousController {
           finished: (wait) => this.recordWait(wait, "model_tool"),
           finishedInterval: (r) => this.recordInterval(r),
           intervalRequestsLeft: () => advanceRequestsLeftFor(s),
-        } : undefined, { state: s, recentEvents: events });
+        } : undefined, { state: s, recentEvents: events }, scheduled ? { state: s.scheduler.state, config: schedCfg, simTimeS: snapshot.simTimeS, inFlight: (key: string) => s.actions.some((a) => !TERMINAL_ACTION_STATUSES.has(a.status) && inspectionKey(a.type, a.params) === key) } : undefined);
 
         // The brief carries this exact snapshot, so observe_snapshot must not resend it until something changes.
         this.provider.delivered = { revision: snapshot.revision, simTimeS: snapshot.simTimeS };
@@ -825,7 +953,7 @@ export class AutonomousController {
           gameId: s.gameId,
           mode: this.mutationsEnabled ? "controlled_mutation" : "observe_only",
           tools,
-          systemPrompt: AUTONOMOUS_SYSTEM_PROMPT,
+          systemPrompt: scheduled ? AUTONOMOUS_SYSTEM_PROMPT + DAILY_REVIEW_PROMPT_ADDENDUM : AUTONOMOUS_SYSTEM_PROMPT,
           brief: cycleBrief(briefInput),
           cycle: s.cycle,
           runId: `${s.sessionId}-c${s.cycle}`,
@@ -837,8 +965,8 @@ export class AutonomousController {
           retryDelayMs: this.options.retryDelayMs ?? 400,
           ...(this.options.newMutationId ? { newMutationId: this.options.newMutationId } : {}),
           limits: {
-            maxModelCalls: cont ? l.maxModelCallsPerCycle : Math.max(1, Math.min(l.maxModelCallsPerCycle, l.maxModelCalls - b.modelCalls - b.failedModelCalls)),
-            maxTotalToolCalls: cont ? l.maxToolCallsPerCycle : Math.max(1, Math.min(l.maxToolCallsPerCycle, l.maxToolCalls - b.toolCalls)),
+            maxModelCalls: cont ? modelCap : Math.max(1, Math.min(l.maxModelCallsPerCycle, l.maxModelCalls - b.modelCalls - b.failedModelCalls)),
+            maxTotalToolCalls: cont ? toolCap : Math.max(1, Math.min(l.maxToolCallsPerCycle, l.maxToolCalls - b.toolCalls)),
             maxToolCallsPerStep: 4,
             maxOutputTokens: l.maxOutputTokens,
             maxCostPerRequestUsd: l.maxCostPerRequestUsd,
@@ -913,7 +1041,12 @@ export class AutonomousController {
         progressReasons: reasons,
         costUsd: Math.round((b.costUsd - before.cost) * 1e6) / 1e6,
         stopReason: result.stopReason,
+        kind: reviewMeta?.kind ?? "cycle",
+        day: reviewMeta?.day ?? null,
+        triggers: reviewMeta?.triggers ?? [],
+        inspectionsDone: b.acceptedInspections - before.inspections,
       });
+      if (scheduled) endReview(s.scheduler.state, nextDayBoundary(s.lastSimTimeS ?? 0, schedCfg));
 
       const hadUnknown = s.pendingMutation !== null;
       b.consecutiveErrors = failedRun || hadUnknown ? b.consecutiveErrors + 1 : 0;
@@ -959,6 +1092,7 @@ export class AutonomousController {
       }
       if (s.config.autonomyMode !== "continuous" && b.consecutiveNoProgress >= s.config.limits.maxConsecutiveNoProgress) return this.end("stopped", "no_progress", describeNoProgress(s));
       if (
+        !scheduled &&
         s.config.autonomyMode === "continuous" &&
         this.mutationsEnabled &&
         !s.actions.some((a) => !TERMINAL_ACTION_STATUSES.has(a.status)) &&

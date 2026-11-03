@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { RiskLedger } from "./riskLedger.js";
+import { DEFAULT_SCHEDULER_CONFIG, SchedulerConfig, SchedulerState, newSchedulerState } from "./dailyScheduler.js";
 /**
  * Session-wide budgets. They are cumulative across cycles and across resumes and are never raised automatically:
  * a session that exhausts one stops, and resuming it does not reset the counters.
@@ -206,6 +207,11 @@ export const DecisionSummary = z.strictObject({
   progressReasons: z.array(z.string()),
   costUsd: z.number(),
   stopReason: z.string(),
+  /** Timeline classification. Defaulted so sessions persisted before the daily scheduler still load. */
+  kind: z.enum(["cycle", "daily_review", "event_review", "review_skipped", "blocked"]).default("cycle"),
+  day: z.number().int().nullable().default(null),
+  triggers: z.array(z.string()).default([]),
+  inspectionsDone: z.number().int().default(0),
 });
 export type DecisionSummary = z.infer<typeof DecisionSummary>;
 
@@ -324,6 +330,8 @@ export const SessionState = z.strictObject({
   progress: ProgressRecord.nullable().default(null),
   /** Per-field alert age, treatment history and last-known authorized readings. Defaulted so older sessions load. */
   riskLedger: RiskLedger.default({}),
+  /** Daily review scheduler: config and persisted state. Defaulted so older sessions load (and get the scheduler in continuous mode). */
+  scheduler: z.strictObject({ config: SchedulerConfig.default(DEFAULT_SCHEDULER_CONFIG), state: SchedulerState.default(newSchedulerState()) }).default({ config: DEFAULT_SCHEDULER_CONFIG, state: newSchedulerState() }),
   lastRevision: z.number().int().nullable(),
   lastSimTimeS: z.number().nullable(),
   /** Event cursor the model's tools use. */

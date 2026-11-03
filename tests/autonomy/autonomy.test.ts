@@ -41,7 +41,8 @@ function setup(limits: Partial<SessionLimits> = {}, mutationsEnabled = true, pla
   const dir = mkdtempSync(join(tmpdir(), "autonomy-"));
   dirs.push(dir);
   const store = new SessionStore(dir, 5_000);
-  const state = newSessionState({ sessionId: "t1", gameId: GAME_ID, modelId: "muse-spark-1.3", mutationsEnabled, limits, planning, autoWait: false, autonomyMode });
+  // These tests pin the per-cycle continuous semantics; the daily scheduler has its own suite (dailyScheduler.test.ts).
+  const state = newSessionState({ sessionId: "t1", gameId: GAME_ID, modelId: "muse-spark-1.3", mutationsEnabled, limits, planning, autoWait: false, autonomyMode, scheduler: { enabled: false } });
   const lock = store.acquire("t1");
   lock.save(state);
   lock.release();

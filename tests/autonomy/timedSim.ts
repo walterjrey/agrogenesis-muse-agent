@@ -24,6 +24,12 @@ export interface TimedSimOptions {
   failAtS?: number;
   /** The first advance request sees a stale revision (another writer moved the game). */
   staleOnce?: number;
+  /** Events emitted when an advance crosses `atS` (for example pest alerts, crop_ready, delivered observations). */
+  scriptedEvents?: Array<{ atS: number; kind: string; actionId?: string | null; summary?: string; data?: Record<string, unknown>; /** Field observations reported from this moment on (a delivered measurement). */ fields?: unknown[] }>;
+  /** Catalogue offers inspectField for each of these field ids (default: just field-1). */
+  catalogFields?: string[];
+  /** Whether the catalogue offers an eligible action (default true). */
+  eligible?: boolean;
 }
 
 interface Op {
@@ -43,6 +49,11 @@ export interface TimedSim {
   actionPosts: Array<Record<string, unknown>>;
   /** Sets how many more advance responses are lost (committed, but delivered after the client timeout). */
   setLose(n: number): void;
+  /** Replaces the field observations the simulator reports (for example after a robot mission delivered data). */
+  setFields(fields: unknown[]): void;
+  setEligible(eligible: boolean): void;
+  /** Number of GET requests served per path, to prove routine ticks do not hammer the simulator. */
+  gets: Record<string, number>;
   close(): Promise<void>;
 }
 
@@ -60,6 +71,10 @@ export async function timedSim(options: TimedSimOptions = {}, clientTimeoutMs = 
   const advancePosts: Array<Record<string, unknown>> = [];
   const actionPosts: Array<Record<string, unknown>> = [];
   let weatherSent = false;
+  let fields: unknown[] = fieldObservations.fields;
+  let eligible = options.eligible ?? true;
+  const scripted = (options.scriptedEvents ?? []).map((e) => ({ ...e, sent: false }));
+  const gets: Record<string, number> = {};
 
   const clockNow = () => ({ simTimeS: r3(state.simTimeS), simDay: Math.floor(state.simTimeS / 60), tickCount: Math.round(state.simTimeS / 0.1), paused: false });
   const event = (kind: string, actionId: string | null, simTimeS: number, summary: string) => {
@@ -84,9 +99,14 @@ export async function timedSim(options: TimedSimOptions = {}, clientTimeoutMs = 
   const server = await startMockServer((req) => {
     const path = req.url.split("?")[0]!.replace(BASE, "");
     if (req.method === "GET") {
+      gets[path] = (gets[path] ?? 0) + 1;
       if (path === "/overview") return { status: 200, body: { ...overview, revision: state.revision, clock: clockNow(), status: { ...overview.status, activeActionCount: state.ops.filter((o) => o.status === "running").length }, finance: { authorized: true, credits: state.credits, realizedRevenue: 0, realizedCosts: 2500 - state.credits } } };
-      if (path === "/fields") return { status: 200, body: { ...fieldObservations, revision: state.revision, simTimeS: r3(state.simTimeS) } };
-      if (path === "/actions") return { status: 200, body: { ...availableActions, revision: state.revision, simTimeS: r3(state.simTimeS) } };
+      if (path === "/fields") return { status: 200, body: { ...fieldObservations, fields, revision: state.revision, simTimeS: r3(state.simTimeS) } };
+      if (path === "/actions") {
+        const base = availableActions.actions[0]!;
+        const offered = (options.catalogFields ?? [base.target.id]).map((id) => ({ ...base, target: { ...base.target, id, label: id }, eligibility: eligible ? base.eligibility : { eligible: false, issues: [{ code: "none", detail: "nothing to do" }] } }));
+        return { status: 200, body: { ...availableActions, actions: offered, revision: state.revision, simTimeS: r3(state.simTimeS) } };
+      }
       if (path === "/events") {
         const cursor = Number(new URL(req.url, "http://x").searchParams.get("cursor") ?? 0);
         const out = events.filter((e) => (e.eventId as number) > cursor);
@@ -144,6 +164,15 @@ export async function timedSim(options: TimedSimOptions = {}, clientTimeoutMs = 
         weatherSent = true;
         emitted.push(event("weather_alert", null, options.weatherAtS, "Storm warning"));
       }
+      for (const e of scripted) {
+        if (!e.sent && before < e.atS && state.simTimeS >= e.atS) {
+          e.sent = true;
+          if (e.fields) fields = e.fields;
+          const ev = event(e.kind, e.actionId ?? null, e.atS, e.summary ?? e.kind);
+          ev.data = e.data ?? {};
+          emitted.push(ev);
+        }
+      }
       for (const op of running) {
         if (fail !== Infinity && state.simTimeS >= fail) {
           op.status = "failed";
@@ -167,5 +196,5 @@ export async function timedSim(options: TimedSimOptions = {}, clientTimeoutMs = 
   });
 
   const client = new SimulatorClient({ baseUrl: server.url, agentToken: "test-agent-token-SECRET", timeoutMs: clientTimeoutMs });
-  return { server, client, state, advancePosts, actionPosts, setLose: (n) => { lose = n; }, close: () => server.close() };
+  return { server, client, state, advancePosts, actionPosts, gets, setLose: (n) => { lose = n; }, setFields: (f) => { fields = f; }, setEligible: (e) => { eligible = e; }, close: () => server.close() };
 }
