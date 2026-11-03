@@ -1109,6 +1109,8 @@ export class AutonomousController {
           return this.end("paused", "waiting_for_simulation", "The next review is scheduled at the planned simulation checkpoint; no model calls are made before then unless a material event interrupts it.");
         }
       }
+      // A completed daily/event review that chose to do nothing is a valid decision; the scheduler paces model calls, so the ineffective-decision backoff must not stack on top of it.
+      if (this.schedulerOn()) b.consecutiveNoProgress = 0;
       if (s.config.autonomyMode === "continuous" && b.consecutiveNoProgress >= s.config.limits.maxConsecutiveNoProgress) return this.noProgressBackoff();
       const budget = this.budgetStop();
       if (budget) {

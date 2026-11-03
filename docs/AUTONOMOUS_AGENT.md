@@ -165,7 +165,7 @@ No revenue (no crop was planted or harvested). Mixed-revision detections: 0.
 
 Resume across processes worked without replaying completed actions and with cumulative budgets.
 
-## Daily review scheduler (v0.1.14)
+## Daily review scheduler (since v0.1.14; no-action reviews are valid since v0.1.15)
 
 Enabled by default (`SessionState.scheduler.config`, `scheduler: { enabled: false }` restores the legacy per-cycle loop).
 One daily review plus up to 3 event-driven reviews per simulated day; each review is bounded (4 model calls, 10 tool

@@ -241,6 +241,15 @@ describe("MOCKED daily scheduler in the controller", () => {
     expect(h.model.requests.length / (day + 1)).toBeLessThanOrEqual(DEFAULT_SCHEDULER_CONFIG.maxModelCallsPerReview);
   });
 
+  it("treats consecutive no-action reviews as valid: no ineffective-decision backoff stacks on the daily cadence", async () => {
+    const h = await harness([PLAN("continue"), TEXT]);
+    const state = await h.runUntil(8 * 60);
+    expect(state.decisions.filter((d) => d.kind === "daily_review").length).toBeGreaterThanOrEqual(5);
+    expect(state.budgets.consecutiveNoProgress).toBe(0);
+    expect(state.stopDetail ?? "").not.toMatch(/without progress/);
+    expect(state.retryAfter).toBeNull();
+  });
+
   it("wakes for a critical water-stress threshold crossing with an event review that can act", async () => {
     const h = await harness([PLAN("continue", 100_000), TEXT, INSPECT(), TEXT, PLAN("continue", 100_000), TEXT], { scriptedEvents: [{ atS: 90, kind: "field_attention", summary: "Water stress level 2", data: { fieldId: "field-1", level: 2, status: "active", kind: "water_stress" } }] });
     const state = await h.runUntil(4 * 60);
