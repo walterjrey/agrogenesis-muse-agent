@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { RiskLedger } from "./riskLedger.js";
 import { DEFAULT_SCHEDULER_CONFIG, SchedulerConfig, SchedulerState, newSchedulerState } from "./dailyScheduler.js";
+import { ActionQueue } from "./actionQueue.js";
 /**
  * Session-wide budgets. They are cumulative across cycles and across resumes and are never raised automatically:
  * a session that exhausts one stops, and resuming it does not reset the counters.
@@ -46,6 +47,11 @@ export const SessionLimits = z.strictObject({
    * so every persisted (legacy) session keeps enforcing its maxCostUsd. maxCostPerRequestUsd always applies.
    */
   unlimitedSpending: z.boolean().default(false),
+  /**
+   * Optional hard cap on logical model calls over the WHOLE session (every cycle, worker poll and resume). Unlike
+   * maxModelCallsPerCycle it never restarts and is charged before a cycle starts; null (default) means no such cap.
+   */
+  maxLifetimeModelCalls: z.number().int().positive().nullable().default(null),
 });
 export type SessionLimits = z.infer<typeof SessionLimits>;
 
@@ -72,6 +78,7 @@ export const DEFAULT_SESSION_LIMITS: Readonly<SessionLimits> = {
   maxFarmSpendCredits: 1_000,
   maxWaitChunkSeconds: 600,
   unlimitedSpending: false,
+  maxLifetimeModelCalls: null,
 };
 
 export const PLANNING_POLICY_VERSION = "phase5c-v1";
@@ -332,6 +339,8 @@ export const SessionState = z.strictObject({
   riskLedger: RiskLedger.default({}),
   /** Daily review scheduler: config and persisted state. Defaulted so older sessions load (and get the scheduler in continuous mode). */
   scheduler: z.strictObject({ config: SchedulerConfig.default(DEFAULT_SCHEDULER_CONFIG), state: SchedulerState.default(newSchedulerState()) }).default({ config: DEFAULT_SCHEDULER_CONFIG, state: newSchedulerState() }),
+  /** Durable plan of justified field operations (survives restarts and simulated days). Defaulted so older sessions load. */
+  queue: ActionQueue.default([]),
   lastRevision: z.number().int().nullable(),
   lastSimTimeS: z.number().nullable(),
   /** Event cursor the model's tools use. */
@@ -363,6 +372,11 @@ export const SessionState = z.strictObject({
     failedModelCalls: z.number().int().default(0),
     /** Physical HTTP retry attempts beyond the first, summed across every logical model call, successful or failed. */
     modelRetryAttempts: z.number().int().default(0),
+    /**
+     * Logical model calls charged against maxLifetimeModelCalls. A cycle's worst case is charged and persisted BEFORE its
+     * first request, then trued up to the actual count afterwards, so a crash mid-cycle can only over-charge, never exceed the cap.
+     */
+    lifetimeModelCallsCharged: z.number().int().default(0),
   }),
   usage: z.strictObject({ inputTokens: z.number().int(), outputTokens: z.number().int(), cachedTokens: z.number().int() }),
   metrics: z.strictObject({

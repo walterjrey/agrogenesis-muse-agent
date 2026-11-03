@@ -91,7 +91,7 @@ export async function timedSim(options: TimedSimOptions = {}, clientTimeoutMs = 
     estimatedCompletionS: op.estimateAtS,
     finishedAtS: op.status === "running" ? null : op.completesAtS,
     progress: op.status === "running" ? r3(Math.min(0.99, (state.simTimeS - op.startedAtS) / Math.max(1, op.completesAtS - op.startedAtS))) : 1,
-    consumed: { ...executeAccepted.action.consumed, credits: op.status === "completed" ? 9.12 : 0 },
+    consumed: { ...executeAccepted.action.consumed, credits: op.status === "completed" ? 9.12 : 0, waterM3: op.status === "completed" && op.type === "irrigateField" ? 42.5 : 0 },
     outcome: op.status === "completed" ? { summary: `${op.type} done`, measurements: {} } : null,
     failure: op.status === "failed" ? { code: "equipment_fault", detail: "The machine broke down." } : null,
   });

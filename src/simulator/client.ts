@@ -62,8 +62,10 @@ export class SimulatorClient {
   }
 
   /** `geometry` asks for each parcel's centre and size so location missions can be targeted; older servers ignore it. */
-  getFieldObservations(gameId: string, options: { geometry?: boolean } = {}) {
-    return this.request("GET", this.game(gameId, options.geometry ? "fields?include=geometry" : "fields"), FieldObservations);
+  getFieldObservations(gameId: string, options: { geometry?: boolean; soil?: boolean } = {}) {
+    // Repeated `include` parameters keep servers that only read the first one working; `soil` adds the static soil capacity.
+    const include = [options.geometry ? "include=geometry" : null, options.soil ? "include=soil" : null].filter((p) => p !== null);
+    return this.request("GET", this.game(gameId, include.length > 0 ? `fields?${include.join("&")}` : "fields"), FieldObservations);
   }
 
   getAvailableActions(gameId: string) {

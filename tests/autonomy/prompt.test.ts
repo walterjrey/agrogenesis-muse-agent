@@ -211,7 +211,7 @@ describe("golden prompt construction", () => {
     const sections = buildBriefSections({ state, snapshot, events: [], progress: buildProgress(state), economics: buildEconomics(state) });
     expect(Object.keys(sections)).toEqual([
       "objective", "mode", "cycle", "remainingBudgets", "previousPlan", "recentDecisions",
-      "operationalRecord", "economy", "planning", "eventsSinceLastCycle", "snapshot",
+      "operationalRecord", "economy", "planning", "observationFreshness", "eventsSinceLastCycle", "snapshot",
     ]);
     expect(Object.keys(sections.planning)).toEqual([
       "policyVersion", "horizon", "cropOptions", "genericCropWindow", "knownCropCommitments",

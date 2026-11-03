@@ -14,7 +14,7 @@ export interface ToolCallMeta {
 }
 
 /** A successful call of one of these changes the farm or the clock, so every earlier read result is stale. */
-const STATE_CHANGING = new Set(["execute_action", "advance_time", "wait_for_operation", "wait_for_checkpoint"]);
+const STATE_CHANGING = new Set(["execute_action", "plan_field_actions", "advance_time", "wait_for_operation", "wait_for_checkpoint"]);
 
 const keyOf = (meta: ToolCallMeta): string => (meta.name === "observe_snapshot" ? meta.name : `${meta.name}:${meta.arguments}`);
 

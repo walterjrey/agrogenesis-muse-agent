@@ -48,6 +48,8 @@ export const ExecuteActionResponse = z.strictObject({
   errors: z.array(ValidationIssue),
   /** Actions finish asynchronously on the simulation clock; poll or advance to observe completion. */
   asynchronous: z.boolean(),
+  /** Dry runs only: the simulator's own cost/water/duration for this exact request. Absent on older servers and on rejections. */
+  estimate: z.strictObject({ credits: z.number(), waterM3: z.number(), durationS: z.number() }).optional(),
 }).refine((r) => (r.accepted ? r.errors.length === 0 : r.errors.length > 0), {
   message: "accepted responses must have no errors; rejected responses must explain why",
 });

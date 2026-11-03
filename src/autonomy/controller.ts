@@ -1,3 +1,5 @@
+import { isActiveQueueStatus, pruneQueue, reconcileQueue } from "./actionQueue.js";
+import { drainQueue } from "./queueRunner.js";
 import { createHash, randomUUID } from "node:crypto";
 import { runAgent } from "../agent/runtime.js";
 import type { MutationIntent, MutationJournal, MutationSettlement } from "../agent/tools.js";
@@ -18,7 +20,7 @@ import { superviseInterval, superviseOperation, type IntervalResult, type WaitRe
 import { reviewAtCheckpoint, refreshLedger, dueReviews } from "./riskLedger.js";
 import { SchedulerConfig, absorbObservations, addTrigger, beginReview, classifyTrigger, decide, dayOf, endReview, inspectionKey, isObservationEvent, newSchedulerState, nextDayBoundary, rollDay } from "./dailyScheduler.js";
 import { requiresDecision } from "./eventClassification.js";
-import { createAutonomousTools, SnapshotProvider, type PlanSink } from "./tools.js";
+import { createAutonomousTools, SnapshotProvider, unreadInspectionNudge, type PlanSink, type ReviewTracker } from "./tools.js";
 import { DEFAULT_SESSION_LIMITS, PLANNING_POLICY_VERSION, TERMINAL_ACTION_STATUSES, transitionLifecycle, type ObservationSummary, type PlanningConfig, type ScenarioManifest, type SessionLimits, type SessionState, type SessionLifecycle, type WaitRecord } from "./types.js";
 
 export interface NewSessionOptions {
@@ -131,12 +133,13 @@ export function newSessionState(options: NewSessionOptions): SessionState {
     progress: null,
     riskLedger: {},
     scheduler: { config: SchedulerConfig.parse(options.scheduler ?? {}), state: newSchedulerState() },
+    queue: [],
     pendingMutation: null,
     lastRevision: null,
     lastSimTimeS: null,
     modelEventCursor: 0,
     progressCursor: 0,
-    budgets: { costUsd: 0, modelCalls: 0, toolCalls: 0, acceptedMutations: 0, mutationAttempts: 0, rejectedActions: 0, acceptedInspections: 0, inspectionAttempts: 0, rejectedInspections: 0, advancedSimSeconds: 0, wallClockMs: 0, consecutiveErrors: 0, consecutiveNoProgress: 0,     consecutiveRejections: 0, advanceRequests: 0, consecutiveAdvances: 0, conflicts: 0, failedModelCalls: 0, modelRetryAttempts: 0 },
+    budgets: { costUsd: 0, modelCalls: 0, toolCalls: 0, acceptedMutations: 0, mutationAttempts: 0, rejectedActions: 0, acceptedInspections: 0, inspectionAttempts: 0, rejectedInspections: 0, advancedSimSeconds: 0, wallClockMs: 0, consecutiveErrors: 0, consecutiveNoProgress: 0,     consecutiveRejections: 0, advanceRequests: 0, consecutiveAdvances: 0, conflicts: 0, failedModelCalls: 0, modelRetryAttempts: 0, lifetimeModelCallsCharged: 0 },
     usage: { inputTokens: 0, outputTokens: 0, cachedTokens: 0 },
     metrics: { baseline: null, latest: null, controllerReads: 0, snapshotRefreshes: 0, snapshotCacheHits: 0, mixedRevisionDetections: 0, grainPeakKg: {}, ledger: [] },
   };
@@ -306,7 +309,7 @@ export class AutonomousController {
 
   private isBudgetReason(reason: string): boolean {
     return new Set([
-      "awaiting_budget", "cost_budget_exhausted", "model_call_budget_exhausted", "tool_call_budget_exhausted",
+      "awaiting_budget", "cost_budget_exhausted", "model_call_budget_exhausted", "lifetime_model_call_budget_exhausted", "tool_call_budget_exhausted",
       "wall_clock_exhausted", "cycle_budget_exhausted", "sim_time_limit_reached",
       "advance_request_budget_exhausted", "mutation_budget_exhausted", "inspection_budget_exhausted",
       "farm_spend_limit_reached", "zero_time_advance_limit",
@@ -413,11 +416,24 @@ export class AutonomousController {
     return false;
   }
 
+  /** Logical model calls charged against the optional lifetime cap (reservations count, so a crash can only over-charge). */
+  private lifetimeCallsUsed(): number {
+    const b = this.state.budgets;
+    return Math.max(b.lifetimeModelCallsCharged, b.modelCalls + b.failedModelCalls);
+  }
+
+  /** null when the session has no lifetime cap; otherwise the calls still available (never negative). */
+  private lifetimeCallsLeft(): number | null {
+    const cap = this.state.config.limits.maxLifetimeModelCalls;
+    return cap === null || cap === undefined ? null : Math.max(0, cap - this.lifetimeCallsUsed());
+  }
+
   /** forWait: waiting for an already-authorized operation spends no model/tool/cycle budget, so only the time, spending and conflict limits apply. */
   private budgetStop(forWait = false): { reason: string; detail: string } | null {
     const { budgets: b, config, cycle } = this.state;
     const l = config.limits;
     const wall = this.wallBase + (Date.now() - this.startedAt);
+    if (!forWait && this.lifetimeCallsLeft() === 0) return { reason: "lifetime_model_call_budget_exhausted", detail: `${this.lifetimeCallsUsed()}/${l.maxLifetimeModelCalls} logical model calls over the whole session (never reset by a new cycle, poll or resume)` };
     if (config.autonomyMode === "continuous") {
       // Continuous autonomy has no lifetime execution quotas (cycles, model/tool/advance calls, worker time,
       // mutations, inspections, simulated time, cumulative farm spending): those counters are observability only.
@@ -459,7 +475,10 @@ export class AutonomousController {
   }
 
   private async refreshActions(): Promise<void> {
-    for (const action of this.state.actions.filter((a) => !TERMINAL_ACTION_STATUSES.has(a.status))) {
+    // A terminal status can arrive through a wait record that carries no water/seed/fuel; fetch the final record once so consumption is never left at its submit-time value.
+    const finalFetchesLeft = { n: 20 };
+    const due = this.state.actions.filter((a) => !TERMINAL_ACTION_STATUSES.has(a.status) || (a.lastCheckedAt === null && finalFetchesLeft.n-- > 0));
+    for (const action of due) {
       try {
         const { action: view } = await this.options.client.getAction(this.state.gameId, action.actionId);
         action.status = view.status;
@@ -627,7 +646,11 @@ export class AutonomousController {
   private async recordWait(wait: WaitResult, trigger: WaitRecord["trigger"]): Promise<void> {
     this.state.waits.push({ cycle: this.state.cycle, actionId: wait.actionId, trigger, outcome: wait.outcome, actionStatus: wait.actionStatus, advanceRequests: wait.advanceRequests, advancedSeconds: wait.advancedSeconds, simTimeStartS: wait.simTimeStartS, simTimeEndS: wait.simTimeEndS, events: wait.events, detail: wait.detail });
     const action = this.state.actions.find((candidate) => candidate.actionId === wait.actionId);
-    if (action && wait.actionStatus !== null) action.status = wait.actionStatus;
+    if (action && wait.actionStatus !== null) {
+      // Terminal via a wait: mark for one final fetch, because the wait record has no water/seed/fuel consumption.
+      if (TERMINAL_ACTION_STATUSES.has(wait.actionStatus) && !TERMINAL_ACTION_STATUSES.has(action.status)) action.lastCheckedAt = null;
+      action.status = wait.actionStatus;
+    }
     if (action && wait.progress !== null) action.progress = wait.progress;
     if (action && wait.estimatedCompletionS !== null) action.estimatedCompletionS = wait.estimatedCompletionS;
     if (action && wait.finishedAtS !== null) action.finishedAtS = wait.finishedAtS;
@@ -678,6 +701,45 @@ export class AutonomousController {
     return wait.outcome === "completed" || wait.outcome === "failed" || wait.outcome === "cancelled";
   }
 
+  /**
+   * Supervises in-flight operations and submits queued operations as they become ready, with no model call. Each round
+   * submits what the plan allows (one operation per field), then waits for one operation to finish. Bounded.
+   * Returns true when any supervised operation reached a terminal state.
+   */
+  private async superviseAndDrain(): Promise<boolean> {
+    const s = this.state;
+    let progressed = await this.autoWait();
+    if (!this.mutationsEnabled) return progressed;
+    for (let round = 0; round < 8; round += 1) {
+      reconcileQueue(s.queue, s.actions, s.operations, s.lastSimTimeS ?? 0);
+      if (s.pendingMutation || !s.queue.some((i) => isActiveQueueStatus(i.status))) break;
+      const drained = await drainQueue({
+        client: this.options.client,
+        gameId: s.gameId,
+        state: s,
+        journal: this.journal,
+        newMutationId: this.options.newMutationId ?? (() => randomUUID()),
+        retryDelayMs: this.options.retryDelayMs ?? 400,
+        maxMutationRetries: 2,
+        trace: { record: (event, data) => this.log(`${event} ${JSON.stringify(data ?? {}).slice(0, 160)}`) },
+        maySubmit: () => !s.pendingMutation && this.budgetStop(true) === null && (s.config.autonomyMode === "continuous" || s.budgets.acceptedMutations < s.config.limits.maxMutations),
+        onOutcomeUnknown: () => undefined,
+      });
+      if (drained.submitted + drained.staled + drained.failed > 0) {
+        this.log(`queue: ${drained.submitted} submitted, ${drained.staled} stale, ${drained.failed} failed`);
+        progressed = progressed || drained.submitted > 0;
+      }
+      await this.save();
+      if (drained.locked) break;
+      const waited = await this.autoWait();
+      progressed = progressed || waited;
+      if (drained.submitted === 0 && !waited) break;
+    }
+    reconcileQueue(s.queue, s.actions, s.operations, s.lastSimTimeS ?? 0);
+    pruneQueue(s.queue);
+    await this.save();
+    return progressed;
+  }
   private farmSpendExceeded(): boolean {
     // Cumulative farm spending is only a quota for legacy sessions; continuous sessions rely on server-side affordability checks.
     if (this.state.config.autonomyMode === "continuous") return false;
@@ -868,6 +930,9 @@ export class AutonomousController {
         }
       }
       await this.refreshActions();
+      // Planned operations that became ready (a new simulated day, a finished predecessor, a restart) run before any model call.
+      if (!s.pendingMutation && s.queue.some((i) => isActiveQueueStatus(i.status)) && (await this.superviseAndDrain())) s.budgets.consecutiveNoProgress = 0;
+      if (s.pendingMutation) continue;
 
       const scheduled = this.schedulerOn();
       if (scheduled && (await this.scheduleGate()) === "wait") {
@@ -890,6 +955,7 @@ export class AutonomousController {
       let result: Awaited<ReturnType<typeof runAgent>>;
       const before = { accepted: s.budgets.acceptedMutations, rejected: s.budgets.rejectedActions, advanced: s.budgets.advancedSimSeconds, cost: s.budgets.costUsd, inspections: s.budgets.acceptedInspections };
       let eligibilityChanged = false;
+      let lifetimeChargedBase = 0;
 
       try {
         const snapshot = await this.provider.get();
@@ -930,6 +996,7 @@ export class AutonomousController {
         const remainingSim = cont ? l.maxAdvanceSecondsPerCall * toolCap : Math.max(0, l.maxSimSeconds - b.advancedSimSeconds);
         const deadlineMs = cont ? Date.now() + l.maxWallClockMs : this.startedAt + (l.maxWallClockMs - this.wallBase);
         const costLeftUsd = cont && l.unlimitedSpending ? Number.MAX_SAFE_INTEGER : Math.max(0, l.maxCostUsd - b.costUsd);
+        const review: ReviewTracker = { unread: new Map() };
         const tools = createAutonomousTools(this.provider, sink, this.mutationsEnabled ? {
           maxChunkSeconds: l.maxWaitChunkSeconds,
           conflictsLeft: () => Math.max(0, l.maxConflicts - s.budgets.conflicts),
@@ -937,7 +1004,7 @@ export class AutonomousController {
           finished: (wait) => this.recordWait(wait, "model_tool"),
           finishedInterval: (r) => this.recordInterval(r),
           intervalRequestsLeft: () => advanceRequestsLeftFor(s),
-        } : undefined, { state: s, recentEvents: events }, scheduled ? { state: s.scheduler.state, config: schedCfg, simTimeS: snapshot.simTimeS, inFlight: (key: string) => s.actions.some((a) => !TERMINAL_ACTION_STATUSES.has(a.status) && inspectionKey(a.type, a.params) === key) } : undefined);
+        } : undefined, { state: s, recentEvents: events }, scheduled ? { state: s.scheduler.state, config: schedCfg, simTimeS: snapshot.simTimeS, inFlight: (key: string) => s.actions.some((a) => !TERMINAL_ACTION_STATUSES.has(a.status) && inspectionKey(a.type, a.params) === key) } : undefined, review);
 
         // The brief carries this exact snapshot, so observe_snapshot must not resend it until something changes.
         this.provider.delivered = { revision: snapshot.revision, simTimeS: snapshot.simTimeS };
@@ -945,6 +1012,14 @@ export class AutonomousController {
         const briefInput = { state: s, snapshot, events, progress: buildProgress(s), economics: buildEconomics(s) };
         const briefSizeEstimate = measureCycleBrief(briefInput);
         this.log(`cycle ${s.cycle} prompt estimate ${JSON.stringify({ cycle: s.cycle, source: "estimated", charsPerTokenHeuristic: 4, totalEstimatedTokens: briefSizeEstimate.totalEstimatedTokens, systemPromptEstimatedTokens: briefSizeEstimate.systemPromptEstimatedTokens, sections: Object.fromEntries(briefSizeEstimate.sections.map((sec) => [sec.section, sec.estimatedTokens])) })}`);
+        const cycleModelCalls = cont ? modelCap : Math.max(1, Math.min(modelCap, l.maxModelCalls - b.modelCalls - b.failedModelCalls));
+        // The lifetime cap (if any) bounds this cycle's calls and is charged and persisted before the first request is sent.
+        const lifetimeLeft = this.lifetimeCallsLeft();
+        const maxCallsThisCycle = lifetimeLeft === null ? cycleModelCalls : Math.min(cycleModelCalls, lifetimeLeft);
+        if (lifetimeLeft !== null) {
+          lifetimeChargedBase = this.lifetimeCallsUsed();
+          b.lifetimeModelCallsCharged = lifetimeChargedBase + maxCallsThisCycle;
+        }
         s.pendingModelCycle = s.cycle;
         await this.save();
         result = await runAgent({
@@ -960,13 +1035,14 @@ export class AutonomousController {
           traceDirectory: this.options.traceDirectory === undefined ? (this.options.store.traceDirectory?.(s.sessionId) ?? null) : this.options.traceDirectory,
           initialState: { observedRevision: snapshot.revision, eventCursor: eventsResponse.nextCursor },
           journal: this.journal,
+          beforeFinal: () => unreadInspectionNudge(review),
           deadlineMs,
           ...(this.options.signal ? { signal: this.options.signal } : {}),
           retryDelayMs: this.options.retryDelayMs ?? 400,
           ...(this.options.newMutationId ? { newMutationId: this.options.newMutationId } : {}),
           limits: {
-            maxModelCalls: cont ? modelCap : Math.max(1, Math.min(l.maxModelCallsPerCycle, l.maxModelCalls - b.modelCalls - b.failedModelCalls)),
-            maxTotalToolCalls: cont ? toolCap : Math.max(1, Math.min(l.maxToolCallsPerCycle, l.maxToolCalls - b.toolCalls)),
+            maxModelCalls: maxCallsThisCycle,
+            maxTotalToolCalls: cont ? toolCap : Math.max(1, Math.min(toolCap, l.maxToolCalls - b.toolCalls)),
             maxToolCallsPerStep: 4,
             maxOutputTokens: l.maxOutputTokens,
             maxCostPerRequestUsd: l.maxCostPerRequestUsd,
@@ -1004,6 +1080,8 @@ export class AutonomousController {
       b.modelCalls += result.totals.modelCalls;
       b.toolCalls += result.totals.toolCalls;
       b.failedModelCalls += result.totals.failedModelCalls;
+      // Replace the cycle's worst-case reservation with what was actually used.
+      if (s.config.limits.maxLifetimeModelCalls !== null) b.lifetimeModelCallsCharged = lifetimeChargedBase + result.totals.modelCalls + result.totals.failedModelCalls;
       b.modelRetryAttempts += result.totals.modelRetryAttempts;
       s.usage.inputTokens += result.totals.inputTokens;
       s.usage.outputTokens += result.totals.outputTokens;
@@ -1015,7 +1093,7 @@ export class AutonomousController {
       if (sink.latest) s.plan = sink.latest;
 
       let waitedProgress = false;
-      if (!s.pendingMutation) waitedProgress = await this.autoWait();
+      if (!s.pendingMutation) waitedProgress = await this.superviseAndDrain();
       await this.refreshActions();
       s.progress = buildProgress(s);
       const spendRefused = result.stopReason === "cost_limit" && result.totals.modelCalls === 0 && result.totals.failedModelCalls === 0;

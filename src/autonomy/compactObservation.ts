@@ -33,6 +33,7 @@ export function compactFields(observations: FieldObservations) {
       ...(f.knownGrowthStage ? { stage: f.knownGrowthStage } : {}),
       ...(f.geometry ? { geo: { x: round(f.geometry.centerX, 1), z: round(f.geometry.centerZ, 1), w: round(f.geometry.widthM, 1), d: round(f.geometry.depthM, 1) } } : {}),
       lastObservedAtS: f.lastObservedAtSimTimeS,
+      ...(f.soil ? { soil: { cap: round(f.soil.capacityM3, 1), fc: round(f.soil.fieldCapacityFraction, 3), wp: round(f.soil.wiltingPointFraction, 3), ...(f.soil.pumpLimitM3PerDay ? { pumpM3PerDay: f.soil.pumpLimitM3PerDay } : {}) } } : {}),
       ...(f.activeOperationActionId ? { activeOp: f.activeOperationActionId } : {}),
       ...(f.attention && f.attention.length > 0 ? { warn: f.attention.map((a) => ({ cat: a.category, lvl: a.level, since: round(a.sinceSimTimeS, 2) })) } : {}),
       m: measurements,
@@ -44,9 +45,9 @@ export function compactFields(observations: FieldObservations) {
   return {
     revision: observations.revision,
     simTimeS: observations.simTimeS,
-    note: "No sensor reports crop identity or growth stage. Measurements: v=value, sd=uncertainty (1 sigma), at=observation sim time, fresh=freshness, c=confidence. Age = simTimeS - at.",
+    note: "No sensor reports crop identity or growth stage. soil (when shown) is static: cap=total water capacity m3, fc=field-capacity moisture fraction, wp=wilting point; soilMoisture is the fraction of cap. Measurements: v=value, sd=uncertainty (1 sigma), at=observation sim time, fresh=freshness, c=confidence. Age = simTimeS - at.",
     units,
     ...(sameMissing && first.length > 0 ? { unobservedInEveryField: first } : {}),
-    fields: sameMissing ? fields.map((f) => ({ id: f.id, ha: f.ha, ...(f.crop ? { crop: f.crop } : {}), ...(f.stage ? { stage: f.stage } : {}), ...(f.geo ? { geo: f.geo } : {}), lastObservedAtS: f.lastObservedAtS, ...(f.activeOp ? { activeOp: f.activeOp } : {}), ...(f.warn ? { warn: f.warn } : {}), m: f.m })) : fields,
+    fields: sameMissing ? fields.map((f) => ({ id: f.id, ha: f.ha, ...(f.crop ? { crop: f.crop } : {}), ...(f.stage ? { stage: f.stage } : {}), ...(f.geo ? { geo: f.geo } : {}), ...(f.soil ? { soil: f.soil } : {}), lastObservedAtS: f.lastObservedAtS, ...(f.activeOp ? { activeOp: f.activeOp } : {}), ...(f.warn ? { warn: f.warn } : {}), m: f.m })) : fields,
   };
 }

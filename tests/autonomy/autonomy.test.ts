@@ -247,7 +247,7 @@ describe("MOCKED autonomy: budgets and loop prevention", () => {
     sim = await fakeSimulator((req) => completedEvents(req));
     const SURVEY: ScriptedStep = { calls: [{ name: "execute_action", args: { type: "inspectField", params: { fieldId: "field-1" }, rationale: "Stale moisture reading before deciding." } }] };
     const { store } = setup({ maxMutations: 1, maxInspections: 1, maxCycles: 4 });
-    const final = await controller(store, sim, scriptedModel([SURVEY, PLAN("continue", "Inspected."), TEXT, INSPECT, PLAN("stop", "Irrigated after inspecting."), TEXT])).run();
+    const final = await controller(store, sim, scriptedModel([SURVEY, PLAN("continue", "Inspected."), TEXT, TEXT, INSPECT, PLAN("stop", "Irrigated after inspecting."), TEXT])).run();
     // The inspection (cycle 1) left the full mutation budget available for the real farm action (cycle 2).
     expect(final.budgets).toMatchObject({ acceptedInspections: 1, inspectionAttempts: 1, acceptedMutations: 1, mutationAttempts: 1, rejectedActions: 0 });
     expect(final).toMatchObject({ status: "completed", stopReason: "model_declared_done" });

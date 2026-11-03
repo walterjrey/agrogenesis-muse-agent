@@ -11,7 +11,7 @@ import type { SessionLimits } from "../../src/autonomy/types.js";
 import { compactHistory } from "../../src/agent/history.js";
 import type { AvailableActions } from "../../src/contracts/actions.js";
 import { availableActions, GAME_ID } from "../fixtures.js";
-import { countingIds, scriptedModel, type ScriptedStep } from "../agent/harness.js";
+import { countingIds, scriptedModel, toolMessages, type ScriptedStep } from "../agent/harness.js";
 import { timedSim, type TimedSim, type TimedSimOptions } from "./timedSim.js";
 
 /**
@@ -178,11 +178,11 @@ const EXECUTE: ScriptedStep = { calls: [{ name: "execute_action", args: { type: 
 const TEXT = (content: string): ScriptedStep => ({ content });
 const WAIT = (actionId = "act-1"): ScriptedStep => ({ calls: [{ name: "wait_for_operation", args: { actionId, rationale: "Operation in flight." } }] });
 
-function sessionSetup(limits: Partial<SessionLimits> = {}, autoWait = true) {
+function sessionSetup(limits: Partial<SessionLimits> = {}, autoWait = true, autonomyMode: "legacy" | "continuous" = "legacy") {
   const dir = mkdtempSync(join(tmpdir(), "supervisor-"));
   dirs.push(dir);
   const store = new SessionStore(dir, 5_000);
-  const state = newSessionState({ sessionId: "w1", gameId: GAME_ID, modelId: "muse-spark-1.3", mutationsEnabled: true, limits, autoWait });
+  const state = newSessionState({ sessionId: "w1", gameId: GAME_ID, modelId: "muse-spark-1.3", mutationsEnabled: true, limits, autoWait, autonomyMode });
   const lock = store.acquire("w1");
   lock.save(state);
   lock.release();
@@ -208,6 +208,21 @@ describe("MOCKED controller: supervised waiting", () => {
     expect(final.decisions[0]).toMatchObject({ progress: true });
     expect(final.progress?.completedOperations[0]).toMatchObject({ actionId: "act-1", status: "completed", outcome: "prepareSoil done" });
     expect(final.progress?.nextRequiredDecision).toContain("review the result of prepareSoil act-1");
+  });
+
+  it("records the water an irrigation really consumed when a wait, not a refresh, is what reports it finished", async () => {
+    sim = await timedSim({ durationS: 11, estimateS: 11 });
+    const { store } = sessionSetup({ maxCycles: 1 }, false);
+    // The operation was started in an earlier slice and already refreshed once while running (consumption still 0).
+    await sim.client.executeAction(GAME_ID, { type: "irrigateField", params: { fieldId: "field-1", volumeM3: 42.5, source: "creek" }, expectedRevision: sim.state.revision, dryRun: false, idempotencyKey: "00000000-0000-4000-8000-0000000000aa" });
+    const lock = store.acquire("w1");
+    const saved = store.load("w1")!;
+    saved.actions.push({ actionId: "act-1", type: "irrigateField", status: "running", submittedAtRevision: 4, idempotencyKey: "00000000-0000-4000-8000-0000000000aa", lastCheckedAt: "2026-01-01T00:00:00.000Z", target: "field-1", startedAtS: 0, estimatedCompletionS: 11, finishedAtS: null, progress: 0.1, consumedCredits: 0, outcome: null, failure: null, params: {}, consumedWaterM3: 0, consumedSeedKg: null, consumedFuelL: null, measurements: {} });
+    lock.save(saved);
+    lock.release();
+    const final = await ctl(store, sim, scriptedModel([WAIT(), TEXT("Done.")])).run();
+    expect(final.waits).toEqual([expect.objectContaining({ trigger: "model_tool", outcome: "completed" })]);
+    expect(final.actions[0]).toMatchObject({ type: "irrigateField", status: "completed", consumedCredits: 9.12, consumedWaterM3: 42.5 });
   });
 
   it("does not choose farm actions on its own: only advance requests follow the model's single action", async () => {
@@ -307,6 +322,64 @@ describe("MOCKED controller: supervised waiting", () => {
     expect(sim.state.replays).toBeGreaterThanOrEqual(1);
     expect(sim.actionPosts).toHaveLength(1);
     expect(sim.state.credits).toBe(2500 - 25 - 9.12);
+  });
+});
+
+describe("MOCKED controller: review orchestration and lifetime call cap", () => {
+  const INSPECT: ScriptedStep = { calls: [{ name: "execute_action", args: { type: "inspectField", params: { fieldId: "field-1" }, rationale: "Need a current reading." } }] };
+
+  it("registers plan_field_actions with its schema in the tool list the model sees", async () => {
+    sim = await timedSim({ durationS: 11, estimateS: 11 });
+    const { store } = sessionSetup({ maxCycles: 1 });
+    const model = scriptedModel([TEXT("Nothing to do.")]);
+    await ctl(store, sim, model).run();
+    const tool = (model.requests[0]!.tools ?? []).find((t) => JSON.stringify(t).includes('"name":"plan_field_actions"'));
+    expect(tool).toBeDefined();
+    expect(JSON.stringify(tool)).toContain("pest_treatment");
+  });
+
+  it("does not let the review end on an unread inspection: the model is nudged once to read and evaluate it", async () => {
+    sim = await timedSim({ durationS: 3, estimateS: 3 });
+    const { store } = sessionSetup({ maxCycles: 1 });
+    const model = scriptedModel([INSPECT, TEXT("Inspection started."), WAIT(), TEXT("No intervention is justified.")]);
+    const final = await ctl(store, sim, model).run();
+    const userTexts = model.requests[2]!.messages.filter((m) => m.role === "user").map((m) => String(m.content));
+    expect(userTexts.some((t) => t.includes("have not read its result"))).toBe(true);
+    expect(model.requests.length).toBe(4);
+    expect(final.waits.some((w) => w.trigger === "model_tool" && w.outcome === "completed")).toBe(true);
+    // The completed wait carries the new reading so it can be evaluated immediately.
+    const wait = toolMessages(model, 3)[0];
+    expect(wait?.body.data).toHaveProperty("inspectionReading");
+  });
+
+  it("never makes more actual model calls than the persisted lifetime cap, across cycles and resumed sessions", async () => {
+    sim = await timedSim({ durationS: 3, estimateS: 3 });
+    const { store } = sessionSetup({ maxLifetimeModelCalls: 3, maxModelCallsPerCycle: 6, maxCycles: 20 }, true, "continuous");
+    // Each run() is a worker poll / resumed session with its own fresh in-memory state.
+    let requests = 0;
+    let final: Awaited<ReturnType<ReturnType<typeof ctl>["run"]>> | undefined;
+    for (let poll = 0; poll < 8; poll++) {
+      const model = scriptedModel(Array.from({ length: 20 }, () => TEXT("Nothing justified now.")));
+      final = await ctl(store, sim, model, { sliceCycles: 1 }).run();
+      requests += model.requests.length;
+      if (final.stopReason === "lifetime_model_call_budget_exhausted") break;
+    }
+    expect(requests).toBeLessThanOrEqual(3);
+    expect(final).toMatchObject({ status: "paused", lifecycle: "awaiting_budget", stopReason: "lifetime_model_call_budget_exhausted" });
+    const after = scriptedModel(Array.from({ length: 20 }, () => TEXT("again")));
+    const resumed = await ctl(store, sim, after, { sliceCycles: 1 }).run();
+    expect(after.requests.length).toBe(0);
+    expect(resumed.stopReason).toBe("lifetime_model_call_budget_exhausted");
+    expect(resumed.budgets.lifetimeModelCallsCharged).toBeLessThanOrEqual(3);
+  });
+
+  it("leaves behaviour unchanged when no lifetime cap is configured", async () => {
+    sim = await timedSim({ durationS: 3, estimateS: 3 });
+    const { store } = sessionSetup({ maxCycles: 2, maxModelCallsPerCycle: 6 });
+    const model = scriptedModel(Array.from({ length: 6 }, () => TEXT("Nothing justified now.")));
+    const final = await ctl(store, sim, model).run();
+    expect(final.stopReason).not.toBe("lifetime_model_call_budget_exhausted");
+    expect(model.requests.length).toBeGreaterThan(0);
   });
 });
 

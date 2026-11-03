@@ -2,13 +2,16 @@ import { z } from "zod";
 import type { SimulatorClient } from "../simulator/client.js";
 import { createToolRegistry, defineTool, failureFromError, fail, succeed, type RegisteredTool } from "../agent/tools.js";
 import { compactCatalog, describeAction, terseCatalog } from "./catalog.js";
+import { isInspectionActionType } from "./actionClassification.js";
 import { compactFields } from "./compactObservation.js";
 import { collectSnapshot, InconsistentObservationError, type Snapshot } from "./observation.js";
 import { adaptReviewWindow, buildCropEconomics } from "./planning.js";
 import { superviseInterval, superviseOperation, type IntervalResult, type WaitResult } from "./supervisor.js";
 import { reviewAtCheckpoint } from "./riskLedger.js";
-import { isInspectionActionType } from "./actionClassification.js";
 import { duplicateInspection, inspectionKey, recordInspection, type SchedulerConfig, type SchedulerState } from "./dailyScheduler.js";
+import { fieldFreshness, inspectionRefusal } from "./freshness.js";
+import { QueueKind, queueBrief } from "./actionQueue.js";
+import { drainQueue, planAndStore } from "./queueRunner.js";
 import type { GameEvent } from "../contracts/time.js";
 import type { Plan, SessionState } from "./types.js";
 
@@ -75,6 +78,56 @@ export interface PlanSink {
   updates: number;
 }
 
+/**
+ * Inspections the model started in this run whose reading it has not received yet. An inspection is asynchronous (a few
+ * simulated seconds), so ending the review right after starting one would pay for evidence nobody evaluates.
+ */
+export interface ReviewTracker {
+  unread: Map<string, { fieldId: string; sinceS: number }>;
+}
+
+export function unreadInspectionNudge(review: ReviewTracker): string | null {
+  if (review.unread.size === 0) return null;
+  const [actionId, { fieldId }] = review.unread.entries().next().value as [string, { fieldId: string }];
+  return `You started an inspection (${actionId}, ${fieldId}) but have not read its result, so the review is not finished. Call wait_for_operation with that actionId: its result carries the new reading. Then evaluate it: if the readings justify irrigation and/or pest treatment call plan_field_actions once with every justified request; if nothing is justified, say so. Do not describe_action again and do not inspect another field first.`;
+}
+
+/** Attaches the new reading to the wait result of an inspection the model has not read yet, so it can evaluate it at once. */
+async function deliveredReading(
+  provider: SnapshotProvider,
+  context: Parameters<RegisteredTool["run"]>[0],
+  review: ReviewTracker | undefined,
+  result: WaitResult,
+): Promise<Record<string, unknown>> {
+  const pending = review?.unread.get(result.actionId);
+  if (!review || !pending || result.outcome !== "completed") return {};
+  try {
+    const snapshot = await provider.get();
+    settleReads(review, snapshot.fields.fields);
+    const compact = compactFields({ ...snapshot.fields, fields: snapshot.fields.fields.filter((f) => f.fieldId === pending.fieldId) });
+    context.state.observedRevision = snapshot.revision;
+    review.unread.delete(result.actionId);
+    return {
+      inspectionReading: compact,
+      next: "Evaluate this reading now. If it justifies irrigation and/or pest treatment, call plan_field_actions once with every justified request (one inspection can justify several operations). If nothing is justified, state that no intervention is needed.",
+    };
+  } catch {
+    return {};
+  }
+}
+
+type SnapshotFields = Snapshot["fields"]["fields"];
+
+/** Drops unread inspections whose field now carries a reading taken at or after the inspection started. */
+function settleReads(review: ReviewTracker | undefined, fields: SnapshotFields): void {
+  if (!review) return;
+  for (const [actionId, { fieldId, sinceS }] of review.unread) {
+    const field = fields.find((f) => f.fieldId === fieldId);
+    const times = ["soilMoisture", "pestPressure"].map((q) => field?.measurements[q]?.observedAtSimTimeS);
+    if (times.some((t) => typeof t === "number" && t >= sinceS)) review.unread.delete(actionId);
+  }
+}
+
 const inconsistent = (error: unknown) =>
   error instanceof InconsistentObservationError
     ? fail("inconsistent_observation", "The simulator state changed between reads and no consistent snapshot could be obtained. Do not act on mixed data; try again later or report the uncertainty.", { observed: error.observed })
@@ -132,8 +185,9 @@ export function createAutonomousTools(
   wait?: WaitHooks,
   planning?: { state: SessionState; recentEvents: GameEvent[] },
   scheduler?: SchedulerToolHooks,
+  review?: ReviewTracker,
 ): RegisteredTool[] {
-  const tools = buildAutonomousTools(provider, sink, wait, planning);
+  const tools = buildAutonomousTools(provider, sink, wait, planning, review);
   if (!scheduler) return tools;
   const TIME_TOOLS = new Set(["advance_time", "wait_for_operation", "wait_for_checkpoint"]);
   return tools.filter((t) => !TIME_TOOLS.has(t.name)).map((t) => (t.name === "execute_action" ? guardedExecuteAction(t, scheduler) : t));
@@ -144,6 +198,7 @@ function buildAutonomousTools(
   sink: PlanSink,
   wait?: WaitHooks,
   planning?: { state: SessionState; recentEvents: GameEvent[] },
+  review?: ReviewTracker,
 ): RegisteredTool[] {
   const base = createToolRegistry();
   const reuse = (name: string): RegisteredTool => {
@@ -166,6 +221,7 @@ function buildAutonomousTools(
             return succeed({ unchanged: true, revision: snapshot.revision, simTimeS: snapshot.simTimeS, note: "The game has not changed since the snapshot you already have (same revision and simulated time); it is not repeated." });
           }
           provider.delivered = { revision: snapshot.revision, simTimeS: snapshot.simTimeS };
+          settleReads(review, snapshot.fields.fields);
           return succeed({ revision: snapshot.revision, simTimeS: snapshot.simTimeS, overview: snapshot.overview, fields: compactFields(snapshot.fields), actions: terseCatalog(snapshot.actions) });
         } catch (error) {
           return inconsistent(error);
@@ -245,7 +301,8 @@ function buildAutonomousTools(
         return succeed({ recorded: true });
       },
     }),
-    reuse("execute_action"),
+    guardedExecute(reuse("execute_action"), provider, planning?.state, review),
+    ...(planning ? [planFieldActionsTool(provider, planning.state, review)] : []),
     reuse("advance_time"),
     ...(wait
       ? [
@@ -298,7 +355,7 @@ function buildAutonomousTools(
                 context.state.mutationLocked = true;
                 return fail("outcome_unknown", "A time advance may or may not have been applied. Further state-changing calls are blocked for this run; the controller will reconcile it with the original idempotency key.");
               }
-              return succeed({ ...result, note: "Time advanced on the server. Earlier observations are stale; observe again before acting." });
+              return succeed({ note: "Time advanced on the server. Earlier observations are stale; observe again before acting.", ...result, ...(await deliveredReading(provider, context, review, result)) });
             },
           }),
         ]
@@ -375,4 +432,131 @@ function buildAutonomousTools(
     reuse("get_action_status"),
     reuse("get_recent_events"),
   ];
+}
+
+
+/**
+ * execute_action with a freshness guard for inspections: a field whose newest authorized reading is still valid (nothing
+ * changed since: no intervention, no new warning, within its validity window) is not inspected again, because every
+ * inspection costs credits. Missing or expired soil/pest readings, aged readings and invalidated ones are always allowed.
+ */
+function guardedExecute(base: RegisteredTool, provider: SnapshotProvider, state: SessionState | undefined, review: ReviewTracker | undefined): RegisteredTool {
+  if (!state) return base;
+  return {
+    ...base,
+    async run(context, args) {
+      const outcome = await guardedInspect(context, args);
+      if (outcome) return outcome;
+      const result = await base.run(context, args);
+      if (review && result.ok && isInspectionActionType(args.type) && typeof args.params === "object" && args.params !== null) {
+        const data = result.data as { accepted?: boolean; action?: { actionId?: string } | null };
+        const fieldId = (args.params as Record<string, unknown>).fieldId;
+        if (data.accepted && data.action?.actionId && typeof fieldId === "string") {
+          let sinceS = 0;
+          try {
+            sinceS = (await provider.get()).simTimeS;
+          } catch {
+            /* the reading is matched against 0 then: any existing reading clears it, which only skips a reminder */
+          }
+          review.unread.set(data.action.actionId, { fieldId, sinceS });
+        }
+      }
+      return result;
+    },
+  };
+
+  async function guardedInspect(context: Parameters<RegisteredTool["run"]>[0], args: Record<string, unknown>) {
+    if (!state) return null;
+      if (args.type === "inspectField" && typeof args.params === "object" && args.params !== null) {
+        const fieldId = (args.params as Record<string, unknown>).fieldId;
+        if (typeof fieldId === "string") {
+          try {
+            const snapshot = await provider.get();
+            const field = snapshot.fields.fields.find((f) => f.fieldId === fieldId);
+            const needed = ["soilMoisture", "pestPressure"].every((q) => {
+              const m = field?.measurements[q];
+              return m && m.freshness !== "expired" && m.freshness !== "never_observed";
+            });
+            if (needed) {
+              const refusal = inspectionRefusal(fieldFreshness(state, fieldId, snapshot.simTimeS), snapshot.simTimeS);
+              if (refusal) {
+                context.trace.record("inspection.refused", { fieldId, code: refusal.code });
+                return fail(refusal.code, refusal.message, { fieldId });
+              }
+            }
+          } catch {
+            /* an unreadable snapshot never blocks the simulator's own validation */
+          }
+        }
+      }
+      return null;
+  }
+}
+
+const FieldRequest = z.strictObject({
+  fieldId: z.string().min(1).max(100),
+  kind: QueueKind.describe("irrigate: water the field up to near field capacity; pest_treatment: one pest-management treatment."),
+  priority: z.number().int().min(1).max(5).default(3).describe("1 = most urgent."),
+  reason: z.string().min(1).max(300).describe("Why, from the observations (e.g. moisture and pest readings and their age)."),
+  targetMoisture: z.number().min(0).max(1).optional().describe("Irrigation only: target soil moisture fraction. Default and maximum: just under the field-capacity moisture."),
+  source: z.enum(["reservoir", "creek"]).optional().describe("Irrigation water source (default reservoir)."),
+  earliestInDays: z.number().min(0).max(5).optional().describe("Start no earlier than this many simulated days from now."),
+});
+
+/**
+ * Plans every justified operation of an observation round at once. The model decides WHAT is justified; the runtime computes
+ * quantities from the authorized soil capacity and observed moisture, validates each item with the simulator's dry run
+ * (authoritative eligibility and cost), applies the cost policy, and submits the ready items through the idempotent journal.
+ */
+function planFieldActionsTool(provider: SnapshotProvider, state: SessionState, review?: ReviewTracker): RegisteredTool {
+  return defineTool({
+    name: "plan_field_actions",
+    description: "Queue ALL the irrigation and pest-treatment operations your current readings justify, for one or several fields, in one call. You give the field, the kind and your reason; the runtime computes the irrigation volume (target moisture minus observed moisture, times the field soil capacity; split into as many simulator operations as needed, never padded), refuses treatments below the pest threshold or not backed by a newer observation than the last treatment, checks each item with the simulator dry run and its cost, then submits the ready ones without further inspections. Queued items persist across simulated days and restarts. Returns what was queued, reused and rejected (with reasons). Call it alone.",
+    mutating: true,
+    args: z.strictObject({ requests: z.array(FieldRequest).min(1).max(8) }),
+    async run(context, args) {
+      if (context.state.mutationLocked) return fail("mutation_locked", "A previous state-changing request has an unconfirmed outcome; no further actions are allowed in this run.");
+      if (!context.journal) return fail("journal_unavailable", "Queued execution needs the session journal.");
+      const journal = context.journal;
+      try {
+        const snapshot = await provider.get();
+        context.state.observedRevision = snapshot.revision;
+        const credits = snapshot.overview.finance.authorized ? snapshot.overview.finance.credits : null;
+        const plan = await planAndStore({ client: context.client, gameId: context.gameId, state }, snapshot.fields, snapshot.simTimeS, credits, args.requests as never);
+        context.trace.record("queue.plan", { queued: plan.queued.map((i) => i.id), rejected: plan.rejected.map((r) => `${r.fieldId}:${r.code}`) });
+        const limits = context.policy.limits;
+        const drained = await drainQueue({
+          client: context.client,
+          gameId: context.gameId,
+          state,
+          journal,
+          newMutationId: context.newMutationId,
+          retryDelayMs: context.retryDelayMs,
+          maxMutationRetries: context.maxMutationRetries,
+          trace: context.trace,
+          maySubmit: () => !context.state.mutationLocked && context.policy.acceptedMutations < limits.maxMutations && context.policy.mutationAttempts < limits.maxMutationAttempts,
+          onOutcomeUnknown: () => {
+            context.state.mutationLocked = true;
+          },
+          onAccepted: () => {
+            context.policy.acceptedMutations += 1;
+            context.policy.mutationAttempts += 1;
+          },
+        });
+        context.state.observedRevision = null;
+        provider.invalidate();
+        review?.unread.clear();
+        if (drained.locked) return fail("outcome_unknown", "A queued request may or may not have been applied. Further state-changing calls are blocked for this run; the controller will reconcile it with the original idempotency key.");
+        return succeed({
+          queued: queueBrief(plan.queued, snapshot.simTimeS) ?? [],
+          alreadyQueued: plan.reused.map((i) => i.id),
+          rejected: plan.rejected,
+          submittedNow: drained.submitted,
+          note: "Items not yet submitted (later parts of an irrigation, delayed or blocked by a running operation) run automatically as their predecessors finish. Do not re-plan them and do not inspect a field only to confirm them.",
+        });
+      } catch (error) {
+        return inconsistent(error);
+      }
+    },
+  });
 }

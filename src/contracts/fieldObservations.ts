@@ -47,6 +47,22 @@ export const FieldGeometry = z.strictObject({
 });
 export type FieldGeometry = z.infer<typeof FieldGeometry>;
 
+/**
+ * Static soil properties of a parcel (from its soil texture and depth, not from current weather or crop state). They let the
+ * agent size an irrigation: water needed (m3) = (target moisture - observed moisture) x capacityM3. Never a current measurement.
+ */
+export const FieldSoil = z.strictObject({
+  /** Total water the parcel's soil can hold (m3); soilMoisture is the fraction of this capacity currently held. */
+  capacityM3: z.number().positive(),
+  /** Moisture fraction above which extra water drains away. */
+  fieldCapacityFraction: Fraction,
+  /** Moisture fraction below which plants cannot extract water. */
+  wiltingPointFraction: Fraction,
+  /** Most water (m3) one source can deliver per simulated day; a larger irrigation needs one operation per day. */
+  pumpLimitM3PerDay: z.number().positive().optional(),
+});
+export type FieldSoil = z.infer<typeof FieldSoil>;
+
 export const FieldObservation = z.strictObject({
   fieldId: Id,
   label: z.string(),
@@ -63,8 +79,10 @@ export const FieldObservation = z.strictObject({
   attention: z.array(FieldAttention).optional(),
   /** Absent unless requested with `include=geometry` (and on servers that predate it). */
   geometry: FieldGeometry.optional(),
+  /** Absent unless requested with `include=soil` (and on servers that predate it). */
+  soil: FieldSoil.optional(),
 });
-export type FieldObservation = z.infer<typeof FieldObservation>;
+export type FieldObservation  = z.infer<typeof FieldObservation>;
 
 export const FieldObservations = z.strictObject({
   gameId: GameId,
