@@ -10,6 +10,9 @@ import { superviseInterval, superviseOperation, type IntervalResult, type WaitRe
 import { reviewAtCheckpoint } from "./riskLedger.js";
 import { duplicateInspection, inspectionKey, recordInspection, type SchedulerConfig, type SchedulerState } from "./dailyScheduler.js";
 import { fieldFreshness, inspectionRefusal } from "./freshness.js";
+
+/** Fields whose reading lapses within this many simulated seconds join an inspection batch (one simulated day). */
+const INSPECTION_BATCH_LOOKAHEAD_S = 60;
 import { QueueKind, queueBrief } from "./actionQueue.js";
 import { drainQueue, planAndStore } from "./queueRunner.js";
 import type { GameEvent } from "../contracts/time.js";
@@ -464,11 +467,39 @@ function guardedExecute(base: RegisteredTool, provider: SnapshotProvider, state:
             /* the reading is matched against 0 then: any existing reading clears it, which only skips a reminder */
           }
           review.unread.set(data.action.actionId, { fieldId, sinceS });
+          if (args.type === "inspectField") await inspectOthersDue(context, args, fieldId);
         }
       }
       return result;
     },
   };
+
+  /**
+   * Readings expire per field, so fields drift apart and each review would otherwise re-inspect just one. When the model
+   * inspects a field, the other fields whose reading is expired or lapses within a simulated day are inspected in the same
+   * turn (same freshness rules and cost), so the next round is one review instead of several.
+   */
+  async function inspectOthersDue(context: Parameters<RegisteredTool["run"]>[0], args: Record<string, unknown>, firstFieldId: string): Promise<void> {
+    if (!state || !review) return;
+    let snapshot: Awaited<ReturnType<SnapshotProvider["get"]>>;
+    try {
+      snapshot = await provider.get();
+    } catch {
+      return;
+    }
+    for (const field of snapshot.fields.fields) {
+      if (field.fieldId === firstFieldId) continue;
+      if ([...review.unread.values()].some((u) => u.fieldId === field.fieldId)) continue;
+      const freshness = fieldFreshness(state, field.fieldId, snapshot.simTimeS);
+      const lapsesSoon = freshness.verdict === "reusable" && freshness.reuseUntilS !== null && freshness.reuseUntilS - snapshot.simTimeS <= INSPECTION_BATCH_LOOKAHEAD_S;
+      const params = { ...(args.params as Record<string, unknown>), fieldId: field.fieldId };
+      const next = { ...args, params };
+      if (!lapsesSoon && (await guardedInspect(context, next))) continue;
+      const started = await base.run(context, next);
+      const data = started.ok ? (started.data as { accepted?: boolean; action?: { actionId?: string } | null }) : null;
+      if (data?.accepted && data.action?.actionId) review.unread.set(data.action.actionId, { fieldId: field.fieldId, sinceS: snapshot.simTimeS });
+    }
+  }
 
   async function guardedInspect(context: Parameters<RegisteredTool["run"]>[0], args: Record<string, unknown>) {
     if (!state) return null;
