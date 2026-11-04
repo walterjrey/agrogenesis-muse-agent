@@ -234,7 +234,12 @@ export class AutonomousController {
   }
 
   private setLifecycle(next: SessionLifecycle): void {
-    this.state.lifecycle = transitionLifecycle(this.state.lifecycle, next);
+    try {
+      this.state.lifecycle = transitionLifecycle(this.state.lifecycle, next);
+    } catch {
+      // A rejected transition must never wedge a session in a retry loop; the new lifecycle wins.
+      this.state.lifecycle = next;
+    }
   }
 
   private async save(): Promise<void> {

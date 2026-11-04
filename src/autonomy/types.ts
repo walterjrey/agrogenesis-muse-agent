@@ -281,9 +281,9 @@ export type SessionLifecycle = z.infer<typeof SessionLifecycle>;
 const LIFECYCLE_TRANSITIONS: Record<SessionLifecycle, ReadonlySet<SessionLifecycle>> = {
   running: new Set(["running", "waiting_for_simulation", "awaiting_budget", "paused_by_user", "recovering", "completed", "failed"]),
   waiting_for_simulation: new Set(["waiting_for_simulation", "running", "awaiting_budget", "paused_by_user", "recovering", "completed", "failed"]),
-  awaiting_budget: new Set(["awaiting_budget", "running", "paused_by_user", "failed"]),
+  awaiting_budget: new Set(["awaiting_budget", "running", "paused_by_user", "recovering", "completed", "failed"]),
   paused_by_user: new Set(["paused_by_user", "running", "waiting_for_simulation", "awaiting_budget", "recovering", "completed", "failed"]),
-  recovering: new Set(["recovering", "running", "waiting_for_simulation", "awaiting_budget", "paused_by_user", "failed"]),
+  recovering: new Set(["recovering", "running", "waiting_for_simulation",   "awaiting_budget", "paused_by_user", "completed", "failed"]),
   completed: new Set(["completed"]),
   failed: new Set(["failed"]),
 };
