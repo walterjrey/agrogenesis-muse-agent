@@ -48,7 +48,7 @@ export class SimulatorClient {
   constructor(private readonly options: SimulatorClientOptions) {
     const url = new URL(options.baseUrl);
     this.baseUrl = url.origin + url.pathname.replace(/\/$/, "");
-    this.timeoutMs = options.timeoutMs ?? 15_000;
+    this.timeoutMs = options.timeoutMs ?? 60_000;
     this.logger = options.logger ?? silentLogger;
     this.fetchImpl = options.fetchImpl ?? fetch;
   }
