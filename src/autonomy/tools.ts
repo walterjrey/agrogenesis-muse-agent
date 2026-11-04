@@ -89,7 +89,7 @@ export interface ReviewTracker {
 export function unreadInspectionNudge(review: ReviewTracker): string | null {
   if (review.unread.size === 0) return null;
   const [actionId, { fieldId }] = review.unread.entries().next().value as [string, { fieldId: string }];
-  return `You started an inspection (${actionId}, ${fieldId}) but have not read its result, so the review is not finished. Call wait_for_operation with that actionId: its result carries the new reading. Then evaluate it: if the readings justify irrigation and/or pest treatment call plan_field_actions once with every justified request; if nothing is justified, say so. Do not describe_action again and do not inspect another field first.`;
+  return `You started an inspection (${actionId}, ${fieldId}) but have not read its result, so the review is not finished. Call wait_for_operation with that actionId: its result carries the new reading. Then evaluate it: if the readings justify irrigation and/or pest treatment call plan_field_actions once with every justified request; if nothing is justified, say so. Do not describe_action again; the readings of every inspection you started arrive together with this wait.`;
 }
 
 /** Attaches the new reading to the wait result of an inspection the model has not read yet, so it can evaluate it at once. */
@@ -102,14 +102,19 @@ async function deliveredReading(
   const pending = review?.unread.get(result.actionId);
   if (!review || !pending || result.outcome !== "completed") return {};
   try {
+    const startedFields = new Set([...review.unread.values()].map((u) => u.fieldId));
     const snapshot = await provider.get();
     settleReads(review, snapshot.fields.fields);
-    const compact = compactFields({ ...snapshot.fields, fields: snapshot.fields.fields.filter((f) => f.fieldId === pending.fieldId) });
+    // Inspections started together settle together: deliver every field that is now read, not only the awaited one.
+    const stillUnread = new Set([...review.unread.values()].map((u) => u.fieldId));
+    const delivered = new Set([...startedFields].filter((id) => !stillUnread.has(id)));
+    delivered.add(pending.fieldId);
+    const compact = compactFields({ ...snapshot.fields, fields: snapshot.fields.fields.filter((f) => delivered.has(f.fieldId)) });
     context.state.observedRevision = snapshot.revision;
     review.unread.delete(result.actionId);
     return {
       inspectionReading: compact,
-      next: "Evaluate this reading now. If it justifies irrigation and/or pest treatment, call plan_field_actions once with every justified request (one inspection can justify several operations). If nothing is justified, state that no intervention is needed.",
+      next: "Evaluate these readings now. If they justify irrigation and/or pest treatment, call plan_field_actions once with every justified request for all fields (one inspection can justify several operations). If nothing is justified, state that no intervention is needed.",
     };
   } catch {
     return {};
