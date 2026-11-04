@@ -17,12 +17,12 @@ export const SchedulerConfig = z.strictObject({
   /** Simulated seconds in one calendar day (the simulator's calendar; never changed by this module). */
   daySeconds: z.number().positive().default(60),
   /** Extra reviews allowed per simulated day after the primary one. */
-  eventReviewsPerDay: z.number().int().nonnegative().default(3),
+  eventReviewsPerDay: z.number().int().nonnegative().default(1),
   /** Bounds for a single review (replace the generic per-cycle limits while the scheduler is on). */
-  maxModelCallsPerReview: z.number().int().positive().default(4),
+  maxModelCallsPerReview: z.number().int().positive().default(2),
   maxToolCallsPerReview: z.number().int().positive().default(10),
   /** A model-planned next review (update_plan.nextReviewSimSeconds) is honoured for at most this many days; 0 disables skipping. */
-  maxPlannedSkipDays: z.number().int().nonnegative().default(3),
+  maxPlannedSkipDays: z.number().int().nonnegative().default(5),
   /** An identical inspection is refused for this long (in simulated days) unless new evidence arrived. */
   inspectionCooldownDays: z.number().nonnegative().default(1),
 });

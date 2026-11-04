@@ -191,15 +191,22 @@ describe("ledger persistence across worker slices and restarts", () => {
   const reload = (s: LedgerInput): LedgerInput => ({ ...s, riskLedger: RiskLedger.parse(JSON.parse(JSON.stringify(s.riskLedger))) });
 
   it("keeps throttle, treatment history and last-known readings after a serialize/restart round trip, without hidden values", () => {
-    let s = state([treated("f1", 3 * DAY)]);
-    refreshLedger(s, fields(3.2 * DAY, [{ id: "f1", alert: { level: 1, since: 0 }, pest: { v: 0.31, at: 3.1 * DAY } }]));
-    expect(dueReviews(s, 3.2 * DAY).length).toBe(1);
+    let s = state([treated("f1", 0)]);
+    refreshLedger(s, fields(4.2 * DAY, [{ id: "f1", alert: { level: 1, since: 0 }, pest: { v: 0.31, at: 4.1 * DAY } }]));
+    expect(dueReviews(s, 4.2 * DAY).length).toBe(1);
     s = reload(s); // worker restart: only the persisted JSON survives
-    refreshLedger(s, fields(3.6 * DAY, [{ id: "f1", alert: { level: 1, since: 0 }, pest: { v: 0.31, at: 3.1 * DAY } }]));
-    expect(dueReviews(s, 3.6 * DAY)).toEqual([]); // same sim day: still throttled after restart
+    refreshLedger(s, fields(4.6 * DAY, [{ id: "f1", alert: { level: 1, since: 0 }, pest: { v: 0.31, at: 4.1 * DAY } }]));
+    expect(dueReviews(s, 4.6 * DAY)).toEqual([]); // same sim day: still throttled after restart
     expect(s.riskLedger.f1!.treatments).toBe(1);
-    expect(attentionQueue(s, 3.6 * DAY)[0]!.lastKnown?.pestPressure?.v).toBe(0.31);
+    expect(attentionQueue(s, 4.6 * DAY)[0]!.lastKnown?.pestPressure?.v).toBe(0.31);
     expect(JSON.stringify(s.riskLedger)).not.toMatch(/damage|yield|hidden|currentPest/i);
+  });
+
+  it("does not wake the model for a persistent Level-1 alert while a fresh treatment settles", () => {
+    const s = state([treated("f1", 3 * DAY)]);
+    refreshLedger(s, fields(4.2 * DAY, [{ id: "f1", alert: { level: 1, since: 0 }, pest: { v: 0.31, at: 4.1 * DAY } }]));
+    expect(dueReviews(s, 4.2 * DAY)).toEqual([]);
+    expect(dueReviews(s, 7.5 * DAY).map((d) => d.reason)).toEqual(["persistent_alert"]);
   });
 
   it("loads sessions persisted before the ledger existed with an empty ledger", () => {

@@ -271,7 +271,7 @@ describe("MOCKED daily scheduler in the controller", () => {
   });
 
   it("does not repeat an identical inspection without new evidence, and submits nothing for the refused one", async () => {
-    const h = await harness([INSPECT(), INSPECT(), TEXT, PLAN("continue", 100_000), TEXT]);
+    const h = await harness([INSPECT(), INSPECT(), TEXT, PLAN("continue", 100_000), TEXT], {}, { maxModelCallsPerReview: 4 });
     const state = await h.run(10);
     const inspections = h.s.actionPosts.filter((p) => p.type === "inspectField");
     expect(inspections).toHaveLength(1);

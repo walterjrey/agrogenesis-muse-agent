@@ -224,6 +224,14 @@ export class AutonomousController {
     if (this.state.lifecycle === "paused_by_user" && this.state.waitingUntilSimTimeS !== null) {
       this.setLifecycle("waiting_for_simulation");
     }
+    // Sessions persisted with the previous (slower) default cadence adopt the new defaults; custom values are kept.
+    const cadence = this.state.scheduler.config;
+    if (cadence.eventReviewsPerDay === 3 && cadence.maxModelCallsPerReview === 4 && cadence.maxPlannedSkipDays === 3) {
+      const next = SchedulerConfig.parse({});
+      cadence.eventReviewsPerDay = next.eventReviewsPerDay;
+      cadence.maxModelCallsPerReview = next.maxModelCallsPerReview;
+      cadence.maxPlannedSkipDays = next.maxPlannedSkipDays;
+    }
     this.mutationsEnabled = this.state.config.mutationsEnabled && this.options.mutationsEnabled;
     this.provider = new SnapshotProvider(this.options.client, this.state.gameId, { retryDelayMs: this.options.retryDelayMs ?? 250 });
     this.wallBase = this.state.budgets.wallClockMs;

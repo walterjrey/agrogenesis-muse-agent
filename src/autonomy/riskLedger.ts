@@ -9,6 +9,8 @@ export const NOTIFY_MIN_INTERVAL_DAYS = 1;
 /** A completed treatment is followed up this long afterwards; a missing observation is escalated at the upper bound. */
 export const FOLLOW_UP_DAYS = 1;
 export const FOLLOW_UP_MAX_DAYS = 2;
+/** After an irrigation or treatment completes on a field, its still-open Level-1 warning is given this long to respond before it may wake the model again. */
+export const SETTLE_DAYS = 4;
 const STALE_FOLLOW_UP_DAYS = 10;
 /** Observed drop/rise between two consecutive authorized observations that counts as substantial worsening. */
 export const WORSENING_DELTA = 0.1;
@@ -112,6 +114,10 @@ export function refreshLedger(state: LedgerInput, fields: FieldObservations): vo
 
 const dropped = (cur: Reading | null, prev: Reading | null, direction: 1 | -1): boolean => cur !== null && prev !== null && direction * (cur.v - prev.v) >= WORSENING_DELTA;
 
+function settling(actions: LedgerInput["actions"], fieldId: string, simTimeS: number): boolean {
+  return actions.some((a) => (a.type === "irrigateField" || a.type === "applyTreatment") && a.status === "completed" && a.target === fieldId && a.finishedAtS !== null && simTimeS - a.finishedAtS < SETTLE_DAYS * DAY_S);
+}
+
 /**
  * Which fields deserve a new model decision now. Pure policy over the ledger: level >= 2 alerts are NOT handled here (the
  * simulator's own events interrupt for them immediately and without a cap). Each field is notified at most once per
@@ -134,7 +140,7 @@ export function dueReviews(state: LedgerInput, simTimeS: number): DueReview[] {
       risk.followUpPending = false;
     } else if (risk.followUpPending && risk.lastTreatmentAtS !== null && simTimeS - risk.lastTreatmentAtS >= FOLLOW_UP_DAYS * DAY_S - 1e-6) {
       reason = "treatment_follow_up";
-    } else if (risk.alertLevel === 1 && risk.alertSinceS !== null && simTimeS - risk.alertSinceS >= PERSISTENT_ALERT_DAYS * DAY_S - 1e-6) {
+    } else if (risk.alertLevel === 1 && risk.alertSinceS !== null && simTimeS - risk.alertSinceS >= PERSISTENT_ALERT_DAYS * DAY_S - 1e-6 && !settling(state.actions, fieldId, simTimeS)) {
       reason = "persistent_alert";
     }
     if (!reason) continue;
