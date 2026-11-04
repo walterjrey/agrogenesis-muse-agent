@@ -858,6 +858,14 @@ export class AutonomousController {
       addTrigger(sch, { key: `ledger:${due.fieldId}:${due.reason}:${today}`, kind: due.reason, critical: false, field: due.fieldId, simTimeS: snapshot.simTimeS, summary: `${due.reason.replace(/_/g, " ")} for ${due.fieldId}`.slice(0, 200) });
     }
 
+    // The one-shot crop_ready event can be missed (it is only emitted by an advance that watches it); eligibility is the durable signal.
+    for (const a of snapshot.actions.actions) {
+      const fieldId = a.target?.id;
+      if (a.type !== "harvestField" || !a.eligibility.eligible || !fieldId || sch.harvestNotified[fieldId] === today) continue;
+      sch.harvestNotified[fieldId] = today;
+      addTrigger(sch, { key: `harvest_ready:${fieldId}:${today}`, kind: "harvest_ready", critical: true, field: fieldId, simTimeS: snapshot.simTimeS, summary: `harvestField is eligible on ${fieldId}: the crop is mature; harvest it, then sell.`.slice(0, 200) });
+    }
+
     const arrange = async (target: number): Promise<"wait"> => {
       s.waitingUntilSimTimeS = Math.min(target, snapshot.simTimeS + Math.max(remainingSimFor(s), 0));
       sch.nextReviewSimS = s.waitingUntilSimTimeS;

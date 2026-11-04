@@ -320,6 +320,14 @@ describe("MOCKED daily scheduler in the controller", () => {
     expect(small.skipsPerDay).toBeLessThanOrEqual(1);
   });
 
+  it("raises a durable harvest_ready trigger from eligibility even when the one-shot crop_ready event was never delivered", async () => {
+    const h = await harness([PLAN("continue", 100_000), TEXT, PLAN("continue", 100_000), TEXT, PLAN("continue", 100_000), TEXT], { catalogType: "harvestField", catalogFields: ["field-1"] });
+    const state = await h.runUntil(4 * 60);
+    const woken = state.decisions.filter((d) => (d.kind === "daily_review" || d.kind === "event_review") && d.triggers.includes("harvest_ready"));
+    expect(woken.length).toBeGreaterThanOrEqual(1);
+    expect(state.scheduler.state.harvestNotified["field-1"]).toBeGreaterThanOrEqual(0);
+  });
+
   it("lets a robot observation with NEW authorized information trigger a follow-up review, but a repeat of known data does not", async () => {
     const fresh = (v: number) => [field("field-1", { soilMoisture: { value: v, at: 200_000 } })];
     const run = async (value: number | null) => {

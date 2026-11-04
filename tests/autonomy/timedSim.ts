@@ -28,6 +28,8 @@ export interface TimedSimOptions {
   scriptedEvents?: Array<{ atS: number; kind: string; actionId?: string | null; summary?: string; data?: Record<string, unknown>; /** Field observations reported from this moment on (a delivered measurement). */ fields?: unknown[] }>;
   /** Catalogue offers inspectField for each of these field ids (default: just field-1). */
   catalogFields?: string[];
+  /** Action type the catalogue offers (default: the fixture's inspectField). */
+  catalogType?: string;
   /** Whether the catalogue offers an eligible action (default true). */
   eligible?: boolean;
 }
@@ -104,7 +106,7 @@ export async function timedSim(options: TimedSimOptions = {}, clientTimeoutMs = 
       if (path === "/fields") return { status: 200, body: { ...fieldObservations, fields, revision: state.revision, simTimeS: r3(state.simTimeS) } };
       if (path === "/actions") {
         const base = availableActions.actions[0]!;
-        const offered = (options.catalogFields ?? [base.target.id]).map((id) => ({ ...base, target: { ...base.target, id, label: id }, eligibility: eligible ? base.eligibility : { eligible: false, issues: [{ code: "none", detail: "nothing to do" }] } }));
+        const offered = (options.catalogFields ?? [base.target.id]).map((id) => ({ ...base, ...(options.catalogType ? { type: options.catalogType } : {}), target: { ...base.target, id, label: id }, eligibility: eligible ? base.eligibility : { eligible: false, issues: [{ code: "none", detail: "nothing to do" }] } }));
         return { status: 200, body: { ...availableActions, actions: offered, revision: state.revision, simTimeS: r3(state.simTimeS) } };
       }
       if (path === "/events") {

@@ -72,6 +72,8 @@ export const SchedulerState = z.strictObject({
   current: z.strictObject({ kind: ReviewKind, day: z.number().int(), triggers: z.array(Trigger), carried: z.array(Trigger), eventReviewsLeft: z.number().int() }).nullable().default(null),
   /** Last authorized measurement per field/quantity, used to decide whether a delivered observation is new information. */
   digest: z.record(z.string(), z.record(z.string(), z.strictObject({ v: z.number(), at: z.number() }))).default({}),
+  /** Last calendar day a harvest_ready trigger was raised per field, so an eligible harvest is re-raised daily until done, never in a spin. */
+  harvestNotified: z.record(z.string(), z.number().int()).default({}),
   /** Bumped whenever the farm gives a reason to look again (new alert, completed operation, new observation). */
   evidenceSeq: z.number().int().default(0),
   inspections: z.record(z.string(), z.strictObject({ simTimeS: z.number(), evidenceSeq: z.number().int() })).default({}),
